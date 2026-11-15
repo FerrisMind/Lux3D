@@ -533,7 +533,9 @@ TRELLIS.2 RGB requests need the separate RMBG-2.0 package. Pass it with
 package; the two families deliberately do not share weights.
 
 Prebuilt releases (`.github/workflows/release.yml`): Windows + Ubuntu × cpu/cuda/vulkan.
-Names follow llama.cpp (`lux3d-<tag>-bin-…`); CUDA libs ship inside the archive (mistral.rs style).
+Names follow llama.cpp (`lux3d-<tag>-bin-…`). CUDA builds do not bundle NVIDIA libraries:
+download the matching `cudart-lux3d-<tag>-…` archive and extract it next to the binaries
+(same directory as the `.exe`; `$ORIGIN` on Linux). The host only needs the NVIDIA driver.
 
 Generation endpoints accept `multipart/form-data` and return `202 Accepted` with an async job object:
 

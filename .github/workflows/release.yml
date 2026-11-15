@@ -1,11 +1,18 @@
 # Lux3D / candle-3d release binaries
 #
-# Packaging model: mistral.rs — CUDA runtime libs live *inside* the same
-# archive as the binaries (no separate cudart-*.zip).
+# Packaging model: llama.cpp — binaries and the CUDA runtime are separate
+# archives. CUDA builds contain no NVIDIA libraries; users extract the matching
+# cudart-* archive next to the binaries ($ORIGIN rpath on Linux).
 #
 # Asset naming: llama.cpp style with the version/tag embedded:
-#   lux3d-<tag>-bin-win-{cpu,cuda,vulkan}-x64.zip
-#   lux3d-<tag>-bin-ubuntu-x64-{cpu,cuda,vulkan}.tar.gz
+#   lux3d-<tag>-bin-win-{cpu,cuda-<cuda>,vulkan}-x64.zip
+#   cudart-lux3d-<tag>-bin-win-cuda-<cuda>-x64.zip
+#   lux3d-<tag>-bin-ubuntu-x64-{cpu,cuda-<cuda>,vulkan}.tar.gz
+#   cudart-lux3d-<tag>-bin-ubuntu-x64-cuda-<cuda>.tar.gz
+#
+# The cudart archives ship only the user-space libraries the binaries actually
+# load: cudart, cublas, cublasLt (NEEDED by cublas) and curand, one copy each.
+# libcuda.so.1 / nvcuda.dll come from the NVIDIA driver and are never bundled.
 
 name: Release
 
@@ -57,6 +64,7 @@ jobs:
     outputs:
       tag: ${{ steps.tag.outputs.name }}
       publish: ${{ steps.ctx.outputs.publish }}
+      cuda_label: ${{ steps.cuda.outputs.label }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -66,6 +74,10 @@ jobs:
         uses: ./.github/actions/get-tag-name
         with:
           version: ${{ inputs.version }}
+      - name: Resolve CUDA label
+        id: cuda
+        shell: bash
+        run: echo "label=$(printf '%s\n' "$CUDA_VERSION" | cut -d. -f1-2)" >> "$GITHUB_OUTPUT"
       - name: Resolve publish flag
         id: ctx
         shell: bash
@@ -100,6 +112,7 @@ jobs:
             features: "vulkan"
     env:
       TAG: ${{ needs.preflight.outputs.tag }}
+      CUDA_LABEL: ${{ needs.preflight.outputs.cuda_label }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -181,34 +194,57 @@ jobs:
           Copy-Item LICENSE $root
           Copy-Item README.md $root -ErrorAction SilentlyContinue
 
-          if ("${{ matrix.backend }}" -eq "cuda") {
-            $cudaBin = Join-Path $env:CUDA_PATH "bin"
-            $patterns = @(
-              "cudart64_*.dll",
-              "cublas64_*.dll",
-              "cublasLt64_*.dll",
-              "curand64_*.dll",
-              "nvrtc64_*.dll",
-              "nvrtc-builtins64_*.dll"
-            )
-            foreach ($pattern in $patterns) {
-              Get-ChildItem $cudaBin -Filter $pattern -ErrorAction SilentlyContinue |
-                Copy-Item -Destination $root -Force
-            }
-            if (-not (Get-ChildItem $root -Filter "cudart64_*.dll" -ErrorAction SilentlyContinue)) {
-              throw "CUDA runtime DLLs missing from $cudaBin (expected cudart64_*.dll)"
-            }
-          }
-
           $asset = "lux3d-$env:TAG-bin-win-${{ matrix.backend }}-x64.zip"
+          if ("${{ matrix.backend }}" -eq "cuda") {
+            $asset = "lux3d-$env:TAG-bin-win-cuda-$env:CUDA_LABEL-x64.zip"
+          }
           if (Test-Path $asset) { Remove-Item $asset -Force }
           Compress-Archive -Path (Join-Path $root "*") -DestinationPath $asset
           echo "ASSET=$asset" >> $env:GITHUB_ENV
+
+      - name: Stage CUDA runtime (separate archive)
+        if: matrix.backend == 'cuda'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cudartRoot = Join-Path $env:RUNNER_TEMP "cudart-lux3d-$env:TAG"
+          New-Item -ItemType Directory -Force -Path $cudartRoot | Out-Null
+          $cudaBin = Join-Path $env:CUDA_PATH "bin"
+
+          # Only the DLLs the binaries load, plus cublasLt because
+          # cublas64_12.dll imports it. No nvrtc: no runtime kernel compilation.
+          $patterns = @(
+            "cudart64_*.dll",
+            "cublas64_*.dll",
+            "cublasLt64_*.dll",
+            "curand64_*.dll"
+          )
+          foreach ($pattern in $patterns) {
+            Get-ChildItem $cudaBin -Filter $pattern -File -ErrorAction SilentlyContinue |
+              Copy-Item -Destination $cudartRoot -Force
+          }
+          foreach ($pattern in $patterns) {
+            if (-not (Get-ChildItem $cudartRoot -Filter $pattern -File -ErrorAction SilentlyContinue)) {
+              throw "CUDA runtime DLL missing: $pattern (searched $cudaBin)"
+            }
+          }
+
+          $cudartAsset = "cudart-lux3d-$env:TAG-bin-win-cuda-$env:CUDA_LABEL-x64.zip"
+          if (Test-Path $cudartAsset) { Remove-Item $cudartAsset -Force }
+          Compress-Archive -Path (Join-Path $cudartRoot "*") -DestinationPath $cudartAsset
+          echo "CUDART_ASSET=$cudartAsset" >> $env:GITHUB_ENV
 
       - uses: actions/upload-artifact@v4
         with:
           name: lux3d-${{ env.TAG }}-bin-win-${{ matrix.backend }}-x64
           path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.backend == 'cuda'
+        with:
+          name: cudart-lux3d-${{ env.TAG }}-bin-win-cuda-${{ env.CUDA_LABEL }}-x64
+          path: ${{ env.CUDART_ASSET }}
           if-no-files-found: error
 
   ubuntu:
@@ -227,6 +263,7 @@ jobs:
             features: "vulkan"
     env:
       TAG: ${{ needs.preflight.outputs.tag }}
+      CUDA_LABEL: ${{ needs.preflight.outputs.cuda_label }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -239,7 +276,7 @@ jobs:
           key: linux-${{ matrix.backend }}
 
       - name: Install pack helpers
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends patchelf zip
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends binutils patchelf zip
 
       - name: Setup CUDA Toolkit
         if: matrix.backend == 'cuda'
@@ -292,6 +329,21 @@ jobs:
             cargo build --locked --release -p lux3d-cli -p lux3d-server
           fi
 
+      - name: Strip debug info
+        run: |
+          set -euo pipefail
+          # Linux ELF embeds DWARF (Cargo debug = "line-tables-only" plus C/C++
+          # dependency info); Windows keeps it in a PDB that is not packaged.
+          # --strip-debug removes DWARF but keeps .symtab, so panic backtraces
+          # still show function names, just without file:line.
+          strip --strip-debug target/release/lux3d-cli target/release/lux3d-server
+          for bin in target/release/lux3d-cli target/release/lux3d-server; do
+            if readelf -S "$bin" | grep -qE '\.debug_(info|line|str|ranges|loc)'; then
+              echo "debug sections remain in $bin" >&2
+              exit 1
+            fi
+          done
+
       - name: Stage package
         run: |
           set -euo pipefail
@@ -302,43 +354,77 @@ jobs:
           cp README.md "$root/" 2>/dev/null || true
 
           if [[ "${{ matrix.backend }}" == "cuda" ]]; then
-            mkdir -p "$root/lib"
-            cuda_lib="${CUDA_PATH:-/usr/local/cuda}/lib64"
+            # CUDA libraries are shipped separately in cudart-*; extract that
+            # archive into this directory so $ORIGIN finds them.
             for bin in lux3d-cli lux3d-server; do
-              ldd "$root/$bin" | awk '/=> \//{print $3}' \
-                | grep -E 'libcud|libcublas|libcurand|libnvrtc|libnvJit|libnvjit' \
-                | sort -u \
-                | while read -r so; do
-                    cp -Lv "$so" "$root/lib/" || true
-                  done
-              patchelf --set-rpath '$ORIGIN/lib' "$root/$bin"
+              patchelf --set-rpath '$ORIGIN' "$root/$bin"
             done
-            # Candle often links cublas/curand without a direct libcudart NEEDED;
-            # still ship cudart (+ siblings) from the toolkit for end-user machines.
-            if [[ -d "$cuda_lib" ]]; then
-              for pattern in libcudart.so* libcublas.so* libcublasLt.so* libcurand.so* libnvrtc.so* libnvJitLink.so* libnvrtc-builtins.so*; do
-                for f in "$cuda_lib"/$pattern; do
-                  [[ -e "$f" ]] || continue
-                  cp -Lv "$f" "$root/lib/" || true
-                done
-              done
-            fi
-            if ! compgen -G "$root/lib/libcu*.so*" > /dev/null; then
-              echo "CUDA runtime .so files missing after ldd/toolkit bundle" >&2
-              ldd "$root/lux3d-cli" || true
-              ls -la "$cuda_lib" 2>/dev/null | head -n 50 || true
-              exit 1
-            fi
           fi
 
           asset="lux3d-${TAG}-bin-ubuntu-x64-${{ matrix.backend }}.tar.gz"
+          if [[ "${{ matrix.backend }}" == "cuda" ]]; then
+            asset="lux3d-${TAG}-bin-ubuntu-x64-cuda-${CUDA_LABEL}.tar.gz"
+          fi
           tar -czvf "$asset" -C "$RUNNER_TEMP" "lux3d-${TAG}"
           echo "ASSET=${asset}" >> "$GITHUB_ENV"
+
+      - name: Stage CUDA runtime (separate archive)
+        if: matrix.backend == 'cuda'
+        run: |
+          set -euo pipefail
+          cuda_lib="${CUDA_PATH:-/usr/local/cuda}/lib64"
+          cuda_major="${CUDA_VERSION%%.*}"
+          cudart_root="$RUNNER_TEMP/cudart/lux3d-${TAG}"
+          mkdir -p "$cudart_root"
+
+          # Exactly the user-space libs the binaries load. cublas NEEDs
+          # cublasLt; nvrtc/nvJitLink/nvrtc-builtins are not imported at all.
+          # curand ABI is 10 for the pinned CUDA 12.x toolkit.
+          libs=(
+            "libcudart.so.${cuda_major}"
+            "libcublas.so.${cuda_major}"
+            "libcublasLt.so.${cuda_major}"
+            "libcurand.so.10"
+          )
+          for so in "${libs[@]}"; do
+            if [[ ! -e "$cuda_lib/$so" ]]; then
+              echo "missing $cuda_lib/$so" >&2
+              ls -la "$cuda_lib" 2>/dev/null | head -n 50 >&2 || true
+              exit 1
+            fi
+            # -L dereferences the SONAME symlink into one plain file. No
+            # libfoo.so / libfoo.so.12 / libfoo.so.12.6.x triple copies.
+            cp -Lv "$cuda_lib/$so" "$cudart_root/"
+          done
+
+          mapfile -t staged < <(find "$cudart_root" -maxdepth 1 -type f -printf '%f\n' | sort)
+          if [[ ${#staged[@]} -ne 4 ]]; then
+            printf 'expected 4 CUDA runtime libs, got %d:\n%s\n' "${#staged[@]}" "${staged[*]}" >&2
+            exit 1
+          fi
+          for lib in "$cudart_root"/*.so.*; do
+            missing="$(LD_LIBRARY_PATH="$cudart_root" ldd "$lib" | awk '/not found/{print $1}')"
+            if [[ -n "$missing" ]]; then
+              echo "missing dependencies for $lib: $missing" >&2
+              exit 1
+            fi
+          done
+
+          cudart_asset="cudart-lux3d-${TAG}-bin-ubuntu-x64-cuda-${CUDA_LABEL}.tar.gz"
+          tar -czvf "$cudart_asset" -C "$RUNNER_TEMP/cudart" "lux3d-${TAG}"
+          echo "CUDART_ASSET=${cudart_asset}" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v4
         with:
           name: lux3d-${{ env.TAG }}-bin-ubuntu-x64-${{ matrix.backend }}
           path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.backend == 'cuda'
+        with:
+          name: cudart-lux3d-${{ env.TAG }}-bin-ubuntu-x64-cuda-${{ env.CUDA_LABEL }}
+          path: ${{ env.CUDART_ASSET }}
           if-no-files-found: error
 
   publish:
@@ -348,6 +434,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TAG: ${{ needs.preflight.outputs.tag }}
+      CUDA_LABEL: ${{ needs.preflight.outputs.cuda_label }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -388,14 +475,22 @@ jobs:
           files: |
             release/*
           body: |
-            Lux3D / candle-3d binaries (mistral.rs packaging: CUDA libs inside the archive).
+            Lux3D / candle-3d binaries (llama.cpp packaging: CUDA runtime is a separate archive).
+
+            **CUDA runtime (required for CUDA builds)**
+
+            Extract the matching `cudart-*` archive next to `lux3d-cli` / `lux3d-server`
+            (same directory as the `.exe`; `$ORIGIN` on Linux). The host only needs the
+            NVIDIA driver (`libcuda.so.1` / `nvcuda.dll`); a full CUDA toolkit is not required.
 
             **Windows x64**
             - [CPU](https://github.com/${{ github.repository }}/releases/download/${{ env.TAG }}/lux3d-${{ env.TAG }}-bin-win-cpu-x64.zip)
-            - [CUDA](https://github.com/${{ github.repository }}/releases/download/${{ env.TAG }}/lux3d-${{ env.TAG }}-bin-win-cuda-x64.zip)
+            - [CUDA binaries](https://github.com/${{ github.repository }}/releases/download/${{ env.TAG }}/lux3d-${{ env.TAG }}-bin-win-cuda-${{ env.CUDA_LABEL }}-x64.zip)
+            - [CUDA runtime](https://github.com/${{ github.repository }}/releases/download/${{ env.TAG }}/cudart-lux3d-${{ env.TAG }}-bin-win-cuda-${{ env.CUDA_LABEL }}-x64.zip)
             - [Vulkan](https://github.com/${{ github.repository }}/releases/download/${{ env.TAG }}/lux3d-${{ env.TAG }}-bin-win-vulkan-x64.zip)
 
             **Ubuntu x64**
             - [CPU](https://github.com/${{ github.repository }}/releases/download/${{ env.TAG }}/lux3d-${{ env.TAG }}-bin-ubuntu-x64-cpu.tar.gz)
-            - [CUDA](https://github.com/${{ github.repository }}/releases/download/${{ env.TAG }}/lux3d-${{ env.TAG }}-bin-ubuntu-x64-cuda.tar.gz)
+            - [CUDA binaries](https://github.com/${{ github.repository }}/releases/download/${{ env.TAG }}/lux3d-${{ env.TAG }}-bin-ubuntu-x64-cuda-${{ env.CUDA_LABEL }}.tar.gz)
+            - [CUDA runtime](https://github.com/${{ github.repository }}/releases/download/${{ env.TAG }}/cudart-lux3d-${{ env.TAG }}-bin-ubuntu-x64-cuda-${{ env.CUDA_LABEL }}.tar.gz)
             - [Vulkan](https://github.com/${{ github.repository }}/releases/download/${{ env.TAG }}/lux3d-${{ env.TAG }}-bin-ubuntu-x64-vulkan.tar.gz)
