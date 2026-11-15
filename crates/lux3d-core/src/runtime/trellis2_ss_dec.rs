@@ -59,7 +59,11 @@ fn get_f32(
 /// cross-correlation, zero padding, stride 1).
 #[derive(Debug)]
 pub(crate) struct Conv3d {
-    weight: Tensor,
+    /// `[27, in_channels, out_channels]` F32, `k = kd*9 + kh*3 + kw`.
+    /// Pre-transposed at load: extracting one `[C, O]` kernel per offset from
+    /// the `[O, C, 3, 3, 3]` checkpoint tensor copies a strided rank-5 view and
+    /// cost one tiny device copy per output/input channel on Vulkan.
+    weight27: Tensor,
     bias: Option<Tensor>,
     padding: usize,
 }
@@ -78,13 +82,20 @@ impl Conv3d {
             (out_channels, in_channels, kernel, kernel, kernel),
             "weight",
         )?;
+        // [O, C, kd, kh, kw] -> [O, C, 27] -> [27, C, O]: flatten the kernel
+        // axes in memory order (kw fastest) and move them in front, so each
+        // forward offset is one contiguous `[C, O]` view.
+        let weight27 = weight
+            .reshape((out_channels, in_channels, kernel * kernel * kernel))?
+            .permute((2, 1, 0))?
+            .contiguous()?;
         let bias = if bias {
             Some(get_f32(&vb, out_channels, "bias")?)
         } else {
             None
         };
         Ok(Self {
-            weight,
+            weight27,
             bias,
             padding,
         })
@@ -93,13 +104,11 @@ impl Conv3d {
     /// `x: [B, C, X, Y, Z]` -> `[B, O, X, Y, Z]` (stride 1, even padding).
     pub fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
         let (batch, in_channels, dx, dy, dz) = xs.dims5()?;
-        let weight = self.weight.dims5()?;
-        let (out_channels, weight_in, kd, kh, kw) =
-            (weight.0, weight.1, weight.2, weight.3, weight.4);
-        if weight_in != in_channels || kd != 3 || kh != 3 || kw != 3 {
+        let (kernel_offsets, weight_in, out_channels) = self.weight27.dims3()?;
+        if weight_in != in_channels || kernel_offsets != 27 {
             candle_core::bail!(
                 "Conv3d weight {:?} does not match input [B, {in_channels}, ..] with 3^3 kernel",
-                self.weight.dims()
+                self.weight27.dims()
             );
         }
         if self.padding > dx || self.padding > dy || self.padding > dz {
@@ -112,9 +121,9 @@ impl Conv3d {
             .pad_with_zeros(4, self.padding, self.padding)?;
         let tokens = ox * oy * oz;
         let mut acc: Option<Tensor> = None;
-        for kd_offset in 0..kd {
-            for kh_offset in 0..kh {
-                for kw_offset in 0..kw {
+        for kd_offset in 0..3 {
+            for kh_offset in 0..3 {
+                for kw_offset in 0..3 {
                     // [B, C, X, Y, Z] window at this kernel offset.
                     let shifted = padded
                         .narrow(2, kd_offset, ox)?
@@ -126,14 +135,9 @@ impl Conv3d {
                         .transpose(1, 2)?
                         .contiguous()?
                         .reshape((batch * tokens, in_channels))?;
-                    // [C, O]
-                    let kernel = self
-                        .weight
-                        .narrow(2, kd_offset, 1)?
-                        .narrow(3, kh_offset, 1)?
-                        .narrow(4, kw_offset, 1)?
-                        .reshape((out_channels, in_channels))?
-                        .t()?;
+                    // [C, O] view of the matching kernel offset.
+                    let k = kd_offset * 9 + kh_offset * 3 + kw_offset;
+                    let kernel = self.weight27.narrow(0, k, 1)?.squeeze(0)?;
                     let part = columns.matmul(&kernel)?; // [B*XYZ, O]
                     acc = Some(match acc {
                         None => part,
@@ -374,7 +378,7 @@ impl Trellis2SsDecoder {
     }
 
     fn input_layer_weight_in(&self) -> usize {
-        self.input_layer.weight.dim(1).unwrap_or(0)
+        self.input_layer.weight27.dim(1).unwrap_or(0)
     }
 }
 
@@ -484,6 +488,102 @@ mod tests {
                     assert_eq!(out[index], expected, "voxel ({dx},{dy},{dz})");
                 }
             }
+        }
+    }
+
+    /// Dense 3D convolution matches a naive cross-correlation over the same
+    /// `[O, I, kD, kH, kW]` weight, which pins the `weight27` offset order.
+    #[test]
+    fn conv3d_matches_naive_cross_correlation() {
+        let device = Device::Cpu;
+        let (batch, in_ch, out_ch, side) = (1usize, 2usize, 3usize, 4usize);
+        let xs: Vec<f32> = (0..batch * in_ch * side * side * side)
+            .map(|i| (i as f32 * 0.37).sin())
+            .collect();
+        let xs = Tensor::from_vec(xs, (batch, in_ch, side, side, side), &device).expect("xs");
+        let w: Vec<f32> = (0..out_ch * in_ch * 27)
+            .map(|i| ((i as f32) * 1.13).cos())
+            .collect();
+        let weight = Tensor::from_vec(w.clone(), (out_ch, in_ch, 3, 3, 3), &device).expect("w");
+        let bias = Tensor::from_vec(vec![0.25_f32, -0.5, 1.0], out_ch, &device).expect("b");
+        let weight27 = weight
+            .reshape((out_ch, in_ch, 27))
+            .and_then(|t| t.permute((2, 1, 0)))
+            .and_then(|t| t.contiguous())
+            .expect("weight27");
+        let conv = Conv3d {
+            weight27,
+            bias: Some(bias.clone()),
+            padding: 1,
+        };
+        let out = conv.forward(&xs).expect("forward");
+        assert_eq!(out.dims(), &[batch, out_ch, side, side, side]);
+        let out = out
+            .flatten_all()
+            .expect("flat")
+            .to_vec1::<f32>()
+            .expect("vec");
+        let xs = xs
+            .flatten_all()
+            .expect("flat")
+            .to_vec1::<f32>()
+            .expect("vec");
+        let w = w;
+        let bias = [0.25_f32, -0.5, 1.0];
+        let idx = |b: usize, c: usize, x: usize, y: usize, z: usize| {
+            ((b * in_ch + c) * side + x) * side * side + y * side + z
+        };
+        let mut expected = vec![0.0_f32; batch * out_ch * side * side * side];
+        for b in 0..batch {
+            for o in 0..out_ch {
+                for x in 0..side {
+                    for y in 0..side {
+                        for z in 0..side {
+                            let mut acc = bias[o];
+                            for c in 0..in_ch {
+                                for kd in 0..3 {
+                                    for kh in 0..3 {
+                                        for kw in 0..3 {
+                                            let (sx, sy, sz) = (
+                                                x as isize + kd as isize - 1,
+                                                y as isize + kh as isize - 1,
+                                                z as isize + kw as isize - 1,
+                                            );
+                                            if sx < 0
+                                                || sy < 0
+                                                || sz < 0
+                                                || sx >= side as isize
+                                                || sy >= side as isize
+                                                || sz >= side as isize
+                                            {
+                                                continue;
+                                            }
+                                            let wv =
+                                                w[((o * in_ch + c) * 3 + kd) * 9 + kh * 3 + kw];
+                                            acc += wv
+                                                * xs[idx(
+                                                    b,
+                                                    c,
+                                                    sx as usize,
+                                                    sy as usize,
+                                                    sz as usize,
+                                                )];
+                                        }
+                                    }
+                                }
+                            }
+                            let oi = ((b * out_ch + o) * side + x) * side * side + y * side + z;
+                            expected[oi] = acc;
+                        }
+                    }
+                }
+            }
+        }
+        for (i, (got, want)) in out.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 2e-5,
+                "conv3d mismatch at {i}: got {got}, want {want}"
+            );
         }
     }
 
