@@ -105,33 +105,6 @@ pub fn kernel_offset_delta(k: usize) -> [i32; 3] {
     ]
 }
 
-/// Vulkan compute dispatches are limited to 65535 workgroups per dimension
-/// (spec minimum; NVIDIA reports 65535 for Y/Z). candle's Vulkan
-/// `index_select` dispatches the index count as the Y workgroup count
-/// without clamping, so gathers with more than 65535 indices are silently
-/// corrupt on that backend (measured on an RTX 3060: 65535 indices exact,
-/// 65536 indices ~96% wrong rows). The sparse ops below gather with
-/// production-scale index counts (conv pair counts and C2S child counts
-/// exceed 65535 at resolution 512), so gathers on Vulkan are split into
-/// limit-sized chunks. A gather is row-wise and exact, so chunking is
-/// bit-identical on every backend; CPU/CUDA keep the single-dispatch path.
-const INDEX_SELECT_DISPATCH_CHUNK: usize = 65_535;
-
-fn index_select_rows(feats: &Tensor, ids: &Tensor) -> CandleResult<Tensor> {
-    let rows = ids.dim(0)?;
-    if rows <= INDEX_SELECT_DISPATCH_CHUNK || !feats.device().is_vulkan() {
-        return feats.index_select(ids, 0);
-    }
-    let mut parts = Vec::new();
-    let mut start = 0usize;
-    while start < rows {
-        let len = (rows - start).min(INDEX_SELECT_DISPATCH_CHUNK);
-        parts.push(feats.index_select(&ids.narrow(0, start, len)?, 0)?);
-        start += len;
-    }
-    Tensor::cat(&parts, 0)
-}
-
 /// Submanifold 3x3x3 sparse convolution (`SparseConv3d`): output coords equal
 /// input coords; the kernel is stored as `[27, Cout, Cin]` (flex_gemm layout
 /// transposed by the loader).
@@ -230,7 +203,7 @@ impl SparseConv3d {
             let pairs = dest.len();
             let dest = Tensor::from_vec(dest, (pairs,), device)?;
             let src = Tensor::from_vec(src, (pairs,), device)?;
-            let gathered = index_select_rows(feats, &src)?; // [n, Cin]
+            let gathered = feats.index_select(&src, 0)?; // [n, Cin]
             let kernel = self.weight.narrow(0, k, 1)?.squeeze(0)?; // [Cout, Cin]
             let product = gathered.matmul(&kernel.transpose(0, 1)?)?; // [n, Cout]
             out = out.index_add(&dest, &product, 0)?;
@@ -321,7 +294,7 @@ pub fn channel_to_spatial(
     let device = feats.device();
     let flat = feats.reshape((rows * 8, child_channels))?;
     let src = Tensor::from_vec(src_rows, (out_coords.len(),), device)?;
-    let out_feats = index_select_rows(&flat, &src)?;
+    let out_feats = flat.index_select(&src, 0)?;
     let sub_binary = Tensor::from_vec(
         leaves
             .iter()

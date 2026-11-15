@@ -1,37 +1,35 @@
 //! Gated Vulkan-vs-CPU numeric parity regression for the TRELLIS.2 sparse
 //! ops and shape VAE decode.
 //!
-//! Background (T9b, 2026-11-14): candle's Vulkan `index_select` dispatches
-//! the index count as the Y workgroup count without clamping to the device
-//! limit (`vulkan_backend.rs::run_index_select_f32`; NVIDIA reports
+//! Background (T9b, 2026-11-14): candle's Vulkan `index_select` used to
+//! dispatch the index count as the Y workgroup count without clamping to the
+//! device limit (`vulkan_backend.rs::run_index_select_f32`; NVIDIA reports
 //! maxComputeWorkGroupCount Y/Z = 65535). Any gather with more than 65535
-//! indices is silently corrupt there — measured on an RTX 3060: 65535
+//! indices was silently corrupt there — measured on an RTX 3060: 65535
 //! indices exact, 65536 indices ~96% wrong rows. The TRELLIS.2 shape VAE
 //! gathers exceed that at resolution 512 (sparse-conv pair counts and C2S
 //! child counts reach ~500k), which collapsed the decoded `intersected`
-//! flags and lost ~2/3 of the mesh quads (z-axis worst). The lux3d-side fix
-//! is `index_select_rows` in `runtime/trellis2_sparse.rs`: Vulkan gathers
-//! are split into 65535-index chunks (bit-identical by construction).
+//! flags and lost ~2/3 of the mesh quads (z-axis worst). Candle now clamps
+//! both the gather and index_select dispatches to the device limits, so the
+//! former lux3d-side 65535-row chunking was removed.
 //!
-//! This suite guards that fix and documents the upstream defect:
+//! This suite guards that fix:
 //! 1. Golden-fixture VAE decode (64-voxel latent, canonical weights) on CPU
 //!    vs Vulkan: coords exact, per-block feats parity, mesh face multiset
 //!    equal, per-axis quad counts equal.
 //! 2. Production-shape synthetic SparseConv3d (200k coords x 128 ch — pair
 //!    counts above the dispatch limit) CPU vs Vulkan, twice for run-to-run
-//!    drift. This is the regression guard for the chunked gather.
+//!    drift. This is the regression guard for the clamped gather.
 //! 3. Synthetic `Tensor::index_add` accumulation (500k rows, duplicate
 //!    destinations, 27 passes) — must stay exact (CAS-atomic scatter).
-//! 4. Raw `Tensor::index_select` boundary probes (65535/65536) — print-only
-//!    documentation of the upstream candle defect; they are expected to
-//!    FAIL parity at 65536 until candle clamps the dispatch.
+//! 4. Raw `Tensor::index_select` boundary probes (65535/65536 and above) —
+//!    asserted exact; they fail if candle regresses the dispatch clamp.
 //!
 //! Gated by `LUX3D_TRELLIS2_VULKAN_PARITY=1`; requires a Vulkan device and
 //! the `vulkan` cargo feature. `LUX3D_TRELLIS2_VULKAN_PARITY_COOPMAT`
 //! (default `0`) pins `CANDLE_VULKAN_F32_UNALIGNED_COOPMAT` before any
-//! Vulkan dispatch: the product CLI sets that variable only when absent, so
-//! an explicit value overrides the shipped TF32-class coopmat default and
-//! the suite always exercises exact-fp32 matmul.
+//! Vulkan dispatch: the product CLI fills that variable only for pi3/pi3x,
+//! so this suite pins exact-fp32 matmul explicitly.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -118,9 +116,10 @@ fn quad_counts(coords: &[[i32; 3]], intersected: &[[bool; 3]]) -> [usize; 3] {
             if !intersected[i][axis] {
                 continue;
             }
-            if OFFSETS[axis].iter().all(|o| {
-                map.contains_key(&[coord[0] + o[0], coord[1] + o[1], coord[2] + o[2]])
-            }) {
+            if OFFSETS[axis]
+                .iter()
+                .all(|o| map.contains_key(&[coord[0] + o[0], coord[1] + o[1], coord[2] + o[2]]))
+            {
                 counts[axis] += 1;
             }
         }
@@ -163,9 +162,7 @@ fn to_mesh(
 #[test]
 fn trellis2_vulkan_sparse_ops_and_vae_parity() {
     if std::env::var("LUX3D_TRELLIS2_VULKAN_PARITY").as_deref() != Ok("1") {
-        eprintln!(
-            "SKIP: set LUX3D_TRELLIS2_VULKAN_PARITY=1 to run the Vulkan parity regression"
-        );
+        eprintln!("SKIP: set LUX3D_TRELLIS2_VULKAN_PARITY=1 to run the Vulkan parity regression");
         return;
     }
     // Pin the coopmat opt-in before any Vulkan dispatch (explicit values
@@ -206,13 +203,18 @@ fn trellis2_vulkan_sparse_ops_and_vae_parity() {
     let slat_feats: Array2<f32> =
         ndarray_npy::read_npy(golden.join("slat_feats.npy")).expect("slat_feats");
     let coords: Vec<[i32; 3]> = (0..slat_coords.dim().0)
-        .map(|i| [slat_coords[[i, 0]], slat_coords[[i, 1]], slat_coords[[i, 2]]])
+        .map(|i| {
+            [
+                slat_coords[[i, 0]],
+                slat_coords[[i, 1]],
+                slat_coords[[i, 2]],
+            ]
+        })
         .collect();
 
     let decode_on = |device: &Device| {
-        let vb =
-            unsafe { VarBuilder::from_mmaped_safetensors(&[&model_file], DType::F32, device) }
-                .expect("mmaped canonical weights");
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&model_file], DType::F32, device) }
+            .expect("mmaped canonical weights");
         let decoder = lux3d_core::runtime::Trellis2ShapeVaeDecoder::load(
             vb.pp("shape_dec"),
             &lux3d_core::runtime::Trellis2ShapeVaeConfig::flexi_dual_shape(),
@@ -309,18 +311,17 @@ fn trellis2_vulkan_sparse_ops_and_vae_parity() {
     assert_eq!(cpu_faces, vk_faces, "face multisets must match");
 
     // Production-shape synthetic SparseConv3d: pair counts above the 65535
-    // dispatch limit (the T9b defect) must stay exact through the chunked
-    // gather and be run-to-run stable.
+    // dispatch limit (the T9b defect) must stay exact through candle's
+    // clamped gather and be run-to-run stable.
     println!("--- synthetic SparseConv3d (dense-cube coords) ---");
     sparse_conv_probe(&vulkan, 200_000, 128, 128, 123);
     sparse_conv_probe(&vulkan, 60_000, 1024, 1024, 321);
     // index_add accumulation with duplicate destinations: exact and stable.
     println!("--- synthetic index_add accumulation ---");
     index_add_probe(&vulkan, 500_000, 128);
-    // Raw index_select boundary probes: documentation of the upstream candle
-    // defect (print-only; 65536+ ids is silently corrupt until candle clamps
-    // the Y dispatch).
-    println!("--- raw index_select boundary probes (upstream defect, print-only) ---");
+    // Raw index_select boundary probes: assert candle's dispatch clamp keeps
+    // gathers above the device workgroup limit exact.
+    println!("--- raw index_select boundary probes (dispatch clamp) ---");
     for (rows, width) in [
         (60_000usize, 128usize),
         (65_535, 128),
@@ -377,8 +378,7 @@ fn sparse_conv_probe(vulkan: &Device, rows: usize, cin: usize, cout: usize, seed
             ("bias".to_string(), bias_cpu.to_device(device).expect("b")),
         ]);
         let vb = VarBuilder::from_tensors(map, DType::F32, device);
-        let conv =
-            lux3d_core::runtime::SparseConv3d::load(vb, cin, cout, true).expect("conv load");
+        let conv = lux3d_core::runtime::SparseConv3d::load(vb, cin, cout, true).expect("conv load");
         let feats = feats_cpu.to_device(device).expect("x");
         conv.forward(&coords, &feats).expect("conv forward")
     };
@@ -393,7 +393,7 @@ fn sparse_conv_probe(vulkan: &Device, rows: usize, cin: usize, cout: usize, seed
     );
     assert!(
         s1.rel <= 1e-5,
-        "vulkan conv parity n={rows} cin={cin}: rel {:.3e} (chunked gather regressed?)",
+        "vulkan conv parity n={rows} cin={cin}: rel {:.3e} (gather dispatch clamp regressed?)",
         s1.rel
     );
     assert!(
@@ -442,8 +442,9 @@ fn index_add_probe(vulkan: &Device, rows: usize, width: usize) {
     assert!(s12.max_abs <= 1e-4, "vulkan index_add run-to-run drift");
 }
 
-/// Raw `Tensor::index_select` boundary probe (bypasses the lux3d chunked
-/// helper): documents the upstream candle Vulkan defect — print-only.
+/// Raw `Tensor::index_select` boundary probe: asserts the candle-side
+/// dispatch clamp keeps every row exact at and above the 65535 workgroup
+/// limit (the T9b defect).
 fn raw_index_select_probe(vulkan: &Device, rows: usize, width: usize) {
     let run = |device: &Device| {
         let table = Tensor::from_vec(
@@ -475,5 +476,14 @@ fn raw_index_select_probe(vulkan: &Device, rows: usize, width: usize) {
     println!(
         "index_select rows={rows} width={width}: vk-vs-cpu max_abs {:.3e} rel {:.3e} | bad rows {bad_rows}/{rows}",
         s1.max_abs, s1.rel
+    );
+    assert_eq!(
+        bad_rows, 0,
+        "index_select rows={rows}: clamped dispatch corrupted rows"
+    );
+    assert!(
+        s1.max_abs <= 1e-5,
+        "index_select rows={rows}: max_abs {:.3e}",
+        s1.max_abs
     );
 }
