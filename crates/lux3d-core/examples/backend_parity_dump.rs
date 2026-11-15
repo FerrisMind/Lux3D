@@ -23,11 +23,14 @@
 //! (~1e-3) but differs from F32 by ~1e-1 rel_l2 on the mask, so use it for
 //! backend-parity checks rather than as an F32-equivalent result.
 //!
-//! `--reduced-precision` mirrors the CLI/server default: Vulkan cooperative
-//! matmul runs with TF32-class inputs and WGPU cooperative matmul runs with
-//! f16 tensor-core MMA. Without it, `DType::F32` keeps exact fp32
-//! accumulation. The companion script calls this mode "FP16-class" because
-//! the WGPU path is genuine f16 MMA; it is not storage-only F16 weights.
+//! `--reduced-precision` forces the reduced-precision GEMM paths for the
+//! comparison: Vulkan cooperative matmul runs with TF32-class inputs and WGPU
+//! cooperative matmul runs with f16 tensor-core MMA. Without it, `DType::F32`
+//! keeps exact fp32 accumulation — which is also the CLI/server default for
+//! the families this harness covers (the opt-in is only applied automatically
+//! for pi3/pi3x). The companion script calls the flag mode "FP16-class"
+//! because the WGPU path is genuine f16 MMA; it is not storage-only F16
+//! weights.
 
 use std::{
     collections::HashMap,

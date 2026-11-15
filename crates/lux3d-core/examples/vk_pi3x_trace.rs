@@ -16,6 +16,9 @@ fn main() -> anyhow::Result<()> {
 
     let models_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models");
     let assets_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-assets");
+    // Match the CLI's pi3x precision policy so traced shader timings reflect
+    // production runs. Must run before the device is created.
+    lux3d_core::enable_reduced_precision_gemm_opt_ins_for(lux3d_core::ModelFamily::Pi3x);
     let assets = lux3d_core::ModelAssetOptions {
         canonical_dir: Some(models_dir.join("pi3x")),
         cache_dir: None,

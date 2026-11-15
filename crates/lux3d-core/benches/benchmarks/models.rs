@@ -108,6 +108,17 @@ fn criterion_benchmark(c: &mut Criterion) {
     let model = std::env::var("LUX3D_BENCH_MODEL").unwrap_or_else(|_| "pi3".to_string());
     let assets_dir = workspace_dir(ASSETS_DIR_ENV, "../../test-assets");
 
+    // Measure the same precision policy the CLI applies for this family: only
+    // the validated families opt into the reduced-precision GEMM fast paths.
+    // Must run before the device is created.
+    let family = match model.as_str() {
+        "pi3" => lux3d_core::ModelFamily::Pi3,
+        "pi3x" => lux3d_core::ModelFamily::Pi3x,
+        "triposr" => lux3d_core::ModelFamily::TripoSr,
+        other => panic!("unknown LUX3D_BENCH_MODEL `{other}`"),
+    };
+    lux3d_core::enable_reduced_precision_gemm_opt_ins_for(family);
+
     let device = match device_kind.as_str() {
         "vulkan" => candle_core::Device::new_vulkan(0),
         "wgpu" => candle_core::Device::new_wgpu(0),

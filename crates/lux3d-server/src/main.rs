@@ -80,7 +80,13 @@ impl From<CliAccessLogFormat> for AccessLogFormat {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    lux3d_core::enable_reduced_precision_gemm_opt_ins();
+    // One server process serves every family, but candle's GEMM switches are
+    // process-wide (vulkan reads them once at the first matmul, wgpu at device
+    // creation). Reduced precision cannot be enabled per request without
+    // changing TRELLIS.2's output, so the server keeps the exact-fp32 default;
+    // operators who want the validated pi3/pi3x fast paths set
+    // CANDLE_VULKAN_F32_UNALIGNED_COOPMAT=1 and/or CANDLE_WGPU_COOP_MATMUL=1
+    // explicitly for a dedicated deployment.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("lux3d_server=info".parse()?))
         .init();
@@ -119,6 +125,21 @@ async fn main() -> anyhow::Result<()> {
     }
     let router = router_builder.build().await?;
 
+    let reduced_precision = [
+        "CANDLE_VULKAN_F32_UNALIGNED_COOPMAT",
+        "CANDLE_WGPU_COOP_MATMUL",
+    ]
+    .iter()
+    .any(|key| std::env::var_os(key).is_some());
+    tracing::info!(
+        "GEMM precision policy: {}",
+        if reduced_precision {
+            "reduced-precision opt-in enabled by environment (pi3/pi3x fast paths; TRELLIS.2 output may change)"
+        } else {
+            "exact fp32 (server default; enable CANDLE_VULKAN_F32_UNALIGNED_COOPMAT \
+             or CANDLE_WGPU_COOP_MATMUL for the validated pi3/pi3x fast paths)"
+        }
+    );
     tracing::info!("Lux3D server listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, router).await?;

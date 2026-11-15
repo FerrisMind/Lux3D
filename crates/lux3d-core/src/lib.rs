@@ -36,12 +36,40 @@ pub use weights::{
     quantize_checkpoint,
 };
 
-/// Enable candle's reduced-precision GPU GEMM opt-ins (TF32-class coopmat on
-/// vulkan, f16-MMA coop on wgpu). Measured 1.9–2.5× on attention/linear GEMM
-/// shapes; the pi3/pi3x warm timings and mesh-compare 6/6 were validated with
-/// these paths active. Candle now defaults both to OFF so plain DType::F32
-/// matmul keeps exact-fp32 accumulation — this product opts back in. Explicit
-/// user environment overrides win.
+/// Families whose GPU timings and output parity were validated with candle's
+/// reduced-precision GEMM opt-ins active (vulkan TF32-class coopmat, wgpu
+/// f16-MMA coop): pi3 and pi3x only.
+///
+/// The opt-ins trade ~10-bit mantissa input precision for 1.9–2.5× on the
+/// attention/linear GEMM shapes those pipelines use. TRELLIS.2 must stay on
+/// exact fp32: its O-Voxel occupancy is discrete, so the drift flips voxels
+/// and changes the exported topology (measured on the 2-step 512 smoke:
+/// 563,889 vertices with the opt-in vs 465,520 CPU, 465,514 Vulkan exact-fp32
+/// and 465,524 CUDA).
+pub const fn reduced_precision_gemm_validated_for(family: ModelFamily) -> bool {
+    matches!(family, ModelFamily::Pi3 | ModelFamily::Pi3x)
+}
+
+/// Enable candle's reduced-precision GPU GEMM opt-ins for one model family.
+///
+/// A no-op for families where the precision tradeoff changes model output;
+/// see [`reduced_precision_gemm_validated_for`]. Explicit user environment
+/// overrides always win.
+pub fn enable_reduced_precision_gemm_opt_ins_for(family: ModelFamily) {
+    if !reduced_precision_gemm_validated_for(family) {
+        return;
+    }
+    enable_reduced_precision_gemm_opt_ins();
+}
+
+/// Unconditionally enable candle's reduced-precision GPU GEMM opt-ins
+/// (TF32-class coopmat on vulkan, f16-MMA coop on wgpu).
+///
+/// Prefer [`enable_reduced_precision_gemm_opt_ins_for`] in product code paths:
+/// this only exists for benchmarks and parity tools that deliberately measure
+/// the reduced-precision kernels. Candle defaults both paths to OFF so plain
+/// `DType::F32` matmul keeps exact-fp32 accumulation. Explicit user
+/// environment overrides win.
 pub fn enable_reduced_precision_gemm_opt_ins() {
     for (key, value) in [
         ("CANDLE_VULKAN_F32_UNALIGNED_COOPMAT", "1"),

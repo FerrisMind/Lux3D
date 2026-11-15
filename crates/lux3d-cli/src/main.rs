@@ -4,7 +4,6 @@ use lux3d_cli::{
 };
 
 fn main() -> anyhow::Result<()> {
-    lux3d_core::enable_reduced_precision_gemm_opt_ins();
     let cli = Cli::parse();
     match cli.command {
         Command::Inspect(args) => {

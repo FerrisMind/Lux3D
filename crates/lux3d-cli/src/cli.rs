@@ -565,6 +565,10 @@ pub fn normalize_weights(
 }
 
 pub fn run_model(args: RunArgs) -> anyhow::Result<PathBuf> {
+    // Must happen before device creation and any worker threads: candle reads
+    // these switches once per process. Only validated families opt in — see
+    // `reduced_precision_gemm_validated_for`.
+    lux3d_core::enable_reduced_precision_gemm_opt_ins_for(args.family.model_family());
     let model_assets = ModelAssetOptions {
         canonical_dir: args.model_path.clone(),
         cache_dir: args.cache_dir.clone(),
