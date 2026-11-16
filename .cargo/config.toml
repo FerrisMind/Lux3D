@@ -1,0 +1,16 @@
+# Native CRT selection for the Windows MSVC build.
+#
+# The CUDA/candle `libmoe.a` objects (and xatlas below) are built against the
+# static MSVC CRT (`MT_StaticRelease`); the native `meshopt` C++ archive is
+# built by `cc` and would otherwise use the dynamic CRT (`MD_DynamicRelease`).
+# Mixing the two fails the MSVC link with LNK2038 (RuntimeLibrary mismatch) on
+# the CLI/server binaries and test executables.
+#
+# Force the static CRT for the whole MSVC target so Rust std, `cc`-built
+# archives (meshopt) and the prebuilt candle CUDA objects agree. This is
+# scoped to the Windows MSVC target, so Linux/macOS builds are unaffected.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]
+XATLAS_MSVC_CRT = "static"
