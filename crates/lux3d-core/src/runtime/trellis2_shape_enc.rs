@@ -65,7 +65,7 @@ use candle_core::{DType, Device, Result as CandleResult, Tensor};
 
 use super::nn_blocks::{Linear, linear};
 use super::trellis2_blocks::layer_norm_no_affine;
-use super::trellis2_sparse::{SparseConv3d, spatial_to_channel};
+use super::trellis2_sparse::{SparseConv3d, SparseConvIndices, spatial_to_channel};
 use super::trellis2_vae::{ConvNeXtBlock, channel_layer_norm_affine};
 use crate::weights::VarBuilder;
 
@@ -192,10 +192,11 @@ impl S2CDownBlock {
     /// Reference `_forward` order: `h = silu(norm1(x))` -> `conv1` (parent
     /// coords) -> `updown` (S2C); `x = updown(x)`; `h = silu(norm2(h))`
     /// (non-affine) -> `conv2`; `h += mean-reshaped S2C(x)`.
-    fn forward(
+    fn forward_with_indices(
         &self,
         coords: &[[i32; 3]],
         feats: &Tensor,
+        parent_indices: &SparseConvIndices,
     ) -> CandleResult<(Vec<[i32; 3]>, Tensor)> {
         let rows = feats.dim(0)?;
         if rows != coords.len() {
@@ -206,11 +207,12 @@ impl S2CDownBlock {
         }
         let h = channel_layer_norm_affine(feats, &self.norm1_weight, &self.norm1_bias, 1e-6)?;
         let h = h.silu()?;
-        let h = self.conv1.forward(coords, &h)?; // [N, out/8]
+        let h = self.conv1.forward_with_indices(&h, parent_indices)?; // [N, out/8]
         let h_s2c = spatial_to_channel(coords, &h)?; // [Np, out]
         let x_s2c = spatial_to_channel(coords, feats)?; // [Np, in * 8]
         let h = layer_norm_no_affine(&h_s2c.feats, 1e-6)?.silu()?;
-        let h = self.conv2.forward(&h_s2c.coords, &h)?; // [Np, out]
+        let child_indices = SparseConvIndices::new(&h_s2c.coords, h.device())?;
+        let h = self.conv2.forward_with_indices(&h, &child_indices)?; // [Np, out]
         let parents = h_s2c.coords.len();
         let groups = self.channels * 8 / self.out_channels;
         let skip = x_s2c
@@ -325,13 +327,15 @@ impl Trellis2ShapeEncoder {
         let mut h = self.input_layer.forward(&feats)?;
         let mut coords = coords.to_vec();
         for blocks in &self.stages {
+            let stage_indices = SparseConvIndices::new(&coords, h.device())?;
             for block in blocks {
                 match block {
                     EncoderStageBlock::ConvNeXt(conv_next) => {
-                        h = conv_next.forward(&coords, &h)?;
+                        h = conv_next.forward_with_indices(&h, &stage_indices)?;
                     }
                     EncoderStageBlock::Down(down) => {
-                        let (parent_coords, parent_feats) = down.forward(&coords, &h)?;
+                        let (parent_coords, parent_feats) =
+                            down.forward_with_indices(&coords, &h, &stage_indices)?;
                         coords = parent_coords;
                         h = parent_feats;
                     }

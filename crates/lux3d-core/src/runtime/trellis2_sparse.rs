@@ -26,9 +26,8 @@
 //! in-memory flattening of `(kd, kh, kw)`) and the forward is 27
 //! hashmap-gather + dense GEMM pairs accumulated in F32.
 
-use std::collections::HashMap;
-
-use candle_core::{DType, Result as CandleResult, Tensor};
+use candle_core::{DType, Device, Result as CandleResult, Tensor};
+use rustc_hash::FxHashMap;
 
 use super::attention_math::exact_query_chunked_sdpa;
 use crate::weights::VarBuilder;
@@ -66,14 +65,15 @@ impl SparseFeats {
 /// across the 27 conv offsets and mesh extraction.
 #[derive(Debug, Clone)]
 pub struct CoordMap {
-    map: HashMap<[i32; 3], u32>,
+    map: FxHashMap<[i32; 3], u32>,
 }
 
 impl CoordMap {
     /// Build from unique coordinates; later duplicates overwrite earlier
     /// entries (inputs are required to be duplicate-free).
     pub fn new(coords: &[[i32; 3]]) -> Self {
-        let mut map = HashMap::with_capacity(coords.len());
+        let mut map = FxHashMap::default();
+        map.reserve(coords.len());
         for (index, coord) in coords.iter().enumerate() {
             map.insert(*coord, index as u32);
         }
@@ -106,15 +106,126 @@ pub fn kernel_offset_delta(k: usize) -> [i32; 3] {
 }
 
 /// Submanifold 3x3x3 sparse convolution (`SparseConv3d`): output coords equal
-/// input coords; the kernel is stored as `[27, Cout, Cin]` (flex_gemm layout
-/// transposed by the loader).
+/// input coords; the kernel is stored per offset as contiguous `[Cin, Cout]`
+/// (the flex_gemm `[Cout, kd, kh, kw, Cin]` layout transposed by the loader).
 #[derive(Debug, Clone)]
 pub struct SparseConv3d {
-    /// `[27, Cout, Cin]`, index `k = kd*9 + kh*3 + kw` (kw fastest).
-    weight: Tensor,
+    /// Per offset `[Cin, Cout]`, index `k = kd*9 + kh*3 + kw` (kw fastest),
+    /// each a standalone contiguous buffer with start offset 0.
+    kernels: Vec<Tensor>,
     bias: Option<Tensor>,
     in_channels: usize,
     out_channels: usize,
+}
+
+/// Precomputed gather/scatter rows for the 27 submanifold offsets of one
+/// fixed coordinate set.
+///
+/// A submanifold convolution keeps the coordinate set unchanged, so every
+/// `ConvNeXt` block in a VAE stage performs the same 27 hashmap sweeps and
+/// uploads the same index arrays. The sparse VAE decoder previously rebuilt
+/// them per block (36 convolutions, 9 distinct coordinate sets); caching one
+/// instance per stage removes most of the host-side hashmap work that
+/// dominated the shape-VAE stage on every backend.
+/// Per-offset source rows for a submanifold sparse convolution. The output
+/// row set equals `coords`, so every offset can be expressed as a dense
+/// `[N]` gather table: row `i` points at the voxel holding the neighbor at
+/// `coords[i] + delta`, or at a zero sentinel row when the neighbor is
+/// absent. Dense tables let the convolution accumulate with plain adds;
+/// scatter-add would issue `27 * N * Cout` atomics (17.5 s for the 2M-row
+/// stage on CUDA) while gathers stream at memory bandwidth.
+#[derive(Debug)]
+enum OffsetSource {
+    /// `delta == 0`: the source row is the output row.
+    Identity,
+    /// `[N]` U32 gather rows; `N` (the appended zero row) marks an absent
+    /// neighbor.
+    Dense(Tensor),
+    /// No output row has a neighbor at this offset.
+    Empty,
+}
+
+#[derive(Debug)]
+pub struct SparseConvIndices {
+    rows: usize,
+    /// True when at least one output row lacks a neighbor at some offset, so
+    /// gathers need the appended zero sentinel row.
+    has_missing: bool,
+    /// Indexed by kernel offset (`kernel_offset_delta`).
+    offsets: Vec<OffsetSource>,
+}
+
+impl SparseConvIndices {
+    pub fn new(coords: &[[i32; 3]], device: &Device) -> CandleResult<Self> {
+        let profile = std::env::var_os("LUX3D_STAGE_TIME").is_some();
+        let mark = std::time::Instant::now();
+        let map = CoordMap::new(coords);
+        let voxels = coords.len();
+        let sentinel = voxels as u32;
+        // The 26 non-identity offsets are independent read-only sweeps over
+        // the same coordinate map. At the 2M-voxel stage the combined sweeps
+        // cost seconds on a single thread, so build them on scoped threads.
+        let rows: Vec<(Vec<u32>, bool, bool)> = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(27);
+            for k in 0..27 {
+                let map = &map;
+                handles.push(scope.spawn(move || {
+                    if k == 13 {
+                        return (Vec::new(), true, false);
+                    }
+                    let delta = kernel_offset_delta(k);
+                    let mut source: Vec<u32> = vec![sentinel; voxels];
+                    let mut any = false;
+                    let mut missing = false;
+                    for (index, coord) in coords.iter().enumerate() {
+                        if let Some(found) = map.get([
+                            coord[0] + delta[0],
+                            coord[1] + delta[1],
+                            coord[2] + delta[2],
+                        ]) {
+                            source[index] = found;
+                            any = true;
+                        } else {
+                            missing = true;
+                        }
+                    }
+                    (source, any, missing)
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("sparse index worker panicked"))
+                .collect()
+        });
+        let mut offsets = Vec::with_capacity(27);
+        let mut has_missing = false;
+        for (source, any, missing) in rows {
+            has_missing |= missing;
+            offsets.push(if !any {
+                OffsetSource::Empty
+            } else if source.is_empty() {
+                OffsetSource::Identity
+            } else {
+                OffsetSource::Dense(Tensor::from_vec(source, (voxels,), device)?)
+            });
+        }
+        if profile {
+            eprintln!(
+                "sparse conv indices: {:.2}s ({} voxels)",
+                mark.elapsed().as_secs_f64(),
+                coords.len()
+            );
+        }
+        Ok(Self {
+            rows: coords.len(),
+            has_missing,
+            offsets,
+        })
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
 }
 
 impl SparseConv3d {
@@ -129,25 +240,82 @@ impl SparseConv3d {
     ) -> CandleResult<Self> {
         // GGUF packages store the rank-5 kernel flattened (candle's GGUF
         // reader caps tensor rank at 4); the helper reshapes it back.
+        let profile = std::env::var_os("LUX3D_STAGE_TIME").is_some();
+        let device = vb.device().clone();
+        // The checkpoint stores the decoder convolutions in FP16 and the
+        // reference runs them in FP16. Keeping the kernels F16 halves their
+        // VRAM (~0.9 GiB for the shape VAE) and lets the gathers/GEMMs halve
+        // their bandwidth; CPU keeps F32 (candle's CPU f16 matmul is a
+        // fallback path).
+        let kernel_dtype = if matches!(&device, Device::Cpu) {
+            DType::F32
+        } else {
+            DType::F16
+        };
+        // Build the 27 `[Cin, Cout]` offset kernels on the host. Doing the
+        // transpose on the GPU was the dominant Vulkan load cost (10.2 s for
+        // the 432 MB stage-0 conv: candle's generic strided-copy shader runs
+        // at ~43 MB/s). A parallel CPU transpose plus one upload per kernel is
+        // ~10x faster and the uploaded buffers are already contiguous, which
+        // is also what the GEMM wants.
+        let mark = std::time::Instant::now();
+        let cpu_vb = vb.clone().set_device(Device::Cpu);
         let weight = super::nn_blocks::get_weight_shaped(
-            &vb,
+            &cpu_vb,
             (out_channels, 3, 3, 3, in_channels),
             "weight",
         )?;
-        // Flatten (kd, kh, kw) in memory order (kw fastest) -> k = kd*9 +
-        // kh*3 + kw, then move the kernel axis in front.
-        let weight = weight
-            .to_dtype(DType::F32)?
-            .reshape((out_channels, 27, in_channels))?
-            .permute((1, 0, 2))?
-            .contiguous()?;
+        if profile {
+            eprintln!(
+                "[stage] sparse conv load get [{in_channels}->{out_channels}]: {:.2}s",
+                mark.elapsed().as_secs_f64()
+            );
+        }
+        let mark = std::time::Instant::now();
+        let weight27 = weight
+            .to_dtype(kernel_dtype)?
+            .reshape((out_channels, 27, in_channels))?;
+        let kernels_cpu: Vec<Tensor> = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(27);
+            for k in 0..27 {
+                let weight27 = &weight27;
+                handles.push(scope.spawn(move || -> CandleResult<Tensor> {
+                    weight27
+                        .narrow(1, k, 1)?
+                        .squeeze(1)?
+                        .transpose(0, 1)?
+                        .contiguous()
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("sparse kernel split panicked"))
+                .collect::<CandleResult<Vec<_>>>()
+        })?;
+        if profile {
+            eprintln!(
+                "[stage] sparse conv load split [{in_channels}->{out_channels}]: {:.2}s",
+                mark.elapsed().as_secs_f64()
+            );
+        }
+        let mark = std::time::Instant::now();
+        let kernels = kernels_cpu
+            .into_iter()
+            .map(|kernel| kernel.to_device(&device))
+            .collect::<CandleResult<Vec<_>>>()?;
+        if profile {
+            eprintln!(
+                "[stage] sparse conv load upload [{in_channels}->{out_channels}]: {:.2}s",
+                mark.elapsed().as_secs_f64()
+            );
+        }
         let bias = if bias {
             Some(vb.get(out_channels, "bias")?.to_dtype(DType::F32)?)
         } else {
             None
         };
         Ok(Self {
-            weight,
+            kernels,
             bias,
             in_channels,
             out_channels,
@@ -162,54 +330,97 @@ impl SparseConv3d {
         self.out_channels
     }
 
-    /// The transposed kernel `[27, Cout, Cin]`.
-    pub fn weight27(&self) -> &Tensor {
-        &self.weight
-    }
-
     /// `coords: [N]`, `feats: [N, Cin]` -> `[N, Cout]` F32. 27 gather + GEMM
     /// pairs accumulated in F32; missing neighbors contribute zero.
     pub fn forward(&self, coords: &[[i32; 3]], feats: &Tensor) -> CandleResult<Tensor> {
+        let indices = SparseConvIndices::new(coords, feats.device())?;
+        self.forward_with_indices(feats, &indices)
+    }
+
+    /// Same as [`Self::forward`] with precomputed neighbor rows (reuse them
+    /// across every convolution over the same coordinates).
+    pub fn forward_with_indices(
+        &self,
+        feats: &Tensor,
+        indices: &SparseConvIndices,
+    ) -> CandleResult<Tensor> {
         let (rows, channels) = feats.dims2()?;
-        if rows != coords.len() || channels != self.in_channels {
+        if rows != indices.rows || channels != self.in_channels {
             candle_core::bail!(
-                "SparseConv3d expects [N, {}] with N = {} coords, got [{rows}, {channels}]",
+                "SparseConv3d expects [N, {}] with N = {}, got [{rows}, {channels}]",
                 self.in_channels,
-                coords.len()
+                indices.rows
             );
         }
         let device = feats.device();
-        let map = CoordMap::new(coords);
-        let mut out = Tensor::zeros((rows, self.out_channels), DType::F32, device)?;
-        for k in 0..27 {
-            let delta = kernel_offset_delta(k);
-            // Destination rows (input rows with an active neighbor at this
-            // offset) and the matching source rows.
-            let mut dest: Vec<u32> = Vec::with_capacity(rows);
-            let mut src: Vec<u32> = Vec::with_capacity(rows);
-            for (index, coord) in coords.iter().enumerate() {
-                if let Some(source) = map.get([
-                    coord[0] + delta[0],
-                    coord[1] + delta[1],
-                    coord[2] + delta[2],
-                ]) {
-                    dest.push(index as u32);
-                    src.push(source);
-                }
-            }
-            if dest.is_empty() {
-                continue;
-            }
-            let pairs = dest.len();
-            let dest = Tensor::from_vec(dest, (pairs,), device)?;
-            let src = Tensor::from_vec(src, (pairs,), device)?;
-            let gathered = feats.index_select(&src, 0)?; // [n, Cin]
-            let kernel = self.weight.narrow(0, k, 1)?.squeeze(0)?; // [Cout, Cin]
-            let product = gathered.matmul(&kernel.transpose(0, 1)?)?; // [n, Cout]
-            out = out.index_add(&dest, &product, 0)?;
+        let profile = std::env::var_os("LUX3D_SPARSE_CONV_PROFILE").is_some();
+        if profile {
+            device.synchronize()?;
         }
+        let mark = std::time::Instant::now();
+        if rows == 0 {
+            return Tensor::zeros((0, self.out_channels), DType::F32, device);
+        }
+        let kernel_dtype = self.kernels[0].dtype();
+        let feats_in = if feats.dtype() == kernel_dtype {
+            feats.clone()
+        } else {
+            feats.to_dtype(kernel_dtype)?
+        };
+        // Row `rows` of the padded tensor is all-zero, so gather tables can
+        // use it for missing neighbors without a per-row mask. Interior
+        // stages have no missing neighbors, and then the zero row/copy is
+        // skipped entirely.
+        let padded = if indices.has_missing {
+            Some(Tensor::cat(
+                &[
+                    feats_in.clone(),
+                    Tensor::zeros((1, channels), kernel_dtype, device)?,
+                ],
+                0,
+            )?)
+        } else {
+            None
+        };
+        // Gather + GEMM per offset, accumulated with plain adds. Scatter add
+        // would issue `27 * N * Cout` atomics (17.5 s for the 2M-row stage on
+        // CUDA); these gathers stream at memory bandwidth.
+        let mut acc: Option<Tensor> = None;
+        for (k, source) in indices.offsets.iter().enumerate() {
+            let input = match source {
+                OffsetSource::Empty => continue,
+                OffsetSource::Identity => feats_in.narrow(0, 0, rows)?,
+                OffsetSource::Dense(src) => padded
+                    .as_ref()
+                    .expect("dense gather with missing sentinel row")
+                    .index_select(src, 0)?,
+            };
+            let product = input.matmul(&self.kernels[k])?;
+            let product = if product.dtype() == DType::F32 {
+                product
+            } else {
+                product.to_dtype(DType::F32)?
+            };
+            acc = Some(match acc {
+                None => product,
+                Some(total) => total.add(&product)?,
+            });
+        }
+        let mut out = match acc {
+            Some(out) => out,
+            None => Tensor::zeros((rows, self.out_channels), DType::F32, device)?,
+        };
         if let Some(bias) = &self.bias {
             out = out.broadcast_add(bias)?;
+        }
+        drop(padded);
+        if profile {
+            device.synchronize()?;
+            eprintln!(
+                "sparse conv [{rows}, {channels}] -> {}: {:.3}s",
+                self.out_channels,
+                mark.elapsed().as_secs_f64()
+            );
         }
         Ok(out)
     }
@@ -277,12 +488,59 @@ pub fn channel_to_spatial(
         );
     }
     let leaves = subdivision_leaves(subdiv_logits, rows)?;
-    let child_channels = channels / 8;
+    let (out_coords, src_rows) = child_layout(coords, &leaves);
+    Ok(Channel2SpatialOutput {
+        feats: select_children(feats, &src_rows, out_coords.len())?,
+        sub_binary: sub_binary_from_leaves(&leaves, rows, feats.device())?,
+        coords: out_coords,
+    })
+}
+
+/// Apply the same C2S subdivision to two feature tensors on the same coords
+/// (the `h` and residual `x` paths of `SparseResBlockC2S3d`). The reference
+/// runs `channel_to_spatial` twice; both calls binarize identical logits and
+/// rebuild identical child rows, so do it once here.
+pub fn channel_to_spatial_pair(
+    coords: &[[i32; 3]],
+    first: &Tensor,
+    second: &Tensor,
+    subdiv_logits: &Tensor,
+) -> CandleResult<(Channel2SpatialOutput, Channel2SpatialOutput)> {
+    let (rows, channels) = first.dims2()?;
+    if rows != coords.len() || second.dim(0)? != rows {
+        candle_core::bail!(
+            "channel_to_spatial_pair coords/features mismatch: {} coords vs {rows} rows",
+            coords.len()
+        );
+    }
+    if channels % 8 != 0 || second.dim(1)? % 8 != 0 {
+        candle_core::bail!(
+            "channel_to_spatial_pair expects channels divisible by 8, got {channels} and {}",
+            second.dim(1)?
+        );
+    }
+    let leaves = subdivision_leaves(subdiv_logits, rows)?;
+    let (out_coords, src_rows) = child_layout(coords, &leaves);
+    let sub_binary = sub_binary_from_leaves(&leaves, rows, first.device())?;
+    let first_out = Channel2SpatialOutput {
+        feats: select_children(first, &src_rows, out_coords.len())?,
+        sub_binary: sub_binary.clone(),
+        coords: out_coords.clone(),
+    };
+    let second_out = Channel2SpatialOutput {
+        feats: select_children(second, &src_rows, out_coords.len())?,
+        sub_binary,
+        coords: out_coords,
+    };
+    Ok((first_out, second_out))
+}
+
+fn child_layout(coords: &[[i32; 3]], leaves: &[[bool; 8]]) -> (Vec<[i32; 3]>, Vec<u32>) {
     let mut out_coords: Vec<[i32; 3]> = Vec::new();
     let mut src_rows: Vec<u32> = Vec::new();
     for (parent, coord) in coords.iter().enumerate() {
-        for subidx in 0..8usize {
-            if leaves[parent][subidx] {
+        for (subidx, &leaf) in leaves[parent].iter().enumerate() {
+            if leaf {
                 let dx = (subidx % 2) as i32;
                 let dy = ((subidx / 2) % 2) as i32;
                 let dz = (subidx / 4) as i32;
@@ -291,23 +549,29 @@ pub fn channel_to_spatial(
             }
         }
     }
-    let device = feats.device();
-    let flat = feats.reshape((rows * 8, child_channels))?;
-    let src = Tensor::from_vec(src_rows, (out_coords.len(),), device)?;
-    let out_feats = flat.index_select(&src, 0)?;
-    let sub_binary = Tensor::from_vec(
+    (out_coords, src_rows)
+}
+
+fn select_children(feats: &Tensor, src_rows: &[u32], children: usize) -> CandleResult<Tensor> {
+    let (rows, channels) = feats.dims2()?;
+    let flat = feats.reshape((rows * 8, channels / 8))?;
+    let src = Tensor::from_vec(src_rows.to_vec(), (children,), feats.device())?;
+    flat.index_select(&src, 0)
+}
+
+fn sub_binary_from_leaves(
+    leaves: &[[bool; 8]],
+    rows: usize,
+    device: &Device,
+) -> CandleResult<Tensor> {
+    Tensor::from_vec(
         leaves
             .iter()
-            .flat_map(|leaf| leaf.iter().map(|&l| l as u8 as f32).collect::<Vec<_>>())
+            .flat_map(|leaf| leaf.iter().map(|&l| l as u8 as f32))
             .collect(),
         (rows, 8),
         device,
-    )?;
-    Ok(Channel2SpatialOutput {
-        coords: out_coords,
-        feats: out_feats,
-        sub_binary,
-    })
+    )
 }
 
 /// The C2S skip ("skin") connection: repeat every channel `repeats` times
@@ -361,7 +625,7 @@ pub fn spatial_to_channel(
         .collect();
     parents.sort_unstable();
     parents.dedup();
-    let parent_index: HashMap<[i32; 3], usize> =
+    let parent_index: FxHashMap<[i32; 3], usize> =
         parents.iter().enumerate().map(|(i, p)| (*p, i)).collect();
     let mut out = vec![0.0_f32; parents.len() * 8 * channels];
     let device = feats.device().clone();

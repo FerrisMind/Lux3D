@@ -42,7 +42,9 @@ use candle_core::{DType, Result as CandleResult, Tensor};
 use super::nn_blocks::{Linear, linear};
 use super::trellis2_blocks::layer_norm_no_affine;
 use super::trellis2_mesh::{DualGridFields, DualGridMesh, flexible_dual_grid_to_mesh};
-use super::trellis2_sparse::{SparseConv3d, channel_to_spatial, repeat_channels};
+use super::trellis2_sparse::{
+    SparseConv3d, SparseConvIndices, channel_to_spatial_pair, repeat_channels,
+};
 use crate::weights::VarBuilder;
 
 /// Shape/texture sparse VAE decoder architecture parameters
@@ -164,15 +166,11 @@ pub(crate) fn channel_layer_norm_affine(
     bias: &Tensor,
     eps: f64,
 ) -> CandleResult<Tensor> {
-    let (_rows, channels) = xs.dims2()?;
-    let mean = xs.mean_keepdim(candle_core::D::Minus1)?;
-    let centered = xs.broadcast_sub(&mean)?;
-    let var = centered.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
-    let denom = var.affine(1.0, eps)?.sqrt()?;
-    let normalized = centered.broadcast_div(&denom)?;
-    normalized
-        .broadcast_mul(&weight.reshape((1, channels))?)?
-        .broadcast_add(&bias.reshape((1, channels))?)
+    // The manual mean/sub/sqr/div chain costs five rank-2 materializations
+    // per norm (72 of them per shape decode); the fused kernel normalizes the
+    // flattened `[N, C]` rows in one dispatch and matches the reference
+    // biased-variance LayerNorm.
+    candle_nn::ops::layer_norm(xs, weight, bias, eps as f32)
 }
 
 /// `SparseConvNeXtBlock3d`: conv -> affine LN(eps 1e-6) -> MLP -> residual.
@@ -203,8 +201,14 @@ impl ConvNeXtBlock {
     /// Reference `_forward`: `h = conv(x); h = norm(h); h = mlp(h)` with
     /// `mlp = Linear -> SiLU -> Linear`; residual `h + x`. No activation
     /// between the norm and the first MLP linear.
-    pub(crate) fn forward(&self, coords: &[[i32; 3]], feats: &Tensor) -> CandleResult<Tensor> {
-        let h = self.conv.forward(coords, feats)?;
+    /// Same block with precomputed neighbor rows. VAE stages pass one
+    /// [`SparseConvIndices`] to every block on the same coords.
+    pub(crate) fn forward_with_indices(
+        &self,
+        feats: &Tensor,
+        indices: &SparseConvIndices,
+    ) -> CandleResult<Tensor> {
+        let h = self.conv.forward_with_indices(feats, indices)?;
         let h = channel_layer_norm_affine(&h, &self.norm_weight, &self.norm_bias, 1e-6)?;
         let h = self.mlp0.forward(&h)?;
         let h = h.silu()?;
@@ -263,6 +267,7 @@ impl C2SResBlock {
         coords: &[[i32; 3]],
         feats: &Tensor,
         subdiv_logits: &Tensor,
+        parent_indices: &SparseConvIndices,
     ) -> CandleResult<(Vec<[i32; 3]>, Tensor)> {
         let rows = feats.dim(0)?;
         if rows != coords.len() {
@@ -274,13 +279,12 @@ impl C2SResBlock {
         // h = silu(norm1(x)) -> conv1 (on the parent coords) -> C2S.
         let h = channel_layer_norm_affine(feats, &self.norm1_weight, &self.norm1_bias, 1e-6)?;
         let h = h.silu()?;
-        let h = self.conv1.forward(coords, &h)?; // [N, out*8]
-        let h_c2s = channel_to_spatial(coords, &h, subdiv_logits)?;
-        // x = C2S(x, subdiv): the residual path through the same subdivision.
-        let x_c2s = channel_to_spatial(coords, feats, subdiv_logits)?;
+        let h = self.conv1.forward_with_indices(&h, parent_indices)?; // [N, out*8]
+        let (h_c2s, x_c2s) = channel_to_spatial_pair(coords, &h, feats, subdiv_logits)?;
         // h = silu(norm2(h)) (non-affine) -> conv2.
         let h = layer_norm_no_affine(&h_c2s.feats, 1e-6)?.silu()?;
-        let h = self.conv2.forward(&h_c2s.coords, &h)?; // [M, out]
+        let child_indices = SparseConvIndices::new(&h_c2s.coords, h.device())?;
+        let h = self.conv2.forward_with_indices(&h, &child_indices)?; // [M, out]
         // skip = repeat_interleave(C2S(x), out // (channels // 8)).
         let repeats = self.out_channels / (self.channels / 8);
         let skip = repeat_channels(&x_c2s.feats, repeats)?;
@@ -290,10 +294,12 @@ impl C2SResBlock {
 
     /// pred_subdiv path: predict the logits from `feats`, then run the
     /// shared body. Returns the raw logits too.
-    fn forward(
+    /// Predicted-subdivision body with cached parent neighbor rows.
+    fn forward_with_indices(
         &self,
         coords: &[[i32; 3]],
         feats: &Tensor,
+        parent_indices: &SparseConvIndices,
     ) -> CandleResult<(Vec<[i32; 3]>, Tensor, Tensor)> {
         let subdiv_logits = match &self.to_subdiv {
             Some(to_subdiv) => to_subdiv.forward(feats)?,
@@ -302,7 +308,8 @@ impl C2SResBlock {
                  supply guide logits through forward_guided"
             ),
         };
-        let (child_coords, out) = self.forward_with_logits(coords, feats, &subdiv_logits)?;
+        let (child_coords, out) =
+            self.forward_with_logits(coords, feats, &subdiv_logits, parent_indices)?;
         Ok((child_coords, out, subdiv_logits))
     }
 
@@ -310,13 +317,14 @@ impl C2SResBlock {
     /// externally supplied raw subdivision logits `[N, 8]` (the shape
     /// decoder's `to_subdiv` output at the same stage; `logits > 0`
     /// binarized inside C2S exactly like the reference `guide_subs`).
-    fn forward_guided(
+    fn forward_guided_with_indices(
         &self,
         coords: &[[i32; 3]],
         feats: &Tensor,
         guide_logits: &Tensor,
+        parent_indices: &SparseConvIndices,
     ) -> CandleResult<(Vec<[i32; 3]>, Tensor)> {
-        self.forward_with_logits(coords, feats, guide_logits)
+        self.forward_with_logits(coords, feats, guide_logits, parent_indices)
     }
 }
 
@@ -378,6 +386,8 @@ impl Trellis2ShapeVaeDecoder {
                 config.num_blocks.len()
             );
         }
+        let profile = std::env::var_os("LUX3D_STAGE_TIME").is_some();
+        let mut load_mark = std::time::Instant::now();
         let from_latent = linear(
             vb.pp("from_latent"),
             config.latent_channels,
@@ -390,6 +400,13 @@ impl Trellis2ShapeVaeDecoder {
             config.out_channels,
             true,
         )?;
+        if profile {
+            eprintln!(
+                "[stage] trellis2 shape vae load head: {:.2}s",
+                load_mark.elapsed().as_secs_f64()
+            );
+            load_mark = std::time::Instant::now();
+        }
         let mut stages = Vec::with_capacity(config.num_blocks.len());
         for (stage, &count) in config.num_blocks.iter().enumerate() {
             let channels = config.stage_in_channels(stage);
@@ -412,6 +429,13 @@ impl Trellis2ShapeVaeDecoder {
             }
             super::drain_upload_staging(vb.device())?;
             stages.push(blocks);
+            if profile {
+                eprintln!(
+                    "[stage] trellis2 shape vae load stage {stage}: {:.2}s",
+                    load_mark.elapsed().as_secs_f64()
+                );
+                load_mark = std::time::Instant::now();
+            }
         }
         Ok(Self {
             config: config.clone(),
@@ -482,15 +506,38 @@ impl Trellis2ShapeVaeDecoder {
         let mut trace = Vec::new();
         let mut h = self.from_latent.forward(latent)?;
         let mut coords = coords.to_vec();
+        let profile = std::env::var_os("LUX3D_STAGE_TIME").is_some();
+        let mut mark = std::time::Instant::now();
         for (stage, blocks) in self.stages.iter().enumerate() {
+            // Every block until the C2S up-block runs on the same coords, so
+            // build the 27 neighbor row sets once for the whole stage.
+            // The final stage has no blocks (only the norm/output layer), so
+            // skip its indices: for 2M voxels the unused 27-offset tables
+            // alone cost the stage ~20 s and ~450 MB.
+            if blocks.is_empty() {
+                if profile {
+                    eprintln!(
+                        "[stage] trellis2 shape vae stage {stage}: {:.2}s ({} voxels, 0 blocks)",
+                        mark.elapsed().as_secs_f64(),
+                        coords.len()
+                    );
+                    mark = std::time::Instant::now();
+                }
+                continue;
+            }
+            let stage_indices = SparseConvIndices::new(&coords, h.device())?;
             for (block_index, block) in blocks.iter().enumerate() {
+                let block_mark = std::time::Instant::now();
                 let subdiv;
+                let kind;
                 match block {
                     VaeStageBlock::ConvNeXt(conv_next) => {
-                        h = conv_next.forward(&coords, &h)?;
+                        h = conv_next.forward_with_indices(&h, &stage_indices)?;
                         subdiv = None;
+                        kind = "convnext";
                     }
                     VaeStageBlock::C2S(c2s) => {
+                        kind = "c2s";
                         let guided = guide_subs.map(|guides| {
                             let logits = &guides[guide_index];
                             guide_index += 1;
@@ -498,15 +545,20 @@ impl Trellis2ShapeVaeDecoder {
                         });
                         match guided {
                             Some(logits) => {
-                                let (child_coords, child_feats) =
-                                    c2s.forward_guided(&coords, &h, &logits)?;
+                                let (child_coords, child_feats) = c2s.forward_guided_with_indices(
+                                    &coords,
+                                    &h,
+                                    &logits,
+                                    &stage_indices,
+                                )?;
                                 subdiv_logits.push(logits.clone());
                                 coords = child_coords;
                                 h = child_feats;
                                 subdiv = Some(logits);
                             }
                             None => {
-                                let (child_coords, child_feats, sub) = c2s.forward(&coords, &h)?;
+                                let (child_coords, child_feats, sub) =
+                                    c2s.forward_with_indices(&coords, &h, &stage_indices)?;
                                 subdiv_logits.push(sub.clone());
                                 coords = child_coords;
                                 h = child_feats;
@@ -514,6 +566,13 @@ impl Trellis2ShapeVaeDecoder {
                             }
                         }
                     }
+                }
+                if profile {
+                    eprintln!(
+                        "[stage] trellis2 shape vae stage {stage} block {block_index} ({kind}): {:.2}s ({} voxels)",
+                        block_mark.elapsed().as_secs_f64(),
+                        coords.len()
+                    );
                 }
                 if collect_trace {
                     trace.push(ShapeVaeBlockTrace {
@@ -524,6 +583,15 @@ impl Trellis2ShapeVaeDecoder {
                         subdiv: subdiv.clone(),
                     });
                 }
+            }
+            if profile {
+                eprintln!(
+                    "[stage] trellis2 shape vae stage {stage}: {:.2}s ({} voxels, {} blocks)",
+                    mark.elapsed().as_secs_f64(),
+                    coords.len(),
+                    blocks.len()
+                );
+                mark = std::time::Instant::now();
             }
         }
         // Final non-affine F.layer_norm (eps 1e-5) then output_layer.
@@ -579,13 +647,15 @@ impl Trellis2ShapeVaeDecoder {
             if stage == upsample_times {
                 return Ok(coords);
             }
+            let stage_indices = SparseConvIndices::new(&coords, h.device())?;
             for block in blocks {
                 match block {
                     VaeStageBlock::ConvNeXt(conv_next) => {
-                        h = conv_next.forward(&coords, &h)?;
+                        h = conv_next.forward_with_indices(&h, &stage_indices)?;
                     }
                     VaeStageBlock::C2S(c2s) => {
-                        let (child_coords, child_feats, _subdiv) = c2s.forward(&coords, &h)?;
+                        let (child_coords, child_feats, _subdiv) =
+                            c2s.forward_with_indices(&coords, &h, &stage_indices)?;
                         coords = child_coords;
                         h = child_feats;
                     }
@@ -657,8 +727,25 @@ pub fn decode_shape_mesh(
     resolution: usize,
     voxel_margin: f32,
 ) -> CandleResult<(ShapeVaeDecodeOutput, DualGridMesh)> {
+    let profile = std::env::var_os("LUX3D_STAGE_TIME").is_some();
+    let mut mark = std::time::Instant::now();
     let decoded = decoder.decode(coords, latent, false)?;
+    if profile {
+        eprintln!(
+            "[stage] trellis2 shape vae decode: {:.2}s ({} voxels)",
+            mark.elapsed().as_secs_f64(),
+            decoded.coords.len()
+        );
+        mark = std::time::Instant::now();
+    }
     let fields = dual_grid_fields(&decoded.feats, voxel_margin)?;
+    if profile {
+        eprintln!(
+            "[stage] trellis2 shape vae fields: {:.2}s",
+            mark.elapsed().as_secs_f64()
+        );
+        mark = std::time::Instant::now();
+    }
     let mesh = flexible_dual_grid_to_mesh(
         &decoded.coords,
         &fields.dual,
@@ -667,5 +754,11 @@ pub fn decode_shape_mesh(
         [resolution, resolution, resolution],
         [[-0.5_f32; 3], [0.5_f32; 3]],
     );
+    if profile {
+        eprintln!(
+            "[stage] trellis2 shape vae extract: {:.2}s",
+            mark.elapsed().as_secs_f64()
+        );
+    }
     Ok((decoded, mesh))
 }

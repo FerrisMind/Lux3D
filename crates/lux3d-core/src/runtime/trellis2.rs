@@ -1656,12 +1656,20 @@ impl Trellis2Pipeline {
         target_resolution: u32,
         device: &Device,
     ) -> Result<(Vec<[i32; 3]>, Vec<[i32; 3]>, u32)> {
+        let profile = std::env::var_os("LUX3D_STAGE_TIME").is_some();
+        let load_mark = std::time::Instant::now();
         let vb = self.stage_var_builder("shape_dec", device)?;
         let decoder =
             Trellis2ShapeVaeDecoder::load(vb, &Trellis2ShapeVaeConfig::flexi_dual_shape())
                 .map_err(|source| Lux3dError::CanonicalWeightsValidation {
                     message: format!("failed to load TRELLIS.2 shape_dec: {source}"),
                 })?;
+        if profile {
+            eprintln!(
+                "[stage] trellis2 shape vae load: {:.2}s",
+                load_mark.elapsed().as_secs_f64()
+            );
+        }
         let hr_coords = decoder
             .upsample_coords(lr_coords, lr_slat_denorm, TRELLIS2_CASCADE_UPSAMPLE_TIMES)
             .map_err(|source| Lux3dError::CanonicalWeightsValidation {
@@ -1786,12 +1794,20 @@ impl Trellis2Pipeline {
         device: &Device,
         shape_resolution: u32,
     ) -> Result<(super::trellis2_vae::ShapeVaeDecodeOutput, DualGridMesh)> {
+        let profile = std::env::var_os("LUX3D_STAGE_TIME").is_some();
+        let load_mark = std::time::Instant::now();
         let vb = self.stage_var_builder("shape_dec", device)?;
         let decoder =
             Trellis2ShapeVaeDecoder::load(vb, &Trellis2ShapeVaeConfig::flexi_dual_shape())
                 .map_err(|source| Lux3dError::CanonicalWeightsValidation {
                     message: format!("failed to load TRELLIS.2 shape_dec: {source}"),
                 })?;
+        if profile {
+            eprintln!(
+                "[stage] trellis2 shape vae load: {:.2}s",
+                load_mark.elapsed().as_secs_f64()
+            );
+        }
         decode_shape_mesh(
             &decoder,
             coords,
