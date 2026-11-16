@@ -293,6 +293,57 @@ fn vggt_runtime_matches_pi3_frames_golden_baseline() {
     );
 }
 
+/// Dtype option plumbing: `load_with_options` selects the pipeline dtype
+/// (`None` = F32) without touching the weights; public outputs stay F32 by
+/// construction (see the F32 conversion in the forward pass).
+#[test]
+fn vggt_load_with_options_selects_dtype_and_defaults() {
+    let assets = model_asset_options(ModelFamily::Vggt);
+
+    let f16_pipeline = VggtPipeline::load_with_options(
+        assets.clone(),
+        lux3d_core::runtime::VggtRunOptions {
+            dtype: Some(DType::F16),
+            ..Default::default()
+        },
+    )
+    .expect("vggt pipeline with f16 option");
+    assert_eq!(f16_pipeline.dtype(), DType::F16);
+
+    let default_pipeline =
+        VggtPipeline::load_with_options(assets, lux3d_core::runtime::VggtRunOptions::default())
+            .expect("vggt pipeline with default options");
+    assert_eq!(default_pipeline.dtype(), DType::F32);
+}
+
+/// `batch_size == 0` is rejected by the high-level entry point before any
+/// preprocessing or weight loading happens.
+#[test]
+fn vggt_infer_from_path_with_options_rejects_batch_size_zero() {
+    let pipeline = VggtPipeline::load_with_options(
+        model_asset_options(ModelFamily::Vggt),
+        lux3d_core::runtime::VggtRunOptions {
+            batch_size: Some(0),
+            ..Default::default()
+        },
+    )
+    .expect("vggt pipeline");
+    let error = pipeline
+        .infer_from_path_with_options(
+            std::path::Path::new("does-not-matter"),
+            &Device::Cpu,
+            &lux3d_core::runtime::VggtRunOptions {
+                batch_size: Some(0),
+                ..Default::default()
+            },
+        )
+        .expect_err("batch_size 0 must be rejected");
+    assert!(
+        error.to_string().contains("batch_size"),
+        "unexpected error: {error}"
+    );
+}
+
 #[test]
 fn vggt_neural_stage_contract_uses_corrected_shapes() {
     let stage = lux3d_core::neural::VggtNeuralStage;

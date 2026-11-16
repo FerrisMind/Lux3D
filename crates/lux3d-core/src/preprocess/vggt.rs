@@ -1,3 +1,44 @@
+//! VGGT input preprocessing, mirroring `vggt.utils.load_fn` from the upstream
+//! reference.
+//!
+//! # Preprocess modes ([`VggtPreprocessMode`])
+//!
+//! * [`VggtPreprocessMode::Crop`] (default) — the reference
+//!   `load_and_preprocess_images(mode="crop")` recipe: resize so the width is
+//!   518 (height keeps the aspect ratio and is rounded to a multiple of 14),
+//!   then center-crop rows when the resized height exceeds 518, then
+//!   center-pad to the batch maximum with white (1.0).
+//! * [`VggtPreprocessMode::Pad`] — the reference `load_and_preprocess_images(mode="pad")`
+//!   recipe: resize so the largest dimension is 518 while the other dimension
+//!   keeps the aspect ratio rounded to a multiple of 14, then center-pad to a
+//!   518x518 square with white (1.0). The padding happens *after* the `[0,1]`
+//!   tensor conversion, exactly like upstream (`F.pad(..., value=1.0)`, with
+//!   `pad_top = h_padding // 2`, `pad_left = w_padding // 2`). No pixels are
+//!   discarded in this mode.
+//!
+//! Both modes composite RGBA input over opaque white before the RGB conversion
+//! and normalize with the ImageNet mean/std afterwards.
+//!
+//! # Original-coordinate mapping
+//!
+//! Upstream `mode="pad"` does not return original coordinates, so this module
+//! defines the mapping itself (see [`VggtOriginalCoords`]): the resized
+//! original content occupies the centered `content_width x content_height`
+//! rectangle inside the prepared 518x518 frame, and per-axis scales follow the
+//! actual resize factors. Crop mode keeps the upstream uniform
+//! `max(w, h) / img_size` ratio in [`crate::geometry`] helpers for bit-parity.
+//!
+//! # Sources
+//!
+//! [`VggtPreprocessStage::prepare_inputs_from_path`] accepts a directory of
+//! frames, a video file (`.mp4`/`.mov`/`.avi`/`.mkv`) or a single image file
+//! (`.png`/`.jpg`/`.jpeg`/`.webp`/`.bmp`/`.tif`/`.tiff`); a single image is a
+//! one-frame source.
+//!
+//! Frame batching (chunked multi-forward inference) lives in
+//! [`crate::runtime::VggtPipeline`] (`VggtRunOptions::batch_size`); the
+//! preprocessing itself always materializes the full frame list.
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -19,15 +60,129 @@ use crate::{
 const TARGET_WIDTH: u32 = 518;
 const PATCH_MULTIPLE: u32 = 14;
 
+/// VGGT input preprocessing mode (upstream `load_and_preprocess_images`
+/// `mode="crop"` / `mode="pad"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VggtPreprocessMode {
+    /// Resize to width 518, center-crop rows taller than 518, then center-pad
+    /// to the batch maximum with white (upstream default).
+    #[default]
+    Crop,
+    /// Resize so the largest dimension is 518 (aspect preserved, shorter side
+    /// rounded to a multiple of 14) and center-pad to 518x518 with white. No
+    /// pixels are discarded.
+    Pad,
+}
+
+/// Per-frame mapping from the prepared (padded) VGGT frame back to the original
+/// image, for both preprocess modes (see [`VggtPreprocessMode`]).
+///
+/// The resized original content occupies the rectangle
+/// `[offset_x, offset_x + content_width) x [offset_y, offset_y + content_height)`
+/// inside the prepared frame. A prepared-frame pixel `(x_p, y_p)` inside the
+/// content rectangle maps back to the original pixel `(u, v)` with
+/// `u = (x_p - offset_x) * width / content_width` and
+/// `v = (y_p - offset_y) * height / content_height` (exact for
+/// [`VggtPreprocessMode::Pad`], and for crop frames whose height was not
+/// center-cropped).
+///
+/// The reference COLMAP rescale instead uses the uniform ratio
+/// `max(width, height) / reconstruction_size` (see
+/// `rename_colmap_recons_and_rescale_camera`); both mappings are exposed —
+/// [`VggtOriginalCoords::resize_ratio`] stays the crop-formula compatibility
+/// helper, while [`VggtOriginalCoords::axis_scales_to_original`] gives the
+/// exact per-axis factors and matches what the crop recipe actually does per
+/// axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VggtOriginalCoords {
+    /// Original image width in pixels.
+    pub width: u32,
+    /// Original image height in pixels.
+    pub height: u32,
+    /// Left edge of the resized original content inside the prepared frame.
+    /// Non-zero only when white padding was applied (pad mode, or crop mode
+    /// batch padding for narrower frames).
+    pub offset_x: u32,
+    /// Top edge of the resized original content inside the prepared frame.
+    /// Combines the height center-crop offset (`start_y`) and the white pad.
+    pub offset_y: u32,
+    /// Width of the resized original content in prepared-frame pixels
+    /// (`target_width` in crop mode; the `/14`-rounded resized width in pad
+    /// mode).
+    pub content_width: u32,
+    /// Height of the resized original content in prepared-frame pixels (the
+    /// crop-mode frame height before batch padding; the `/14`-rounded resized
+    /// height in pad mode).
+    pub content_height: u32,
+    /// Preprocess mode that produced this frame. The upstream pad recipe does
+    /// not report original coordinates, so this discriminator lets the
+    /// geometry helpers pick the exact per-axis mapping (pad) or the reference
+    /// uniform ratio (crop).
+    pub mode: VggtPreprocessMode,
+}
+
+impl VggtOriginalCoords {
+    /// Reference `rename_colmap_recons_and_rescale_camera` ratio:
+    /// `max(real_width, real_height) / img_size`.
+    ///
+    /// This is the *crop-formula* compatibility helper: upstream applies it to
+    /// both axes even in crop mode where the vertical scale actually differs.
+    /// For the exact per-axis factors use [`VggtOriginalCoords::axis_scales_to_original`].
+    pub fn resize_ratio(&self, img_size: f64) -> f64 {
+        if img_size <= 0.0 {
+            return 0.0;
+        }
+        f64::from(self.width.max(self.height)) / img_size
+    }
+
+    /// Exact per-axis prepared→original scale factors
+    /// `(width / content_width, height / content_height)`.
+    ///
+    /// Exact for pad mode (no cropping ever happens) and for crop frames whose
+    /// resized height was not center-cropped; crop frames with a height crop
+    /// keep the uniform reference ratio instead (see [`Self::resize_ratio`]).
+    /// A degenerate zero content dimension yields `0.0` on that axis rather
+    /// than a division by zero.
+    pub fn axis_scales_to_original(&self) -> (f64, f64) {
+        let scale_x = if self.content_width == 0 {
+            0.0
+        } else {
+            f64::from(self.width) / f64::from(self.content_width)
+        };
+        let scale_y = if self.content_height == 0 {
+            0.0
+        } else {
+            f64::from(self.height) / f64::from(self.content_height)
+        };
+        (scale_x, scale_y)
+    }
+
+    /// Top-left corner of the original content inside the prepared frame.
+    pub fn top_left(&self) -> (f64, f64) {
+        (f64::from(self.offset_x), f64::from(self.offset_y))
+    }
+
+    /// Principal point of the original image: `(real_width / 2, real_height / 2)`.
+    pub fn original_principal_point(&self) -> (f64, f64) {
+        (f64::from(self.width) / 2.0, f64::from(self.height) / 2.0)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VggtPreparedInputs {
     pub interval: usize,
     pub original_size: SpatialSize,
     pub target_size: SpatialSize,
+    /// Preprocess mode the frames were prepared with (mirrored in every
+    /// [`VggtOriginalCoords::mode`]).
+    pub preprocess_mode: VggtPreprocessMode,
     /// `[S, 3, H, W]` f32, range `[0, 1]`.
     pub rgb_frames: Tensor,
     /// `[1, S, 3, H, W]` f32, ImageNet-normalized.
     pub normalized_frames: Tensor,
+    /// One entry per frame: original resolution plus the crop/pad offset that
+    /// locates the resized original content inside the prepared frame.
+    pub original_coords: Vec<VggtOriginalCoords>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,13 +201,30 @@ impl Default for VggtPreprocessStage {
 }
 
 impl VggtPreprocessStage {
-    /// Load a directory of RGB frames or a video file (`.mp4`/`.mov`/`.avi`/
-    /// `.mkv`), then apply the VGGT `mode="crop"` preprocessing recipe from
-    /// `vggt.utils.load_fn`.
+    /// Load a directory of RGB frames, a video file (`.mp4`/`.mov`/`.avi`/
+    /// `.mkv`) or a single image file, then apply the VGGT `mode="crop"`
+    /// preprocessing recipe from `vggt.utils.load_fn`.
     pub fn prepare_inputs_from_path(
         &self,
         source: &Path,
         interval: Option<usize>,
+        device: &Device,
+    ) -> Result<VggtPreparedInputs> {
+        self.prepare_inputs_from_path_with_mode(
+            source,
+            interval,
+            VggtPreprocessMode::default(),
+            device,
+        )
+    }
+
+    /// [`Self::prepare_inputs_from_path`] with an explicit preprocess mode
+    /// (see [`VggtPreprocessMode`] and the module docs for the exact recipes).
+    pub fn prepare_inputs_from_path_with_mode(
+        &self,
+        source: &Path,
+        interval: Option<usize>,
+        mode: VggtPreprocessMode,
         device: &Device,
     ) -> Result<VggtPreparedInputs> {
         let interval = interval.unwrap_or_else(|| default_interval_for(source));
@@ -68,10 +240,27 @@ impl VggtPreprocessStage {
 
         let mut shapes = Vec::with_capacity(sampled_paths.len());
         let mut frames = Vec::with_capacity(sampled_paths.len());
+        let mut original_dims = Vec::with_capacity(sampled_paths.len());
+        // Content top-left inside the per-frame tensor *before* the batch
+        // maximum white padding: `(0, crop_start_y)` in crop mode, the
+        // centered white-pad offsets in pad mode.
+        let mut content_offsets = Vec::with_capacity(sampled_paths.len());
+        // Size of the resized original content (equals `shape` in crop mode;
+        // smaller than the 518x518 frame in pad mode).
+        let mut content_sizes = Vec::with_capacity(sampled_paths.len());
         for path in sampled_paths {
             let image = load_rgb_frame(path)?;
-            let (shape, chw) = self.resize_and_crop_frame(&image)?;
+            original_dims.push(image.dimensions());
+            let (shape, offset, content, chw) = match mode {
+                VggtPreprocessMode::Crop => {
+                    let (shape, crop_start_y, chw) = self.resize_and_crop_frame(&image)?;
+                    (shape, (0, crop_start_y), shape, chw)
+                }
+                VggtPreprocessMode::Pad => self.resize_and_pad_frame(&image)?,
+            };
             shapes.push(shape);
+            content_offsets.push(offset);
+            content_sizes.push(content);
             frames.push(chw);
         }
 
@@ -82,6 +271,26 @@ impl VggtPreprocessStage {
                 "VGGT preprocessing produced an empty frame",
             ));
         }
+
+        // Per-frame top-left of the resized original content inside the padded
+        // frame: the per-mode content offset plus the batch white pad.
+        let original_coords = shapes
+            .iter()
+            .zip(&original_dims)
+            .zip(&content_offsets)
+            .zip(&content_sizes)
+            .map(
+                |(((shape, (width, height)), &(offset_x, offset_y)), content)| VggtOriginalCoords {
+                    width: *width,
+                    height: *height,
+                    offset_x: offset_x + (max_width - shape.width) / 2,
+                    offset_y: offset_y + (max_height - shape.height) / 2,
+                    content_width: content.width,
+                    content_height: content.height,
+                    mode,
+                },
+            )
+            .collect();
 
         let plane = (max_height as usize) * (max_width as usize);
         let mut flattened = Vec::with_capacity(frames.len() * 3 * plane);
@@ -119,8 +328,10 @@ impl VggtPreprocessStage {
             interval,
             original_size,
             target_size: SpatialSize::new(max_width, max_height),
+            preprocess_mode: mode,
             rgb_frames,
             normalized_frames,
+            original_coords,
         })
     }
 
@@ -138,7 +349,35 @@ impl VggtPreprocessStage {
         )
     }
 
-    fn resize_and_crop_frame(&self, image: &RgbImage) -> Result<(SpatialSize, Vec<f32>)> {
+    /// Prepared frame size for `mode` (see [`Self::target_size_for`] for the
+    /// crop formula). Pad mode returns the `/14`-rounded resized content size;
+    /// the frame is additionally white-padded to a `target_width` square
+    /// afterwards.
+    pub fn target_size_for_mode(
+        &self,
+        original: SpatialSize,
+        target_width: u32,
+        mode: VggtPreprocessMode,
+    ) -> Result<SpatialSize> {
+        match mode {
+            VggtPreprocessMode::Crop => self.target_size_for(original, target_width),
+            VggtPreprocessMode::Pad => {
+                let (width, height) = scaled_pad_size(
+                    original.width,
+                    original.height,
+                    target_width,
+                    self.patch_multiple,
+                )?;
+                Ok(SpatialSize::new(width, height))
+            }
+        }
+    }
+
+    /// Returns `(frame size, crop offset, CHW pixels)`. The crop offset is the
+    /// row index inside the resized image from which the kept rows start
+    /// (non-zero only when the resized height exceeds `target_width`); it is
+    /// needed to map prepared pixels back to the original image.
+    fn resize_and_crop_frame(&self, image: &RgbImage) -> Result<(SpatialSize, u32, Vec<f32>)> {
         let (width, height) = image.dimensions();
         let target = scaled_crop_size(width, height, self.target_width, self.patch_multiple)?;
         let resized = resize_bicubic_pillow(image, target.width, target.height);
@@ -162,11 +401,61 @@ impl VggtPreprocessStage {
             }
         }
 
-        Ok((SpatialSize::new(self.target_width, out_height), chw))
+        Ok((
+            SpatialSize::new(self.target_width, out_height),
+            start_y,
+            chw,
+        ))
+    }
+
+    /// Returns `(frame size, content top-left, content size, CHW pixels)` for
+    /// pad mode. Mirrors `load_and_preprocess_images(mode="pad")`: resize so
+    /// the largest dimension is `target_width` (the other dimension keeps the
+    /// aspect ratio, rounded to `patch_multiple`), convert to `[0,1]`, *then*
+    /// center-pad to a `target_width` square with white (1.0) —
+    /// `pad_top = h_padding // 2`, `pad_left = w_padding // 2`, remainder on
+    /// the bottom/right. No rows or columns are cropped.
+    fn resize_and_pad_frame(
+        &self,
+        image: &RgbImage,
+    ) -> Result<(SpatialSize, (u32, u32), SpatialSize, Vec<f32>)> {
+        let (width, height) = image.dimensions();
+        let (new_width, new_height) =
+            scaled_pad_size(width, height, self.target_width, self.patch_multiple)?;
+        let resized = resize_bicubic_pillow(image, new_width, new_height);
+
+        let content = SpatialSize::new(new_width, new_height);
+        let plane = (new_height as usize) * (new_width as usize);
+        let mut chw = vec![0.0_f32; 3 * plane];
+        for y in 0..new_height {
+            for x in 0..new_width {
+                let pixel = resized.get_pixel(x, y);
+                for channel in 0..3 {
+                    chw[channel * plane + (y as usize) * (new_width as usize) + x as usize] =
+                        f32::from(pixel[channel]) / 255.0;
+                }
+            }
+        }
+
+        // White-pad the [0,1] tensor to the square target, centered exactly
+        // like the reference `F.pad` call.
+        let padded = pad_chw_to_max(&chw, content, self.target_width, self.target_width);
+        let offset_x = (self.target_width - new_width) / 2;
+        let offset_y = (self.target_width - new_height) / 2;
+        Ok((
+            SpatialSize::new(self.target_width, self.target_width),
+            (offset_x, offset_y),
+            content,
+            padded,
+        ))
     }
 }
 
 impl PreprocessStage<VggtRawInput, VggtPreparedBatch> for VggtPreprocessStage {
+    /// Contract-level stage descriptor. `VggtRawInput` carries no preprocess
+    /// mode, so this follows the upstream default (crop formula); the
+    /// mode-aware run surface is
+    /// [`Self::prepare_inputs_from_path_with_mode`].
     fn preprocess(&self, input: VggtRawInput) -> Result<VggtPreparedBatch> {
         if input.interval == 0 {
             return Err(Lux3dError::InvalidInput("interval must be at least 1"));
@@ -214,6 +503,49 @@ fn scaled_crop_size(
         target_width,
         (steps as u32) * patch_multiple,
     ))
+}
+
+/// Reference pad-mode sizing from `load_and_preprocess_images(mode="pad")`:
+/// the largest dimension becomes `target`, the other keeps the aspect ratio
+/// and is rounded to `patch_multiple` with Python's ties-to-even rounding.
+/// Returns `(new_width, new_height)`.
+fn scaled_pad_size(
+    width: u32,
+    height: u32,
+    target: u32,
+    patch_multiple: u32,
+) -> Result<(u32, u32)> {
+    if width == 0 || height == 0 {
+        return Err(Lux3dError::InvalidInput("original size must be non-zero"));
+    }
+    if target == 0 {
+        return Err(Lux3dError::InvalidInput("target size must be non-zero"));
+    }
+    if patch_multiple == 0 {
+        return Err(Lux3dError::InvalidInput("patch multiple must be non-zero"));
+    }
+
+    // `width >= height` matches the reference branch order exactly.
+    let (long, short) = if width >= height {
+        (width, height)
+    } else {
+        (height, width)
+    };
+    let scale = f64::from(target) / f64::from(long);
+    let multiple = f64::from(patch_multiple);
+    let steps = (f64::from(short) * scale / multiple).round_ties_even();
+    if steps < 1.0 {
+        return Err(Lux3dError::InvalidInput(
+            "scaled target size must be non-zero",
+        ));
+    }
+    let new_short = (steps as u32) * patch_multiple;
+
+    if width >= height {
+        Ok((target, new_short))
+    } else {
+        Ok((new_short, target))
+    }
 }
 
 /// Pillow's 8-bit resampler uses 22 fixed-point bits:
@@ -435,6 +767,15 @@ fn is_video_extension(ext: &str) -> bool {
     )
 }
 
+/// Extensions accepted for a *direct single-image* VGGT source. Directory
+/// listing keeps its own (narrower) filter so existing behavior is unchanged.
+fn is_image_extension(ext: &str) -> bool {
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "png" | "jpg" | "jpeg" | "webp" | "bmp" | "tif" | "tiff"
+    )
+}
+
 fn default_interval_for(source: &Path) -> usize {
     match source.extension().and_then(|ext| ext.to_str()) {
         Some(ext) if is_video_extension(ext) => 10,
@@ -489,16 +830,25 @@ fn load_sampled_frames(source: &Path, interval: usize) -> Result<SampledVggtFram
         });
     }
 
-    if source
+    let extension = source
         .extension()
         .and_then(|ext| ext.to_str())
-        .is_some_and(is_video_extension)
-    {
+        .map(str::to_ascii_lowercase);
+
+    if extension.as_deref().is_some_and(is_video_extension) {
         return extract_video_frames(source, interval);
     }
 
+    // A single image file is a one-frame source; `interval` does not apply.
+    if source.is_file() && extension.as_deref().is_some_and(is_image_extension) {
+        return Ok(SampledVggtFrames {
+            paths: vec![source.to_path_buf()],
+            _temp_dir: None,
+        });
+    }
+
     Err(Lux3dError::InvalidInput(
-        "VGGT input source must be a directory or a video file (.mp4/.mov/.avi/.mkv)",
+        "VGGT input source must be a directory, a video file (.mp4/.mov/.avi/.mkv) or an image file (.png/.jpg/.jpeg/.webp/.bmp/.tif/.tiff)",
     ))
 }
 
@@ -619,5 +969,343 @@ mod tests {
         assert!(!is_video_extension("png"));
         assert!(!is_video_extension("zip"));
         assert_eq!(1, default_interval_for(Path::new("frames")));
+    }
+
+    /// Per-frame original coords must record the center-crop offset (frame
+    /// taller than 518) and the white-pad offset (frame shorter than 518).
+    #[test]
+    fn original_coords_record_crop_and_pad_offsets() {
+        let dir = std::env::temp_dir().join(format!(
+            "lux3d-vggt-coords-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create frame dir");
+
+        // 1024x768 -> resized 518x392 (no crop), then padded to 518 rows.
+        RgbImage::from_fn(1024, 768, |x, y| {
+            Rgb([(x % 256) as u8, (y % 256) as u8, 7u8])
+        })
+        .save(dir.join("a.png"))
+        .expect("save frame a");
+        // 1024x2048 -> resized 518x1036, center-cropped to 518 rows
+        // (start_y = (1036 - 518) / 2 = 259).
+        RgbImage::from_fn(1024, 2048, |x, y| {
+            Rgb([3u8, (x % 256) as u8, (y % 256) as u8])
+        })
+        .save(dir.join("b.png"))
+        .expect("save frame b");
+
+        let stage = VggtPreprocessStage::default();
+        let prepared = stage
+            .prepare_inputs_from_path(&dir, Some(1), &Device::Cpu)
+            .expect("prepare vggt inputs");
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(prepared.original_size, SpatialSize::new(1024, 768));
+        assert_eq!(prepared.target_size, SpatialSize::new(518, 518));
+        assert_eq!(prepared.preprocess_mode, VggtPreprocessMode::Crop);
+        assert_eq!(prepared.rgb_frames.dims(), &[2, 3, 518, 518]);
+        assert_eq!(prepared.original_coords.len(), 2);
+        assert_eq!(
+            prepared.original_coords[0],
+            VggtOriginalCoords {
+                width: 1024,
+                height: 768,
+                offset_x: 0,
+                offset_y: 63, // (518 - 392) / 2 white-pad rows
+                content_width: 518,
+                content_height: 392,
+                mode: VggtPreprocessMode::Crop,
+            }
+        );
+        assert_eq!(
+            prepared.original_coords[1],
+            VggtOriginalCoords {
+                width: 1024,
+                height: 2048,
+                offset_x: 0,
+                offset_y: 259, // height center-crop start row
+                content_width: 518,
+                content_height: 518,
+                mode: VggtPreprocessMode::Crop,
+            }
+        );
+
+        // Mapping prepared pixels back: the frame-a content rectangle starts
+        // at row 63, so prepared row 63 is original row 0 and prepared row 454
+        // is original row 391 * 768 / 392.
+        let coords = &prepared.original_coords[0];
+        let v = (454.0 - f64::from(coords.offset_y)) * f64::from(coords.height)
+            / f64::from(coords.content_height);
+        assert!((v - 391.0 * 768.0 / 392.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scaled_pad_size_matches_reference_formula() {
+        // 1024x768: long side 518, short side round(768 * 518/1024 / 14) * 14
+        // == round(27.75) * 14 == 392.
+        assert_eq!(
+            scaled_pad_size(1024, 768, 518, 14).expect("landscape"),
+            (518, 392)
+        );
+        assert_eq!(
+            scaled_pad_size(768, 1024, 518, 14).expect("portrait"),
+            (392, 518)
+        );
+        assert_eq!(
+            scaled_pad_size(512, 512, 518, 14).expect("square"),
+            (518, 518)
+        );
+        // Ties-to-even: 4 * (518/8) / 14 == 18.5 -> 18 -> 252.
+        assert_eq!(scaled_pad_size(8, 4, 518, 14).expect("wide"), (518, 252));
+        assert_eq!(scaled_pad_size(4, 8, 518, 14).expect("tall"), (252, 518));
+        // `width == height` takes the width-first reference branch.
+        assert_eq!(scaled_pad_size(4, 4, 518, 14).expect("equal"), (518, 518));
+
+        assert!(scaled_pad_size(0, 8, 518, 14).is_err());
+        assert!(scaled_pad_size(8, 0, 518, 14).is_err());
+        assert!(scaled_pad_size(8, 8, 0, 14).is_err());
+    }
+
+    #[test]
+    fn target_size_for_mode_matches_crop_and_pad_formulas() {
+        let stage = VggtPreprocessStage::default();
+        let landscape = SpatialSize::new(1024, 768);
+        assert_eq!(
+            stage
+                .target_size_for_mode(landscape, 518, VggtPreprocessMode::Crop)
+                .expect("crop target"),
+            SpatialSize::new(518, 392)
+        );
+        assert_eq!(
+            stage
+                .target_size_for_mode(landscape, 518, VggtPreprocessMode::Pad)
+                .expect("pad target"),
+            SpatialSize::new(518, 392)
+        );
+        assert_eq!(
+            stage
+                .target_size_for_mode(SpatialSize::new(480, 640), 518, VggtPreprocessMode::Pad)
+                .expect("pad portrait target"),
+            SpatialSize::new(392, 518)
+        );
+    }
+
+    /// Pad-mode golden values for 1024x768: content 518x392, centered with 63
+    /// white rows top/bottom, no white columns.
+    #[test]
+    fn pad_mode_1024x768_centers_content_in_white_frame() {
+        let dir = std::env::temp_dir().join(format!(
+            "lux3d-vggt-pad-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create frame dir");
+        RgbImage::from_fn(1024, 768, |x, y| {
+            Rgb([(x % 256) as u8, (y % 256) as u8, 7u8])
+        })
+        .save(dir.join("a.png"))
+        .expect("save frame");
+
+        let stage = VggtPreprocessStage::default();
+        let prepared = stage
+            .prepare_inputs_from_path_with_mode(
+                &dir,
+                Some(1),
+                VggtPreprocessMode::Pad,
+                &Device::Cpu,
+            )
+            .expect("prepare pad inputs");
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(prepared.original_size, SpatialSize::new(1024, 768));
+        assert_eq!(prepared.preprocess_mode, VggtPreprocessMode::Pad);
+        assert_eq!(prepared.target_size, SpatialSize::new(518, 518));
+        assert_eq!(prepared.rgb_frames.dims(), &[1, 3, 518, 518]);
+        assert_eq!(prepared.normalized_frames.dims(), &[1, 1, 3, 518, 518]);
+        assert_eq!(
+            prepared.original_coords[0],
+            VggtOriginalCoords {
+                width: 1024,
+                height: 768,
+                offset_x: 0,
+                offset_y: 63,
+                content_width: 518,
+                content_height: 392,
+                mode: VggtPreprocessMode::Pad,
+            }
+        );
+
+        // White rows exactly on [0, 62] and [455, 517]; content rows in between.
+        let channel0 = prepared
+            .rgb_frames
+            .get(0)
+            .expect("frame")
+            .get(0)
+            .expect("c0");
+        for y in [0usize, 62, 455, 517] {
+            let row = channel0.get(y).expect("row").to_vec1::<f32>().expect("vec");
+            assert!(
+                row.iter().all(|value| (*value - 1.0).abs() <= 1e-6),
+                "pad row {y} is not white"
+            );
+        }
+        let content_row = channel0
+            .get(63)
+            .expect("content first row")
+            .to_vec1::<f32>()
+            .expect("vec");
+        assert!(
+            content_row.iter().any(|value| (*value - 1.0).abs() > 1e-6),
+            "first content row must not be white"
+        );
+
+        // Per-axis mapping: prepared row 454 (last content row) maps back to
+        // original row 391 * 768 / 392.
+        let coords = &prepared.original_coords[0];
+        let (scale_x, scale_y) = coords.axis_scales_to_original();
+        assert!((scale_x - 1024.0 / 518.0).abs() < 1e-12);
+        assert!((scale_y - 768.0 / 392.0).abs() < 1e-12);
+        let v = (454.0 - f64::from(coords.offset_y)) * scale_y;
+        assert!((v - 391.0 * 768.0 / 392.0).abs() < 1e-9);
+    }
+
+    /// Pad-mode portrait: content 392x518 centered horizontally, full height.
+    #[test]
+    fn pad_mode_portrait_pads_left_and_right() {
+        let dir = std::env::temp_dir().join(format!(
+            "lux3d-vggt-pad-portrait-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create frame dir");
+        RgbImage::from_pixel(768, 1024, Rgb([30, 140, 220]))
+            .save(dir.join("a.png"))
+            .expect("save frame");
+
+        let stage = VggtPreprocessStage::default();
+        let prepared = stage
+            .prepare_inputs_from_path_with_mode(
+                &dir,
+                Some(1),
+                VggtPreprocessMode::Pad,
+                &Device::Cpu,
+            )
+            .expect("prepare pad inputs");
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            prepared.original_coords[0],
+            VggtOriginalCoords {
+                width: 768,
+                height: 1024,
+                offset_x: 63,
+                offset_y: 0,
+                content_width: 392,
+                content_height: 518,
+                mode: VggtPreprocessMode::Pad,
+            }
+        );
+
+        // A constant image stays constant through the bicubic resize, so the
+        // white pad columns are exactly 1.0 and the content exactly 30/255.
+        let channel0 = prepared
+            .rgb_frames
+            .get(0)
+            .expect("frame")
+            .get(0)
+            .expect("c0");
+        for x in [0usize, 62, 455, 517] {
+            let column_ok = (0..518usize).all(|y| {
+                (channel0
+                    .get(y)
+                    .expect("row")
+                    .get(x)
+                    .expect("col")
+                    .to_scalar::<f32>()
+                    .expect("scalar")
+                    - 1.0)
+                    .abs()
+                    <= 1e-6
+            });
+            assert!(column_ok, "pad column {x} is not white");
+        }
+        for x in [63usize, 454] {
+            let column_ok = (0..518usize).all(|y| {
+                (channel0
+                    .get(y)
+                    .expect("row")
+                    .get(x)
+                    .expect("col")
+                    .to_scalar::<f32>()
+                    .expect("scalar")
+                    - 30.0 / 255.0)
+                    .abs()
+                    <= 1e-6
+            });
+            assert!(column_ok, "content column {x} changed under resize");
+        }
+    }
+
+    /// Single image files are accepted directly as one-frame sources.
+    #[test]
+    fn single_image_file_is_a_one_frame_source() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "lux3d-vggt-single-{}-{}.png",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        RgbImage::from_pixel(320, 240, Rgb([90, 60, 30]))
+            .save(&path)
+            .expect("save image");
+
+        let stage = VggtPreprocessStage::default();
+        let prepared = stage
+            .prepare_inputs_from_path(&path, None, &Device::Cpu)
+            .expect("prepare single image");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(prepared.interval, 1);
+        assert_eq!(prepared.original_size, SpatialSize::new(320, 240));
+        // Crop mode: single landscape frame keeps its 518x392 resized size.
+        assert_eq!(prepared.target_size, SpatialSize::new(518, 392));
+        assert_eq!(prepared.rgb_frames.dims(), &[1, 3, 392, 518]);
+        assert_eq!(prepared.original_coords.len(), 1);
+        assert_eq!(
+            prepared.original_coords[0],
+            VggtOriginalCoords {
+                width: 320,
+                height: 240,
+                offset_x: 0,
+                offset_y: 0,
+                content_width: 518,
+                content_height: 392,
+                mode: VggtPreprocessMode::Crop,
+            }
+        );
+    }
+
+    #[test]
+    fn recognizes_all_single_image_extensions() {
+        for extension in ["png", "JPG", "jpeg", "WebP", "bmp", "tif", "TIFF"] {
+            assert!(is_image_extension(extension), "expected image: {extension}");
+        }
+        assert!(!is_image_extension("mp4"));
+        assert!(!is_image_extension("txt"));
+        assert!(!is_image_extension(""));
     }
 }

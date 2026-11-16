@@ -20,14 +20,16 @@ pub(crate) enum VggtDptActivation {
     Exp,
 }
 
+/// Residual convolution unit shared by the point/depth DPT heads and the
+/// track-head feature extractor (`vggt.heads.dpt_head.ResidualConvUnit`).
 #[derive(Debug)]
-struct ResidualConvUnit {
+pub(crate) struct ResidualConvUnit {
     conv1: Conv2d,
     conv2: Conv2d,
 }
 
 impl ResidualConvUnit {
-    fn load(vb: VarBuilder, features: usize) -> CandleResult<Self> {
+    pub(crate) fn load(vb: VarBuilder, features: usize) -> CandleResult<Self> {
         let config = Conv2dConfig {
             padding: 1,
             stride: 1,
@@ -39,7 +41,7 @@ impl ResidualConvUnit {
         })
     }
 
-    fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
+    pub(crate) fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
         // The reference uses nn.ReLU(inplace=True); the first in-place ReLU
         // mutates `x`, so the residual added back is relu(x), not x.
         let activated = xs.relu()?;
@@ -49,15 +51,17 @@ impl ResidualConvUnit {
     }
 }
 
+/// Feature fusion block shared by the point/depth DPT heads and the
+/// track-head feature extractor (`vggt.heads.dpt_head.FeatureFusionBlock`).
 #[derive(Debug)]
-struct FeatureFusionBlock {
+pub(crate) struct FeatureFusionBlock {
     out_conv: Conv2d,
     res_conf_unit1: Option<ResidualConvUnit>,
     res_conf_unit2: ResidualConvUnit,
 }
 
 impl FeatureFusionBlock {
-    fn load(vb: VarBuilder, features: usize, has_residual: bool) -> CandleResult<Self> {
+    pub(crate) fn load(vb: VarBuilder, features: usize, has_residual: bool) -> CandleResult<Self> {
         Ok(Self {
             out_conv: conv2d(
                 features,
@@ -75,7 +79,7 @@ impl FeatureFusionBlock {
         })
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &self,
         xs: &Tensor,
         skip: Option<&Tensor>,
@@ -99,14 +103,14 @@ impl FeatureFusionBlock {
 }
 
 #[derive(Debug)]
-enum ResizeLayer {
+pub(crate) enum ResizeLayer {
     Transpose(ConvTranspose2d),
     Identity,
     Conv(Conv2d),
 }
 
 impl ResizeLayer {
-    fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
+    pub(crate) fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
         match self {
             Self::Transpose(layer) => layer.forward(xs),
             Self::Identity => Ok(xs.clone()),

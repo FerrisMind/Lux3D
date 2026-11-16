@@ -9,7 +9,7 @@ use image::{Rgb, RgbImage, Rgba, RgbaImage};
 use lux3d_core::contracts::{
     ModelFamily, Pi3InputSource, PreprocessStage, RgbRange, SpatialSize, VggtRawInput,
 };
-use lux3d_core::preprocess::VggtPreprocessStage;
+use lux3d_core::preprocess::{VggtPreprocessMode, VggtPreprocessStage};
 use lux3d_core::test_support::runtime_root;
 
 fn temp_dir(label: &str) -> PathBuf {
@@ -343,4 +343,183 @@ fn portrait_frames_are_center_cropped_to_the_max_size() {
     assert_eq!(prepared.target_size, SpatialSize::new(518, 518));
     assert_eq!(prepared.rgb_frames.dims(), &[1, 3, 518, 518]);
     assert_eq!(prepared.normalized_frames.dims(), &[1, 1, 3, 518, 518]);
+}
+
+/// Pad-mode golden values for 1024x768: content 518x392 (the same resize as
+/// crop mode for this aspect ratio), centered white padding of 63 rows, and
+/// per-frame coords recording the content rectangle. The content pixels must
+/// be bit-identical to the crop-mode frame (identical resize, no crop rows).
+#[test]
+fn pad_mode_landscape_matches_reference_recipe_and_crop_content() {
+    let dir = temp_dir("pad-landscape");
+    RgbImage::from_fn(1024, 768, |x, y| {
+        Rgb([(x % 251) as u8, (y % 241) as u8, 60u8])
+    })
+    .save(dir.join("000.png"))
+    .expect("save landscape frame");
+
+    let stage = VggtPreprocessStage::default();
+    let crop = stage
+        .prepare_inputs_from_path(&dir, Some(1), &Device::Cpu)
+        .expect("crop inputs");
+    let pad = stage
+        .prepare_inputs_from_path_with_mode(&dir, Some(1), VggtPreprocessMode::Pad, &Device::Cpu)
+        .expect("pad inputs");
+    let _ = fs::remove_dir_all(&dir);
+
+    // 1024x768: pad and crop resize identically to 518x392; pad then centers
+    // the content in a 518x518 white frame.
+    assert_eq!(crop.target_size, SpatialSize::new(518, 392));
+    assert_eq!(pad.target_size, SpatialSize::new(518, 518));
+    assert_eq!(pad.rgb_frames.dims(), &[1, 3, 518, 518]);
+    assert_eq!(pad.normalized_frames.dims(), &[1, 1, 3, 518, 518]);
+    assert_eq!(
+        pad.original_coords[0],
+        lux3d_core::preprocess::VggtOriginalCoords {
+            width: 1024,
+            height: 768,
+            offset_x: 0,
+            offset_y: 63,
+            content_width: 518,
+            content_height: 392,
+            mode: VggtPreprocessMode::Pad,
+        }
+    );
+
+    // White rows exactly on [0, 62] and [455, 517] in RGB space; the
+    // normalized frame carries the ImageNet-transformed white instead.
+    let rgb_channel0 = pad
+        .rgb_frames
+        .get(0)
+        .expect("frame")
+        .get(0)
+        .expect("channel 0");
+    for y in [0usize, 62, 455, 517] {
+        assert_row_is(&rgb_channel0, y, 1.0);
+    }
+    for y in [63usize, 454] {
+        let row = rgb_channel0
+            .get(y)
+            .expect("row")
+            .to_vec1::<f32>()
+            .expect("vec");
+        assert!(
+            row.iter().any(|value| (*value - 1.0).abs() > 1e-6),
+            "content row {y} must not be white"
+        );
+    }
+    let normalized_channel0 = pad
+        .normalized_frames
+        .get(0)
+        .expect("batch")
+        .get(0)
+        .expect("frame")
+        .get(0)
+        .expect("channel 0");
+    let normalized_white = normalize_rgb([1.0, 1.0, 1.0])[0];
+    for y in [0usize, 62, 455, 517] {
+        assert_row_is(&normalized_channel0, y, normalized_white);
+    }
+
+    // Content rectangle is bit-identical to the crop-mode frame.
+    let crop_frame = crop.rgb_frames.get(0).expect("crop frame");
+    let pad_frame = pad.rgb_frames.get(0).expect("pad frame");
+    let content = pad_frame.narrow(1, 63, 392).expect("pad content rows");
+    let delta = max_abs_delta(&content, &crop_frame);
+    assert_eq!(delta, 0.0, "pad content differs from crop-mode resize");
+}
+
+/// Pad-mode RGBA compositing plus the ties-to-even rounding of the shorter
+/// side: 4x2 translucent black -> content 518x252 (127-gray), offset_y 133.
+#[test]
+fn pad_mode_composites_alpha_and_rounds_shorter_side() {
+    let dir = temp_dir("pad-alpha");
+    let mut rgba = RgbaImage::new(4, 2);
+    for pixel in rgba.pixels_mut() {
+        *pixel = Rgba([0, 0, 0, 128]);
+    }
+    rgba.save(dir.join("000.png")).expect("save rgba frame");
+
+    let prepared = VggtPreprocessStage::default()
+        .prepare_inputs_from_path_with_mode(&dir, Some(1), VggtPreprocessMode::Pad, &Device::Cpu)
+        .expect("prepared pad alpha inputs");
+    let _ = fs::remove_dir_all(&dir);
+
+    // 4x2 -> new_height = round(2 * 518/4 / 14) * 14 = round(18.5, ties to
+    // even) * 14 = 252; white pad rows (518 - 252) / 2 = 133.
+    assert_eq!(prepared.target_size, SpatialSize::new(518, 518));
+    assert_eq!(
+        prepared.original_coords[0],
+        lux3d_core::preprocess::VggtOriginalCoords {
+            width: 4,
+            height: 2,
+            offset_x: 0,
+            offset_y: 133,
+            content_width: 518,
+            content_height: 252,
+            mode: VggtPreprocessMode::Pad,
+        }
+    );
+
+    let channel0 = prepared
+        .rgb_frames
+        .get(0)
+        .expect("frame")
+        .get(0)
+        .expect("channel 0");
+    for y in [0usize, 132, 385, 517] {
+        assert_row_is(&channel0, y, 1.0);
+    }
+    for y in [133usize, 252, 384] {
+        assert_row_is(&channel0, y, 127.0 / 255.0);
+    }
+}
+
+/// A single image file (including non-png extensions) is a one-frame source.
+#[test]
+fn single_image_file_is_accepted_directly() {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "lux3d-vggt-preprocess-single-{}-{}.bmp",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    RgbImage::from_pixel(640, 480, Rgb([12, 34, 56]))
+        .save(&path)
+        .expect("save single frame");
+
+    let stage = VggtPreprocessStage::default();
+    let crop = stage
+        .prepare_inputs_from_path(&path, None, &Device::Cpu)
+        .expect("prepared single-file crop inputs");
+    let pad = stage
+        .prepare_inputs_from_path_with_mode(&path, None, VggtPreprocessMode::Pad, &Device::Cpu)
+        .expect("prepared single-file pad inputs");
+    let _ = fs::remove_file(&path);
+
+    assert_eq!(crop.interval, 1);
+    assert_eq!(crop.rgb_frames.dims(), &[1, 3, 392, 518]);
+    assert_eq!(crop.original_coords.len(), 1);
+    assert_eq!(crop.preprocess_mode, VggtPreprocessMode::Crop);
+
+    // 640x480 pad: width >= height -> new_width 518, new_height
+    // round(480 * 518/640 / 14) * 14 = round(27.75) * 14 = 392.
+    assert_eq!(pad.target_size, SpatialSize::new(518, 518));
+    assert_eq!(pad.rgb_frames.dims(), &[1, 3, 518, 518]);
+    assert_eq!(pad.preprocess_mode, VggtPreprocessMode::Pad);
+    assert_eq!(
+        pad.original_coords[0],
+        lux3d_core::preprocess::VggtOriginalCoords {
+            width: 640,
+            height: 480,
+            offset_x: 0,
+            offset_y: 63,
+            content_width: 518,
+            content_height: 392,
+            mode: VggtPreprocessMode::Pad,
+        }
+    );
 }

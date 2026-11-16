@@ -35,6 +35,8 @@ fn synthetic_output() -> VggtInferenceOutput {
         depth: Tensor::zeros((1, 1, 2, 2, 1), DType::F32, &device).expect("depth"),
         depth_conf: Tensor::zeros((1, 1, 2, 2), DType::F32, &device).expect("depth conf"),
         pose_enc: Tensor::zeros((1, 1, 9), DType::F32, &device).expect("pose enc"),
+        // Fixture is not a real forward pass, so no per-iteration encodings.
+        pose_enc_list: Vec::new(),
         extrinsics: Tensor::zeros((1, 1, 3, 4), DType::F32, &device).expect("extrinsics"),
         intrinsics: Tensor::zeros((1, 1, 3, 3), DType::F32, &device).expect("intrinsics"),
         // [S, C, H, W]: distinct per-channel values; flat pixels are
