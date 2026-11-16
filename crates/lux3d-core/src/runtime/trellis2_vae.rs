@@ -156,8 +156,9 @@ impl Trellis2ShapeVaeConfig {
 }
 
 /// Affine LayerNorm over the channel dim of `[N, C]` (`LayerNorm32` on sparse
-/// features, biased variance, per-channel weight/bias).
-fn channel_layer_norm_affine(
+/// features, biased variance, per-channel weight/bias). Shared with the shape
+/// SLAT encoder (`super::trellis2_shape_enc`), whose blocks use the same norm.
+pub(crate) fn channel_layer_norm_affine(
     xs: &Tensor,
     weight: &Tensor,
     bias: &Tensor,
@@ -175,8 +176,10 @@ fn channel_layer_norm_affine(
 }
 
 /// `SparseConvNeXtBlock3d`: conv -> affine LN(eps 1e-6) -> MLP -> residual.
+/// Shared with the shape SLAT encoder (`super::trellis2_shape_enc`), whose
+/// torso uses the identical block with the identical tensor layout.
 #[derive(Debug)]
-struct ConvNeXtBlock {
+pub(crate) struct ConvNeXtBlock {
     conv: SparseConv3d,
     norm_weight: Tensor,
     norm_bias: Tensor,
@@ -185,7 +188,7 @@ struct ConvNeXtBlock {
 }
 
 impl ConvNeXtBlock {
-    fn load(vb: VarBuilder, channels: usize, mlp_ratio: f64) -> CandleResult<Self> {
+    pub(crate) fn load(vb: VarBuilder, channels: usize, mlp_ratio: f64) -> CandleResult<Self> {
         let mlp_hidden = (channels as f64 * mlp_ratio) as usize;
         Ok(Self {
             conv: SparseConv3d::load(vb.pp("conv"), channels, channels, true)?,
@@ -200,7 +203,7 @@ impl ConvNeXtBlock {
     /// Reference `_forward`: `h = conv(x); h = norm(h); h = mlp(h)` with
     /// `mlp = Linear -> SiLU -> Linear`; residual `h + x`. No activation
     /// between the norm and the first MLP linear.
-    fn forward(&self, coords: &[[i32; 3]], feats: &Tensor) -> CandleResult<Tensor> {
+    pub(crate) fn forward(&self, coords: &[[i32; 3]], feats: &Tensor) -> CandleResult<Tensor> {
         let h = self.conv.forward(coords, feats)?;
         let h = channel_layer_norm_affine(&h, &self.norm_weight, &self.norm_bias, 1e-6)?;
         let h = self.mlp0.forward(&h)?;

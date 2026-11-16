@@ -90,9 +90,11 @@ mod trellis2_dino;
 mod trellis2_dit;
 mod trellis2_mesh;
 mod trellis2_sampler;
+mod trellis2_shape_enc;
 mod trellis2_sparse;
 mod trellis2_ss_dec;
 mod trellis2_tex;
+mod trellis2_texture;
 mod trellis2_vae;
 mod triposg;
 mod triposg_dino;
@@ -104,6 +106,7 @@ mod triposr;
 mod triposr_field;
 mod vggt;
 mod vggt_dpt;
+mod vggt_track;
 mod vision_preproc;
 
 pub(crate) use pi3x::prepare_pi3x_inputs_with_stage;
@@ -114,11 +117,15 @@ pub use pi3x::{
 pub use rmbg::{RmbgConfig, RmbgModel};
 pub use rmbg2::{Rmbg2Config, Rmbg2Model, Rmbg2Outputs};
 pub use trellis2::{
-    TRELLIS2_CASCADE_HR_RESOLUTION, TRELLIS2_CASCADE_LR_RESOLUTION,
-    TRELLIS2_CASCADE_UPSAMPLE_TIMES, TRELLIS2_SHAPE_SLAT_MEAN, TRELLIS2_SHAPE_SLAT_STD,
-    TRELLIS2_TEX_NOISE_SALT, TRELLIS2_TEX_SLAT_MEAN, TRELLIS2_TEX_SLAT_STD, TRELLIS2_VOXEL_MARGIN,
-    Trellis2CascadeShape, Trellis2Pipeline, Trellis2PipelineConfig, Trellis2Rng,
-    Trellis2RunOptions, Trellis2Stages, quantize_hr_coords, quantize_hr_coords_with_stop,
+    TRELLIS2_CASCADE_1536_TARGET_RESOLUTION, TRELLIS2_CASCADE_HR_RESOLUTION,
+    TRELLIS2_CASCADE_LR_RESOLUTION, TRELLIS2_CASCADE_UPSAMPLE_TIMES, TRELLIS2_SHAPE_SLAT_MEAN,
+    TRELLIS2_SHAPE_SLAT_STD, TRELLIS2_SINGLE_1024_SHAPE_RESOLUTION,
+    TRELLIS2_SINGLE_1024_SS_RESOLUTION, TRELLIS2_TEX_NOISE_SALT, TRELLIS2_TEX_SLAT_MEAN,
+    TRELLIS2_TEX_SLAT_STD, TRELLIS2_VOXEL_MARGIN, Trellis2CascadeShape,
+    Trellis2MeshPostprocessOptions, Trellis2Pipeline, Trellis2PipelineConfig, Trellis2Rng,
+    Trellis2RunOptions, Trellis2SamplerOverrides, Trellis2Stages, Trellis2TextureExportOptions,
+    Trellis2TexturedMesh, build_trellis2_textured_mesh, quantize_hr_coords,
+    quantize_hr_coords_with_stop, resolve_stage_params,
 };
 pub use trellis2_blocks::{
     Trellis2AdaLn, Trellis2CrossAttention, Trellis2DenseBlock, Trellis2FeedForward,
@@ -134,6 +141,10 @@ pub use trellis2_sampler::{
     Trellis2SampleTrace, Trellis2SamplerParams, guided_velocity, pred_to_xstart, sample_dense,
     sample_sparse, ss_t_schedule, v_to_xstart_eps, xstart_to_pred,
 };
+pub use trellis2_shape_enc::{
+    Trellis2ShapeEncoder, Trellis2ShapeEncoderConfig, Trellis2ShapeSlat, concat_dual_grid_input,
+    load_trellis2_shape_encoder_from_stage_file,
+};
 pub use trellis2_sparse::{
     Channel2SpatialOutput, CoordMap, SparseConv3d, Spatial2ChannelOutput, channel_to_spatial,
     kernel_offset_delta, repeat_channels, sparse_cross_attention, sparse_self_attention,
@@ -143,6 +154,11 @@ pub use trellis2_ss_dec::{Trellis2SsDecoder, Trellis2SsDecoderConfig, occupancy_
 pub use trellis2_tex::{
     TexDecodeOutput, Trellis2PbrLayout, Trellis2TexDecoder, Trellis2TexDit, concat_tex_input,
     pbr_attrs_from_raw, query_vertex_attrs, query_vertex_colors, split_pbr_attrs,
+};
+pub use trellis2_texture::{
+    TRELLIS2_SHAPE_ENC_STAGE_REL, Trellis2TexturingOptions, Trellis2TexturingOutput,
+    load_trellis2_shape_encoder_from_model_assets, preprocess_mesh_for_texturing,
+    synthesize_tex_guide_subs,
 };
 pub use trellis2_vae::{
     ShapeVaeBlockTrace, ShapeVaeDecodeOutput, Trellis2ShapeVaeConfig, Trellis2ShapeVaeDecoder,
@@ -154,7 +170,10 @@ pub use triposg::{
     TripoSgRunOptions,
 };
 pub use triposg_dino::TripoSgDinoEncoder;
-pub use triposg_dit::{RectifiedFlowSchedule, TripoSgDiT, TripoSgTransformerConfig, denoise};
+pub use triposg_dit::{
+    RectifiedFlowSchedule, SCHEDULER_NUM_TRAIN_TIMESTEPS, SCHEDULER_SHIFT, TripoSgDiT,
+    TripoSgTransformerConfig, denoise, denoise_with_schedule,
+};
 pub use triposg_field::{TripoSgSdfGrid, hierarchical_sdf_grid};
 pub use triposg_flash::{
     TripoSgDmcMesh, TripoSgFlashGrid, compact_dmc_mesh, flash_dual_marching_cubes,
@@ -168,6 +187,11 @@ pub(crate) use triposr::prepare_triposr_inputs_with_stage;
 pub use triposr::{TripoInferenceOutput, TripoMeshBuffers, TripoPreparedInputs, TripoSrPipeline};
 pub use vggt::{
     VggtAggregatorOutput, VggtDebugTaps, VggtInferenceOutput, VggtPipeline, VggtPreparedInputs,
+    VggtRunOptions, merge_vggt_inference_outputs,
+};
+pub use vggt_track::{
+    VggtTrackHead, VggtTrackQuery, VggtTrackResult, bilinear_sample_features,
+    expected_track_head_tensor_names,
 };
 
 use crate::{

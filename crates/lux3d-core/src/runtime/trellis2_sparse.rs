@@ -364,6 +364,7 @@ pub fn spatial_to_channel(
     let parent_index: HashMap<[i32; 3], usize> =
         parents.iter().enumerate().map(|(i, p)| (*p, i)).collect();
     let mut out = vec![0.0_f32; parents.len() * 8 * channels];
+    let device = feats.device().clone();
     let feats = feats.to_device(&candle_core::Device::Cpu)?;
     let values = feats.flatten_all()?.to_vec1::<f32>()?;
     for (child, coord) in coords.iter().enumerate() {
@@ -376,11 +377,10 @@ pub fn spatial_to_channel(
         let dst = (slot * 8 + subidx) * channels;
         out[dst..dst + channels].copy_from_slice(&values[child * channels..(child + 1) * channels]);
     }
-    let device = feats.device();
     let parent_count = parents.len();
     Ok(Spatial2ChannelOutput {
         coords: parents,
-        feats: Tensor::from_vec(out, (parent_count, 8 * channels), device)?,
+        feats: Tensor::from_vec(out, (parent_count, 8 * channels), &device)?,
     })
 }
 

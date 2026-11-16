@@ -1,5 +1,9 @@
 //! TRELLIS.2 image-to-3D pipeline orchestration (T5 geometry slice + T6
-//! 1024 cascade).
+//! 1024 cascade + upstream-parity variants).
+//!
+//! Pipeline variants (`Trellis2RunOptions::pipeline_type`, reference
+//! `run(...)`, `trellis2_image_to_3d.py:489-595`; `ss_res` map
+//! `{'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}`):
 //!
 //! 512 path (`pipeline_type = "512"`):
 //!
@@ -14,11 +18,19 @@
 //!    Euler CFG sampler (strength 7.5, rescale 0.5, interval [0.6, 1.0],
 //!    rescale_t 3.0) -> de-normalize `slat * std + mean`.
 //! 5. shape VAE decode at resolution 512 -> dual-grid head split ->
-//!    O-Voxel mesh extraction -> export.
+//!    O-Voxel mesh extraction -> geometry post-process (`to_glb` mesh
+//!    cleaning: hole filling, decimation, cleanup, orientation
+//!    unification; [`Trellis2MeshPostprocessOptions`], enabled by
+//!    default) -> export.
 //!
-//! 1024 cascade (`pipeline_type = "1024_cascade"`, reference
-//! `sample_shape_slat_cascade`, `trellis2_image_to_3d.py:277-364`): the SS
-//! stage is unchanged (32^3 occupancy, `cond_512`); the shape stages become
+//! 1024 path (`pipeline_type = "1024"`): the same single-resolution flow at
+//! SS resolution 64, conditioning at 1024 (`shape_dit_1024` /
+//! `tex_dit_1024`), decode at 1024, no cascade.
+//!
+//! Cascade paths (`1024_cascade` target 1024, `1536_cascade` target 1536;
+//! reference `sample_shape_slat_cascade`, `trellis2_image_to_3d.py:277-364`):
+//! the SS stage is unchanged (32^3 occupancy, `cond_512`); the shape stages
+//! become
 //!
 //! 4a. LR shape SLAT on the 32^3 coords with `shape_dit_512` + `cond_512`
 //!     -> de-normalize.
@@ -29,24 +41,29 @@
 //! 4c. quantize onto the `hr_resolution // 16` grid:
 //!     `((coord + 0.5) / 512 * (hr_resolution // 16)).int()`, deduplicate
 //!     (lexicographically sorted rows, `torch.unique(dim=0)` semantics) and
-//!     enforce the token budget: the loop breaks when
-//!     `rows < max_num_tokens || hr_resolution == 1024`, else
-//!     `hr_resolution -= 128`. At resolution 1024 the loop always breaks on
-//!     its first pass, so the 1024 cascade never reduces its resolution.
+//!     enforce the token budget: the loop starts at `hr_resolution = target`
+//!     and breaks when `rows < max_num_tokens || hr_resolution == 1024`,
+//!     else `hr_resolution -= 128`. The stop resolution is 1024 for BOTH
+//!     cascade variants (the reference hardcodes it — the 1024-DiT latent
+//!     grid ceiling `hr_resolution // 16 <= 64`... the elastic models accept
+//!     larger grids, so the 1536 cascade decodes at 1536 unless the token
+//!     budget reduces it to 1024). The 1024 cascade always breaks on its
+//!     first pass.
 //! 4d. HR shape SLAT on the quantized coords with `shape_dit_1024` +
 //!     `cond_1024` (DINOv3 at 1024, `[1, 4101, 1024]`) -> de-normalize.
-//! 5. shape VAE decode at `hr_resolution` -> dual-grid head split ->
-//!    O-Voxel mesh extraction.
+//! 5. shape VAE decode at the returned `hr_resolution` -> dual-grid head
+//!    split -> O-Voxel mesh extraction.
 //!
-//! Texture (both paths, reference `sample_tex_slat` /
-//! `decode_tex_slat`, enabled with `Trellis2RunOptions::with_texture`):
+//! Texture (all paths, reference `sample_tex_slat` / `decode_tex_slat`,
+//! enabled with `Trellis2RunOptions::with_texture`):
 //!
 //! 6. texture SLAT on the FINAL shape latent coords (the HR quantized
-//!    coords in the cascade): noise `[N, 32]` re-normalized shape SLAT
+//!    coords in the cascades): noise `[N, 32]` re-normalized shape SLAT
 //!    `(shape_slat - mean) / std` concatenated along channels -> `[N, 64]`
-//!    -> `tex_dit_512` (512 path, `cond_512`) or `tex_dit_1024` (cascade,
-//!    `cond_1024`) -> 12-step Euler sampler (guidance 1.0, rescale 0.0,
-//!    interval [0.6, 0.9], R=3.0) -> de-normalize with the texture vectors.
+//!    -> `tex_dit_512` (512 path, `cond_512`) or `tex_dit_1024` (1024/1536
+//!    paths, `cond_1024`) -> 12-step Euler sampler (guidance 1.0, rescale
+//!    0.0, interval [0.6, 0.9], R=3.0) -> de-normalize with the texture
+//!    vectors.
 //! 7. guided texture VAE decode (`tex_dec`, `pred_subdiv = false`): the
 //!    shape decoder's raw C2S subdivision logits steer the tex decode, so
 //!    the tex output coords equal the shape decode's final coords; the
@@ -54,8 +71,31 @@
 //!    (base_color 0:3, metallic 3, roughness 4, alpha 5).
 //! 8. per-vertex base colors: flex_gemm sparse trilinear sampling of the
 //!    voxel attributes at the mesh vertices (`MeshWithVoxel.
-//!    query_vertex_attrs`); carried on the mesh buffers for PLY/GLB export
+//!    query_vertex_attrs`) — sampled on the POST-PROCESSED mesh vertices
+//!    when the geometry post-process ran (step 5), so no vertex-color
+//!    remap is needed; carried on the mesh buffers for PLY/GLB export
 //!    alongside the `<stem>.pbrvox.bin` sidecar payload.
+//!
+//! Textured export (all paths, reference `postprocess.py:190-330`
+//! `to_glb`, enabled with [`Trellis2TextureExportOptions::enabled`]
+//! inside [`Trellis2RunOptions::texture_export`], default on when
+//! texture ran):
+//!
+//! 9. UV unwrap + PBR bake: xatlas charting/packing at
+//!    `texture_size` (default 2048, see [`crate::geometry::uv_unwrap`]),
+//!    area-weighted vertex normals, conservative rasterization of the
+//!    UV triangles, sparse-trilinear sampling of the same voxel
+//!    attributes per texel, and TELEA-style frontier inpainting of the
+//!    uncovered texels (see [`crate::geometry::bake_pbr_texture`]). The
+//!    result ([`Trellis2Stages::textured`], [`Trellis2TexturedMesh`])
+//!    carries atlas UVs + indices, the vertex normals, and both baked
+//!    textures; [`Trellis2ExportStage::write_textured_glb`] emits the
+//!    textured GLB (embedded PNGs, axis conversion `(x, y, z) -> (x, z,
+//!    -y)`, UV V flip). Skipped cleanly (`textured = None`) when texture
+//!    export is disabled, `uv_unwrap` is disabled, the voxel attributes
+//!    are not the 6-channel PBR layout, or the mesh has no faces.
+//!    CPU cost is material (xatlas charting + ~4M texel samples at
+//!    2048); see [`crate::geometry::BakedPbrTexture`] for details.
 //!
 //! Stage weights load sequentially from the mmap-ed canonical package and
 //! drop after their stage; no more than one DiT is resident (the cascade
@@ -68,10 +108,35 @@
 //! `pipeline.json` (mirrored in the canonical package's
 //! `resolved_config.json`) and can be overridden via
 //! [`Trellis2PipelineConfig::from_resolved_config`].
+//!
+//! Per-stage sampler overrides ([`Trellis2SamplerOverrides`] in
+//! [`Trellis2RunOptions::ss_sampler`]/`shape_sampler`/`tex_sampler`, the
+//! upstream `run(...)` `*_sampler_params` arguments): each field replaces
+//! the pipeline-config default (`steps`, `guidance_strength`,
+//! `guidance_rescale`, `rescale_t`, `guidance_interval`). The legacy
+//! `ss_steps`/`shape_steps`/`tex_steps` options stay the base step count for
+//! all three stages; a stage override's `steps` wins over the legacy field
+//! when both are set (`resolve_stage_params`).
+//!
+//! `num_samples` (upstream `run(num_samples)` batches every flow): this
+//! port keeps single-output sampling — `num_samples = 1` is bit-identical to
+//! the pre-`num_samples` behavior, and `run_many_from_path` /
+//! `run_many_with_latents` emulate `num_samples > 1` by running the
+//! deterministic stages sequentially with per-sample seed offset
+//! `seed + sample_index` over the SAME conditioning. That is NOT batched DiT
+//! inference; the single-run entry points error on `num_samples != 1`.
+//!
+//! `Trellis2Stages::write_latent_npz` is the upstream `return_latent=True`
+//! surface (`(out_mesh, (shape_slat, tex_slat, res))`): an `.npz` with
+//! `shape_latent [N, 32]` F32, `tex_latent [N, 32]` F32 (empty when texture
+//! is off), `coords [N, 3]` I32, `resolution` scalar, cascade
+//! `lr_shape_latent [N_lr, 32]` F32 (empty for non-cascade runs) and a
+//! UTF-8 JSON `meta` blob.
 
 use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device, Tensor};
+use ndarray::Array2;
 
 use super::trellis2_dino::Trellis2Dino;
 use super::trellis2_dit::{Trellis2SlatConfig, Trellis2SlatDit, Trellis2SsConfig, Trellis2SsDit};
@@ -87,7 +152,9 @@ use crate::Result;
 use crate::contracts::Trellis2PipelineType;
 use crate::error::Lux3dError;
 use crate::export::Trellis2ExportStage;
-use crate::geometry::Trellis2GeometryStage;
+use crate::geometry::{
+    Trellis2GeometryStage, area_weighted_vertex_normals, bake_pbr_texture, uv_unwrap,
+};
 use crate::preprocess::{Trellis2BackgroundRemover, Trellis2Preprocess};
 use crate::runtime::Rmbg2Model;
 use crate::weights::{
@@ -101,10 +168,24 @@ pub const TRELLIS2_VOXEL_MARGIN: f32 = 0.5;
 /// in `run(...)`, `trellis2_image_to_3d.py:566-573`).
 pub const TRELLIS2_CASCADE_LR_RESOLUTION: u32 = 512;
 
-/// Cascade HR target resolution (`resolution=1024` for `1024_cascade`). The
-/// token-budget loop always breaks once `hr_resolution` reaches 1024, so the
-/// 1024 cascade decodes at 1024 regardless of the token count.
+/// Cascade stop/conditioning resolution (1024): the reference token-budget
+/// loop hardcodes `hr_resolution == 1024` as an unconditional break, and the
+/// HR conditioning is `get_cond([image], 1024)` for the `1024`/cascade
+/// variants alike. The 1024 cascade's target equals the stop resolution, so
+/// it always decodes at 1024 regardless of the token count; the 1536 cascade
+/// can only reduce 1536 -> 1408 -> ... -> 1024.
 pub const TRELLIS2_CASCADE_HR_RESOLUTION: u32 = 1024;
+
+/// Single-resolution `1024` path: SS occupancy resolution (upstream
+/// `ss_res['1024'] = 64`; the SS decoder's 64^3 occupancy is used as-is) and
+/// the mesh extraction resolution.
+pub const TRELLIS2_SINGLE_1024_SS_RESOLUTION: u32 = 64;
+pub const TRELLIS2_SINGLE_1024_SHAPE_RESOLUTION: u32 = 1024;
+
+/// Cascade target resolutions (`resolution` argument of the reference
+/// `sample_shape_slat_cascade`): 1024 for `1024_cascade`, 1536 for
+/// `1536_cascade`.
+pub const TRELLIS2_CASCADE_1536_TARGET_RESOLUTION: u32 = 1536;
 
 /// Cascade C2S upsample stages (`upsample(slat, upsample_times=4)`): 32^3 LR
 /// coords double four times to the 512 grid.
@@ -302,13 +383,18 @@ fn read_sampler(value: Option<&serde_json::Value>) -> Option<Trellis2SamplerPara
 
 impl Trellis2PipelineConfig {
     /// Apply overrides from a `resolved_config.json` / raw `pipeline.json`
-    /// document (`pipeline_args` nesting tolerated). Missing sections keep
-    /// the hard-coded defaults.
+    /// document (`pipeline_args` nesting tolerated, as is the raw
+    /// `pipeline.json` `{name, args}` wrapper). Missing sections keep the
+    /// hard-coded defaults.
     pub fn from_resolved_config(value: &serde_json::Value) -> Self {
         let mut config = Self::default();
         // `resolved_config.json` nests under `pipeline_args`; a raw
-        // `pipeline.json` carries the same keys at the root.
-        let root = value.get("pipeline_args").unwrap_or(value);
+        // `pipeline.json` carries the same keys under `args` (or at the
+        // root).
+        let root = value
+            .get("pipeline_args")
+            .or_else(|| value.get("args"))
+            .unwrap_or(value);
         if let Some(mean) = read_f32_vec(
             root.get("shape_slat_normalization")
                 .and_then(|n| n.get("mean")),
@@ -354,6 +440,65 @@ impl Trellis2PipelineConfig {
     }
 }
 
+/// Per-stage sampler overrides (the upstream `run(...)`
+/// `sparse_structure_sampler_params` / `shape_slat_sampler_params` /
+/// `tex_slat_sampler_params` arguments, each merged over the pipeline
+/// defaults). Field names follow the local [`Trellis2SamplerParams`]
+/// config, which matches the upstream `params` keys (`steps`,
+/// `guidance_strength`, `guidance_rescale`, `guidance_interval`,
+/// `rescale_t`).
+///
+/// `None` fields keep the pipeline default. When both a stage override's
+/// `steps` and the legacy `Trellis2RunOptions::ss_steps`/`shape_steps`/
+/// `tex_steps` are set, the override wins (`resolve_stage_params`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Trellis2SamplerOverrides {
+    /// Euler step count (upstream `steps`).
+    pub steps: Option<usize>,
+    /// Classifier-free guidance strength (upstream `guidance_strength`;
+    /// 1.0 disables CFG).
+    pub guidance_strength: Option<f32>,
+    /// CFG rescale (upstream `guidance_rescale`; 0 disables).
+    pub guidance_rescale: Option<f32>,
+    /// Inclusive t interval `[lo, hi]` where CFG applies (upstream
+    /// `guidance_interval`).
+    pub guidance_interval: Option<(f32, f32)>,
+    /// t-schedule rescale factor (upstream `rescale_t`).
+    pub rescale_t: Option<f32>,
+}
+
+/// Merge a stage's pipeline-config sampler defaults with the run options:
+/// the legacy `steps` field is the base step count, an override's `steps`
+/// wins over it, and every other set override field replaces the config
+/// default. Pure function so the precedence contract is unit-testable
+/// without weights.
+pub fn resolve_stage_params(
+    base: &Trellis2SamplerParams,
+    overrides: Option<&Trellis2SamplerOverrides>,
+    steps: usize,
+) -> Trellis2SamplerParams {
+    let mut out = base.clone();
+    out.steps = steps;
+    if let Some(overrides) = overrides {
+        if let Some(value) = overrides.steps {
+            out.steps = value;
+        }
+        if let Some(value) = overrides.guidance_strength {
+            out.guidance_strength = value as f64;
+        }
+        if let Some(value) = overrides.guidance_rescale {
+            out.guidance_rescale = value as f64;
+        }
+        if let Some(value) = overrides.rescale_t {
+            out.rescale_t = value as f64;
+        }
+        if let Some((low, high)) = overrides.guidance_interval {
+            out.guidance_interval = [low as f64, high as f64];
+        }
+    }
+    out
+}
+
 /// Cascade HR coordinate quantization + token-budget loop (reference
 /// `sample_shape_slat_cascade`, `trellis2_image_to_3d.py:327-339`).
 ///
@@ -366,17 +511,20 @@ impl Trellis2PipelineConfig {
 /// `hr_resolution -= 128`. `torch.unique(dim=0)` returns lexicographically
 /// sorted rows; the returned coords are sorted the same way.
 ///
+/// `target_resolution` is the cascade target (1024 or 1536); the stop
+/// resolution stays 1024 for both variants.
+///
 /// Returns `(unique_sorted_coords, hr_resolution)`.
 pub fn quantize_hr_coords(
     hr_coords: &[[i32; 3]],
     lr_resolution: u32,
-    resolution: u32,
+    target_resolution: u32,
     max_num_tokens: usize,
 ) -> (Vec<[i32; 3]>, u32) {
     quantize_hr_coords_with_stop(
         hr_coords,
         lr_resolution,
-        resolution,
+        target_resolution,
         max_num_tokens,
         TRELLIS2_CASCADE_HR_RESOLUTION,
     )
@@ -425,21 +573,170 @@ pub fn quantize_hr_coords_with_stop(
     (coords, hr_resolution)
 }
 
-/// Run options (`plan.md` frozen surface; defaults match the reference
-/// `run(...)` signature).
+/// Geometry post-processing options for the assembled TRELLIS.2 dual-grid
+/// mesh (upstream `to_glb` defaults; the reference demo additionally caps the
+/// texture budget at 4096 but keeps the 1e6 decimation target).
+///
+/// When [`Trellis2MeshPostprocessOptions::enabled`], the assembled mesh runs
+/// `mesh_ops::postprocess_mesh` BEFORE the texture stage attaches per-vertex
+/// colors, so the final (possibly re-topologized) vertices are the ones the
+/// PBR color sampling sees and no vertex-color remap is needed. The pass
+/// mirrors the upstream order, including both simplify passes:
+///
+/// 1. `fill_holes(fill_hole_perimeter)` — also covers the reference
+///    decode-time `Mesh.fill_holes()` call inside `decode_latent` (same
+///    3e-2 default threshold);
+/// 2. aggressive simplify toward `decimation_target * 3` triangles (`0`
+///    skips BOTH simplify passes — cleanup-only post-processing);
+/// 3. `remove_duplicate_faces` / `repair_non_manifold_edges` /
+///    `remove_small_connected_components(min_component_area)` /
+///    `fill_holes`;
+/// 4. second simplify toward `decimation_target` + the same cleanup;
+/// 5. final `fill_holes` + `unify_face_orientations` + vertex compaction.
+///
+/// UV unwrapping / texture baking are a separate workstream and are NOT part
+/// of this pass.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Trellis2MeshPostprocessOptions {
+    /// Run the geometry post-process (true). With `false` the pipeline keeps
+    /// the decoded mesh byte-identical to the pre-postprocess behavior.
+    pub enabled: bool,
+    /// Boundary loops whose total perimeter is `<` this threshold are
+    /// closed (upstream `fill_holes(max_hole_perimeter=3e-2)` uses a strict
+    /// `<` comparison); `0` legitimately disables hole filling.
+    pub fill_hole_perimeter: f32,
+    /// Final triangle-count target (upstream `to_glb(decimation_target)`,
+    /// default 1_000_000). The reference first simplifies aggressively to
+    /// `3 * decimation_target`, then to this target. `0` skips simplification
+    /// entirely (cleanup-only).
+    pub decimation_target: usize,
+    /// Connected components with total triangle area `<` this threshold are
+    /// removed (upstream `remove_small_connected_components(1e-5)` keeps
+    /// components with `area >= min_area`); `0` keeps every non-degenerate
+    /// component.
+    pub min_component_area: f32,
+}
+
+impl Default for Trellis2MeshPostprocessOptions {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            fill_hole_perimeter: 3e-2,
+            decimation_target: 1_000_000,
+            min_component_area: 1e-5,
+        }
+    }
+}
+
+impl Trellis2MeshPostprocessOptions {
+    /// Validate the options. Disabled post-processing skips the threshold
+    /// checks (the values are unused). Enabled runs require finite,
+    /// non-negative thresholds — `0` is a meaningful "off" for both (no hole
+    /// is closed / no component is dropped) — and accept any decimation
+    /// target (`0` = skip simplification, cleanup-only).
+    pub fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if !self.fill_hole_perimeter.is_finite() || self.fill_hole_perimeter < 0.0 {
+            return Err(Lux3dError::InvalidInput(
+                "Trellis2 postprocess fill_hole_perimeter must be a finite non-negative \
+                 threshold (0 disables hole filling)",
+            ));
+        }
+        if !self.min_component_area.is_finite() || self.min_component_area < 0.0 {
+            return Err(Lux3dError::InvalidInput(
+                "Trellis2 postprocess min_component_area must be a finite non-negative \
+                 threshold (0 keeps every component)",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Textured-GLB export options (upstream `to_glb` UV unwrap + bake,
+/// `postprocess.py:195-315`).
+///
+/// When enabled AND the mesh carries the 6-channel PBR payload (the texture
+/// stage ran), the pipeline computes the xatlas UV atlas, area-weighted
+/// vertex normals and the baked PBR textures after `attach_texture`, and
+/// stores the product in `Trellis2Stages::textured`. Skipped cleanly (the
+/// field stays `None`, no error) when `with_texture = false` (no PBR
+/// payload), `voxel_attr_channels != 6`, `uv_unwrap = false` (baking needs
+/// UVs) or `enabled = false`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Trellis2TextureExportOptions {
+    /// Compute and store the textured atlas mesh (`true`, matching the
+    /// reference `to_glb` default).
+    pub enabled: bool,
+    /// Bake texture edge length (upstream `texture_size`, default 2048).
+    /// Must be a multiple of 8 in `8..=8192` (nvdiffrast-compatible
+    /// resolution granularity).
+    pub texture_size: usize,
+    /// Run the xatlas UV unwrap (`true`). With `false` the textured mesh is
+    /// skipped entirely — texture baking needs UV coordinates.
+    pub uv_unwrap: bool,
+}
+
+impl Default for Trellis2TextureExportOptions {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            texture_size: 2048,
+            uv_unwrap: true,
+        }
+    }
+}
+
+impl Trellis2TextureExportOptions {
+    /// Validate the options. Disabled texture export skips the checks (the
+    /// values are unused); enabled runs require a multiple-of-8 texture size
+    /// in `8..=8192` and accept either `uv_unwrap` value (a disabled unwrap
+    /// skips the textured mesh cleanly instead of failing).
+    pub fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.texture_size < 8 || self.texture_size > 8192 || self.texture_size % 8 != 0 {
+            return Err(Lux3dError::InvalidInput(
+                "Trellis2 texture export texture_size must be a multiple of 8 in 8..=8192 \
+                 (upstream nvdiffrast parity)",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Run options (defaults match the reference `run(...)` signature).
+///
+/// Sampler parameter precedence (`resolve_stage_params`): the per-stage
+/// overrides (`ss_sampler`/`shape_sampler`/`tex_sampler`, `None` = keep the
+/// pipeline defaults) win over the legacy `ss_steps`/`shape_steps`/
+/// `tex_steps` fields when both set a value; the legacy fields stay the
+/// base step count for all three stages otherwise.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Trellis2RunOptions {
-    /// RNG seed (42).
+    /// RNG seed (42). `run_many_*` runs sample `i` with `seed + i`.
     pub seed: u64,
-    /// Pipeline variant (Cascade1024 by contract; T5 implements the `512`
-    /// path only and rejects the others until T6 lands).
+    /// Pipeline variant (Cascade1024 by contract).
     pub pipeline_type: Trellis2PipelineType,
-    /// Sparse-structure Euler steps (12).
+    /// Sparse-structure Euler steps (12); the base step count when
+    /// `ss_sampler` does not set `steps`.
     pub ss_steps: usize,
-    /// Shape SLAT Euler steps (12).
+    /// Shape SLAT Euler steps (12); the base step count for both cascade
+    /// shape stages when `shape_sampler` does not set `steps`.
     pub shape_steps: usize,
-    /// Texture SLAT Euler steps (12).
+    /// Texture SLAT Euler steps (12); the base step count when
+    /// `tex_sampler` does not set `steps`.
     pub tex_steps: usize,
+    /// Sparse-structure sampler overrides (upstream
+    /// `sparse_structure_sampler_params`; `None` keeps the defaults).
+    pub ss_sampler: Option<Trellis2SamplerOverrides>,
+    /// Shape SLAT sampler overrides (upstream `shape_slat_sampler_params`;
+    /// applied to BOTH the LR and HR cascade shape stages).
+    pub shape_sampler: Option<Trellis2SamplerOverrides>,
+    /// Texture SLAT sampler overrides (upstream `tex_slat_sampler_params`).
+    pub tex_sampler: Option<Trellis2SamplerOverrides>,
     /// Run the texture stages (texture SLAT + guided texture VAE + PBR
     /// vertex colors, true — the reference pipeline always textures). With
     /// `false` the pipeline stays geometry-only (the mesh buffers carry the
@@ -452,6 +749,24 @@ pub struct Trellis2RunOptions {
     pub max_num_tokens: usize,
     /// Run image preprocessing inside `run_from_path` (true).
     pub preprocess: bool,
+    /// Sample count (1). Upstream `run(num_samples)` batches the flows;
+    /// this port keeps single-output sampling — `num_samples = 1` is
+    /// bit-identical to the unbatched behavior and the single-run entry
+    /// points error on `num_samples != 1`; use `run_many_from_path` /
+    /// `run_many_with_latents` (sequential seed-offset emulation, NOT
+    /// batched inference).
+    pub num_samples: usize,
+    /// Geometry post-process of the assembled mesh, applied BEFORE the
+    /// texture stage attaches per-vertex colors (upstream `to_glb` mesh
+    /// cleaning; defaults mirror the reference signature). With
+    /// `enabled = false` the decoded mesh is passed through untouched.
+    pub postprocess: Trellis2MeshPostprocessOptions,
+    /// Textured-GLB export stage (upstream `to_glb` UV unwrap + PBR bake):
+    /// UV atlas, area-weighted vertex normals and the baked base-color /
+    /// metallic-roughness textures on `Trellis2Stages::textured`. Defaults
+    /// mirror the reference (enabled, 2048, unwrap on); skipped cleanly when
+    /// the run is geometry-only.
+    pub texture_export: Trellis2TextureExportOptions,
 }
 
 impl Default for Trellis2RunOptions {
@@ -462,9 +777,15 @@ impl Default for Trellis2RunOptions {
             ss_steps: 12,
             shape_steps: 12,
             tex_steps: 12,
+            ss_sampler: None,
+            shape_sampler: None,
+            tex_sampler: None,
             with_texture: true,
             max_num_tokens: 49152,
             preprocess: true,
+            num_samples: 1,
+            postprocess: Trellis2MeshPostprocessOptions::default(),
+            texture_export: Trellis2TextureExportOptions::default(),
         }
     }
 }
@@ -505,7 +826,9 @@ pub struct Trellis2Stages {
     /// (identical to `shape_coords`; kept for stage-tap symmetry).
     pub quant_coords: Option<Vec<[i32; 3]>>,
     /// Cascade only: the token-budget resolution the HR stage/decode ran at
-    /// (1024 unless the reference loop reduced it; `None` in the 512 path).
+    /// (1024 for the 1024 cascade — the loop always stops there; the 1536
+    /// cascade decodes at its target unless the budget reduced it; `None`
+    /// in the single-resolution paths).
     pub hr_resolution: Option<u32>,
     /// Shape decoder raw C2S subdivision logits (one `[N_parents, 8]` F32
     /// tensor per C2S stage, stage order) — the texture decoder's
@@ -518,6 +841,216 @@ pub struct Trellis2Stages {
     /// metallic 3, roughness 4, alpha 5) on the shape decode's final coords
     /// (`None` for geometry-only runs).
     pub tex_attrs: Option<Vec<f32>>,
+    /// Textured atlas mesh (upstream `to_glb` textured product: xatlas UV
+    /// unwrap + area-weighted vertex normals + baked PBR textures).
+    /// `None` for geometry-only runs, when
+    /// `Trellis2RunOptions::texture_export` is disabled, when
+    /// `uv_unwrap = false`, or when the mesh carries no 6-channel PBR
+    /// payload (see [`Trellis2TextureExportOptions`]).
+    pub textured: Option<Trellis2TexturedMesh>,
+}
+
+/// Textured atlas mesh produced by the texture-export stage (upstream
+/// `to_glb` `textured_mesh`, `postprocess.py:307-323`).
+///
+/// All geometry lives in the decoded REFERENCE `[-0.5, 0.5]^3` frame (no
+/// axis remap, like `Trellis2MeshBuffers`); the glTF axis conversion
+/// `(x, y, z) -> (x, z, -y)` and the UV V flip (`v' = 1 - v`) are applied by
+/// the textured GLB writer at export time only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Trellis2TexturedMesh {
+    /// Atlas mesh positions, flat `[A, 3]` f32 (reference frame). Atlas
+    /// vertices duplicate the mesh vertices at UV seams.
+    pub vertices: Vec<f32>,
+    /// Flat triangle indices into `vertices` (u32).
+    pub faces: Vec<u32>,
+    /// Area-weighted vertex normals, flat `[A, 3]` f32 (the upstream
+    /// `mesh.compute_vertex_normals()` product, gathered through the atlas
+    /// vertex map).
+    pub normals: Vec<f32>,
+    /// Atlas UVs per atlas vertex, flat `[A, 2]` f32 in [0, 1] (pre V-flip;
+    /// the baked textures use the nvdiffrast row-0 = v = 1 layout, the GLB
+    /// writer flips at export).
+    pub uvs: Vec<f32>,
+    /// Baked PBR textures (base color RGBA + metallic/roughness) with the
+    /// pre-inpaint coverage mask and bake statistics.
+    pub texture: crate::geometry::BakedPbrTexture,
+    /// Number of charts the unwrap produced (`> 0`).
+    pub chart_count: u32,
+    /// Number of packed atlases (UVs are merged into a single [0, 1] frame).
+    pub atlas_count: u32,
+    /// Atlas edge length in texels the packing targeted.
+    pub atlas_size: u32,
+}
+
+/// Texture-export stage (upstream `to_glb` UV unwrap + bake,
+/// `postprocess.py:195-315`): xatlas UV atlas over the (post-processed)
+/// mesh, area-weighted vertex normals and the sparse-trilinear PBR bake at
+/// `texture_size`.
+///
+/// Skips cleanly (returns `None`, no error) when the options are disabled,
+/// `uv_unwrap` is off, the mesh carries no 6-channel PBR payload / vertex
+/// colors (geometry-only runs) or the mesh has no triangles. Real failures
+/// error with descriptive messages (no panics). Public so exports can build
+/// the textured mesh from standalone `Trellis2MeshBuffers` (the same buffers
+/// the pipeline produces) without running the GPU pipeline.
+pub fn build_trellis2_textured_mesh(
+    mesh: &crate::geometry::Trellis2MeshBuffers,
+    options: &Trellis2TextureExportOptions,
+) -> Result<Option<Trellis2TexturedMesh>> {
+    if !options.enabled || !options.uv_unwrap {
+        return Ok(None);
+    }
+    if mesh.voxel_attr_channels != super::trellis2_tex::Trellis2PbrLayout::CHANNELS
+        || mesh.vertex_colors.is_none()
+    {
+        return Ok(None);
+    }
+    if mesh.face_count() == 0 {
+        return Ok(None);
+    }
+    mesh.validate()?;
+    let vertices: Vec<[f32; 3]> = mesh
+        .vertices
+        .chunks_exact(3)
+        .map(|chunk| [chunk[0], chunk[1], chunk[2]])
+        .collect();
+    // `validate()` already checked range and non-negativity.
+    let faces: Vec<u32> = mesh.faces.iter().map(|&index| index as u32).collect();
+    let voxel_coords: Vec<[i32; 3]> = mesh
+        .voxel_coords
+        .chunks_exact(3)
+        .map(|chunk| [chunk[0], chunk[1], chunk[2]])
+        .collect();
+    let atlas = uv_unwrap(&vertices, &faces, options.texture_size as u32).map_err(|source| {
+        Lux3dError::CanonicalWeightsValidation {
+            message: format!("Trellis2 UV unwrap failed: {source}"),
+        }
+    })?;
+    let normals = area_weighted_vertex_normals(&atlas.vertices, &atlas.indices);
+    let texture = bake_pbr_texture(
+        &atlas.vertices,
+        &atlas.uvs,
+        &atlas.indices,
+        &voxel_coords,
+        &mesh.voxel_attrs,
+        mesh.resolution,
+        options.texture_size,
+    )
+    .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+        message: format!("Trellis2 PBR texture bake failed: {source}"),
+    })?;
+    Ok(Some(Trellis2TexturedMesh {
+        vertices: atlas.vertices.iter().flatten().copied().collect(),
+        faces: atlas.indices,
+        normals: normals.iter().flatten().copied().collect(),
+        uvs: atlas.uvs.iter().flatten().copied().collect(),
+        texture,
+        chart_count: atlas.chart_count,
+        atlas_count: atlas.atlas_count,
+        atlas_size: atlas.atlas_size,
+    }))
+}
+
+impl Trellis2Stages {
+    fn tensor_to_f32_rows(tensor: &Tensor, rows: usize, channels: usize) -> Result<Array2<f32>> {
+        let values = tensor
+            .to_device(&Device::Cpu)
+            .and_then(|t| t.to_dtype(DType::F32))
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f32>())
+            .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                message: format!("Trellis2 latent npz download failed: {source}"),
+            })?;
+        Ok(
+            Array2::from_shape_vec((rows, channels), values).map_err(|error| {
+                Lux3dError::ContractValidation {
+                    message: format!("Trellis2 latent npz shape mismatch: {error}"),
+                }
+            })?,
+        )
+    }
+
+    /// Upstream `return_latent=True` surface: serialize the final latents to
+    /// an `.npz` with
+    ///
+    /// * `shape_latent` — `[N, 32]` F32 (de-normalized; the HR slat for the
+    ///   cascades),
+    /// * `tex_latent` — `[N, 32]` F32 (empty `[0, 32]` for geometry-only
+    ///   runs),
+    /// * `coords` — `[N, 3]` I32 (the shape latent coords),
+    /// * `resolution` — `()` scalar I32 (the decode resolution; the cascade
+    ///   `hr_resolution` when present),
+    /// * `lr_shape_latent` — `[N_lr, 32]` F32 (empty `[0, 32]` for
+    ///   non-cascade runs),
+    /// * `meta` — UTF-8 JSON `Array1<u8>`: `{"pipeline_type", "resolution",
+    ///   "num_coords", "cascade", "hr_resolution"}`.
+    pub fn write_latent_npz(&self, path: &Path, pipeline_type: Trellis2PipelineType) -> Result<()> {
+        let shape_rows = self.shape_coords.len();
+        let shape_latent = Self::tensor_to_f32_rows(&self.shape_latent, shape_rows, 32)?;
+        let tex_latent = match &self.tex_latent {
+            Some(tex) => Self::tensor_to_f32_rows(tex, shape_rows, 32)?,
+            None => Array2::zeros((0, 32)),
+        };
+        let mut coords = Array2::<i32>::zeros((shape_rows, 3));
+        for (index, coord) in self.shape_coords.iter().enumerate() {
+            coords[[index, 0]] = coord[0];
+            coords[[index, 1]] = coord[1];
+            coords[[index, 2]] = coord[2];
+        }
+        let resolution = self
+            .hr_resolution
+            .unwrap_or(self.mesh.as_ref().map(|m| m.resolution).unwrap_or(512));
+        let lr_shape_latent = match &self.lr_shape_latent {
+            Some(lr) => {
+                let rows = lr
+                    .dim(0)
+                    .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                        message: format!("Trellis2 latent npz download failed: {source}"),
+                    })?;
+                Self::tensor_to_f32_rows(lr, rows, 32)?
+            }
+            None => Array2::zeros((0, 32)),
+        };
+        let meta = serde_json::json!({
+            "pipeline_type": pipeline_type.as_str(),
+            "resolution": resolution,
+            "num_coords": shape_rows,
+            "cascade": self.lr_shape_latent.is_some(),
+            "hr_resolution": self.hr_resolution,
+        });
+        let meta_bytes =
+            serde_json::to_vec(&meta).map_err(|source| Lux3dError::ContractValidation {
+                message: format!("Trellis2 latent npz meta serialization failed: {source}"),
+            })?;
+        let file = std::fs::File::create(path).map_err(|source| Lux3dError::ModelAssetIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let mut npz = ndarray_npy::NpzWriter::new(file);
+        let npz_error = |source: ndarray_npy::WriteNpzError| Lux3dError::ContractValidation {
+            message: format!(
+                "Trellis2 latent npz write to {} failed: {source}",
+                path.display()
+            ),
+        };
+        npz.add_array("shape_latent", &shape_latent)
+            .map_err(npz_error)?;
+        npz.add_array("tex_latent", &tex_latent)
+            .map_err(npz_error)?;
+        npz.add_array("coords", &coords).map_err(npz_error)?;
+        npz.add_array(
+            "resolution",
+            &ndarray::Array0::from_elem((), resolution as i32),
+        )
+        .map_err(npz_error)?;
+        npz.add_array("lr_shape_latent", &lr_shape_latent)
+            .map_err(npz_error)?;
+        npz.add_array("meta", &ndarray::Array1::from_vec(meta_bytes))
+            .map_err(npz_error)?;
+        npz.finish().map_err(npz_error)?;
+        Ok(())
+    }
 }
 
 /// Shape-stage products of [`Trellis2Pipeline::sample_shape_slat_cascade`]
@@ -533,8 +1066,9 @@ pub struct Trellis2CascadeShape {
     /// Quantized + deduplicated coords the HR stage ran on (lexicographically
     /// sorted, `torch.unique(dim=0)` semantics).
     pub quant_coords: Vec<[i32; 3]>,
-    /// The token-budget resolution (`1024` for the 1024 cascade — the loop
-    /// always breaks at 1024).
+    /// The token-budget resolution (1024 for the 1024 cascade — the loop
+    /// always breaks at 1024; 1536 for the 1536 cascade unless the budget
+    /// reduced it toward the 1024 stop).
     pub hr_resolution: u32,
     /// De-normalized HR shape SLAT `[N_hr, 32]` on `quant_coords`.
     pub hr_slat: Tensor,
@@ -588,8 +1122,10 @@ pub struct Trellis2Pipeline {
     /// reference always runs RMBG; there is no opaque fallback).
     pub rmbg: Option<Rmbg2Model>,
     /// Raw checkpoint dir + device when loaded through
-    /// [`Self::load_from_raw_dir`].
-    raw_dir: Option<(PathBuf, Device)>,
+    /// [`Self::load_from_raw_dir`]. `pub(super)`: the texturing core
+    /// (`runtime::trellis2_texture`) resolves the shape-encoder stage file
+    /// through it.
+    pub(super) raw_dir: Option<(PathBuf, Device)>,
 }
 
 impl Trellis2Pipeline {
@@ -678,7 +1214,7 @@ impl Trellis2Pipeline {
         })
     }
 
-    fn background_remover(&self) -> Option<&dyn Trellis2BackgroundRemover> {
+    pub(super) fn background_remover(&self) -> Option<&dyn Trellis2BackgroundRemover> {
         self.rmbg
             .as_ref()
             .map(|model| model as &dyn Trellis2BackgroundRemover)
@@ -736,22 +1272,28 @@ impl Trellis2Pipeline {
         }
     }
 
-    fn resolutions(&self, options: &Trellis2RunOptions) -> Result<(u32, u32)> {
+    /// `(ss_resolution, decode_resolution)` for the selected variant (the
+    /// upstream `ss_res` map and the `res` decode resolution): `512` ->
+    /// `(32, 512)` (package config), `1024` -> `(64, 1024)`, `1024_cascade`
+    /// -> `(32, 1024)`, `1536_cascade` -> `(32, 1536 target)`. All four
+    /// variants are implemented; this cannot fail for known variants but
+    /// keeps the `Result` surface for future additions.
+    pub fn resolutions(&self, options: &Trellis2RunOptions) -> Result<(u32, u32)> {
         match options.pipeline_type {
             Trellis2PipelineType::R512 => {
                 Ok((self.config.ss_resolution, self.config.shape_resolution))
             }
+            Trellis2PipelineType::R1024 => Ok((
+                TRELLIS2_SINGLE_1024_SS_RESOLUTION,
+                TRELLIS2_SINGLE_1024_SHAPE_RESOLUTION,
+            )),
             Trellis2PipelineType::Cascade1024 => {
                 Ok((self.config.ss_resolution, TRELLIS2_CASCADE_HR_RESOLUTION))
             }
-            other => Err(Lux3dError::ModelAssetResolution {
-                message: format!(
-                    "Trellis2 pipeline type `{}` is not implemented in this slice (the 1024 \
-                     cascade is implemented; the single-resolution `1024` path lands with the \
-                     texture stage); use `512` or `1024_cascade`",
-                    other.as_str()
-                ),
-            }),
+            Trellis2PipelineType::Cascade1536 => Ok((
+                self.config.ss_resolution,
+                TRELLIS2_CASCADE_1536_TARGET_RESOLUTION,
+            )),
         }
     }
 
@@ -772,8 +1314,10 @@ impl Trellis2Pipeline {
 
     /// Cascade conditioning at the HR resolution (1024): DINOv3 over
     /// pre-built pixel values (`[1, 3, 1024, 1024]`), producing
-    /// `[1, 4101, 1024]` + zero negative cond.
-    fn dino_conditioning_pixels(
+    /// `[1, 4101, 1024]` + zero negative cond. `pub(super)`: the texturing
+    /// pipeline (`runtime::trellis2_texture`) shares the DINOv3 load for
+    /// its 512/1024 `get_cond` passes.
+    pub(super) fn dino_conditioning_pixels(
         &self,
         pixel_values: &Tensor,
         device: &Device,
@@ -839,13 +1383,16 @@ impl Trellis2Pipeline {
     /// Sparse-structure stage: sample `z_s` from `noise` (or the seeded RNG
     /// when `noise` is `None`) and decode the occupancy coords at
     /// `ss_resolution`. The SS flow DiT and decoder are dropped afterwards.
+    /// `params` are the resolved SS sampler parameters
+    /// (`resolve_stage_params(&config.ss_sampler, options.ss_sampler,
+    /// options.ss_steps)`).
     pub fn sample_sparse_structure(
         &self,
         cond: &Tensor,
         neg_cond: &Tensor,
         noise: Option<&Tensor>,
         seed: u64,
-        steps: usize,
+        params: &Trellis2SamplerParams,
         device: &Device,
         ss_resolution: u32,
     ) -> Result<(Tensor, Vec<[i32; 3]>)> {
@@ -876,16 +1423,12 @@ impl Trellis2Pipeline {
                     message: format!("failed to load TRELLIS.2 ss_flow: {source}"),
                 }
             })?;
-        let params = Trellis2SamplerParams {
-            steps,
-            ..self.config.ss_sampler.clone()
-        };
         let (z_s, _trace) = sample_dense(
             &|x: &Tensor, t_model: f32, c: &Tensor| ss_dit.forward(x, t_model, c),
             &noise,
             cond,
             neg_cond,
-            &params,
+            params,
         )
         .map_err(|source| Lux3dError::CanonicalWeightsValidation {
             message: format!("Trellis2 SS sampling failed: {source}"),
@@ -918,7 +1461,8 @@ impl Trellis2Pipeline {
     }
 
     /// Shape SLAT stage (512): sample the (normalized) latent on `coords`
-    /// and de-normalize. The flow DiT is dropped afterwards.
+    /// and de-normalize. The flow DiT is dropped afterwards. `params` are
+    /// the resolved shape sampler parameters (`resolve_stage_params`).
     pub fn sample_shape_slat(
         &self,
         cond: &Tensor,
@@ -926,7 +1470,7 @@ impl Trellis2Pipeline {
         coords: &[[i32; 3]],
         noise: Option<&Tensor>,
         seed: u64,
-        steps: usize,
+        params: &Trellis2SamplerParams,
         device: &Device,
     ) -> Result<Tensor> {
         self.sample_shape_slat_stage(
@@ -938,37 +1482,45 @@ impl Trellis2Pipeline {
             coords,
             noise,
             seed,
-            steps,
+            params,
             device,
         )
     }
 
-    /// Cascade HR shape SLAT stage (1024): same sampler params, the
-    /// `shape_dit_1024` checkpoint and a distinct RNG salt so the HR noise
-    /// stream differs from the LR one. Negative cond is `zeros_like(cond)`
-    /// exactly like the reference.
+    /// Cascade HR shape SLAT stage (`shape_dit_1024`): same sampler params,
+    /// a distinct RNG salt so the HR noise stream differs from the LR one,
+    /// and the elastic validation bound for the HR grid. Negative cond is
+    /// `zeros_like(cond)` exactly like the reference.
     fn sample_shape_slat_hr(
         &self,
         cond: &Tensor,
         coords: &[[i32; 3]],
         seed: u64,
-        steps: usize,
+        params: &Trellis2SamplerParams,
         device: &Device,
+        hr_grid_resolution: usize,
     ) -> Result<Tensor> {
         let neg_cond =
             Tensor::zeros_like(cond).map_err(|source| Lux3dError::CanonicalWeightsValidation {
                 message: format!("Trellis2 negative cond allocation failed: {source}"),
             })?;
+        let config = if hr_grid_resolution > 64 {
+            // 1536 cascade (or a budget-reduced 1536 pass): the elastic DiT
+            // accepts the larger grid; raise the validation bound to 96.
+            Trellis2SlatConfig::shape_1536()
+        } else {
+            Trellis2SlatConfig::shape_1024()
+        };
         self.sample_shape_slat_stage(
             "shape_dit_1024",
-            Trellis2SlatConfig::shape_1024(),
+            config,
             0x534C_4154_5F48_5231,
             cond,
             &neg_cond,
             coords,
             None,
             seed,
-            steps,
+            params,
             device,
         )
     }
@@ -988,7 +1540,7 @@ impl Trellis2Pipeline {
         coords: &[[i32; 3]],
         noise: Option<&Tensor>,
         seed: u64,
-        steps: usize,
+        params: &Trellis2SamplerParams,
         device: &Device,
     ) -> Result<Tensor> {
         let noise = match noise {
@@ -1009,17 +1561,13 @@ impl Trellis2Pipeline {
                 message: format!("failed to load TRELLIS.2 {stage}: {source}"),
             }
         })?;
-        let params = Trellis2SamplerParams {
-            steps,
-            ..self.config.shape_sampler.clone()
-        };
         let (slat_norm, _trace) = sample_sparse(
             &|x: &Tensor, t_model: f32, c: &Tensor, cs: &[[i32; 3]]| dit.forward(x, cs, t_model, c),
             coords,
             &noise,
             cond,
             neg_cond,
-            &params,
+            params,
         )
         .map_err(|source| Lux3dError::CanonicalWeightsValidation {
             message: format!("Trellis2 shape SLAT sampling failed: {source}"),
@@ -1057,16 +1605,19 @@ impl Trellis2Pipeline {
     ///    on the 512 grid;
     /// 2. drop the VAE, then quantize onto the `hr_resolution // 16` grid,
     ///    deduplicate and run the token-budget loop
-    ///    ([`quantize_hr_coords`]).
+    ///    ([`quantize_hr_coords`]) starting at `target_resolution` (1024 or
+    ///    1536; the loop's stop resolution stays 1024).
     ///
     /// Returns `(hr_upsampled_coords, quant_coords, hr_resolution)`. The
     /// 1024 cascade's loop always breaks at `hr_resolution == 1024`, so
-    /// `hr_resolution` is 1024 here regardless of the token count.
+    /// `hr_resolution` is 1024 there regardless of the token count; the
+    /// 1536 cascade decodes at 1536 unless the token budget reduces it.
     pub fn upsample_and_quantize_shape_slat(
         &self,
         lr_coords: &[[i32; 3]],
         lr_slat_denorm: &Tensor,
         max_num_tokens: usize,
+        target_resolution: u32,
         device: &Device,
     ) -> Result<(Vec<[i32; 3]>, Vec<[i32; 3]>, u32)> {
         let vb = self.stage_var_builder("shape_dec", device)?;
@@ -1084,7 +1635,7 @@ impl Trellis2Pipeline {
         let (quant_coords, hr_resolution) = quantize_hr_coords(
             &hr_coords,
             TRELLIS2_CASCADE_LR_RESOLUTION,
-            TRELLIS2_CASCADE_HR_RESOLUTION,
+            target_resolution,
             max_num_tokens,
         );
         Ok((hr_coords, quant_coords, hr_resolution))
@@ -1092,9 +1643,10 @@ impl Trellis2Pipeline {
 
     /// Full cascade shape stage (reference `sample_shape_slat_cascade`):
     /// LR SLAT on `coords` (32^3) with `shape_dit_512` + `cond_lr`, shape
-    /// VAE `upsample(slat, 4)`, HR quantization + token budget, HR SLAT on
-    /// the quantized coords with `shape_dit_1024` + `cond_hr`. Both stages
-    /// use the `shape_slat_sampler` params (12 steps, guidance 7.5,
+    /// VAE `upsample(slat, 4)`, HR quantization + token budget starting at
+    /// `target_resolution` (1024 or 1536), HR SLAT on the quantized coords
+    /// with `shape_dit_1024` + `cond_hr`. Both stages use the resolved
+    /// `shape_slat_sampler` params (defaults: 12 steps, guidance 7.5,
     /// rescale 0.5, interval [0.6, 1.0], R=3.0); the DiTs and the VAE are
     /// loaded and dropped sequentially.
     #[allow(clippy::too_many_arguments)]
@@ -1105,8 +1657,9 @@ impl Trellis2Pipeline {
         coords: &[[i32; 3]],
         lr_noise: Option<&Tensor>,
         seed: u64,
-        steps: usize,
+        params: &Trellis2SamplerParams,
         max_num_tokens: usize,
+        target_resolution: u32,
         device: &Device,
     ) -> Result<Trellis2CascadeShape> {
         let neg_lr = Tensor::zeros_like(cond_lr).map_err(|source| {
@@ -1115,15 +1668,28 @@ impl Trellis2Pipeline {
             }
         })?;
         let lr_slat =
-            self.sample_shape_slat(cond_lr, &neg_lr, coords, lr_noise, seed, steps, device)?;
-        let (hr_upsampled_coords, quant_coords, hr_resolution) =
-            self.upsample_and_quantize_shape_slat(coords, &lr_slat, max_num_tokens, device)?;
+            self.sample_shape_slat(cond_lr, &neg_lr, coords, lr_noise, seed, params, device)?;
+        let (hr_upsampled_coords, quant_coords, hr_resolution) = self
+            .upsample_and_quantize_shape_slat(
+                coords,
+                &lr_slat,
+                max_num_tokens,
+                target_resolution,
+                device,
+            )?;
         if quant_coords.is_empty() {
             return Err(Lux3dError::InvalidInput(
                 "Trellis2 cascade quantized the upsampled coords to zero HR tokens",
             ));
         }
-        let hr_slat = self.sample_shape_slat_hr(cond_hr, &quant_coords, seed, steps, device)?;
+        let hr_slat = self.sample_shape_slat_hr(
+            cond_hr,
+            &quant_coords,
+            seed,
+            params,
+            device,
+            (hr_resolution / 16) as usize,
+        )?;
         Ok(Trellis2CascadeShape {
             lr_slat,
             hr_upsampled_coords,
@@ -1173,6 +1739,7 @@ impl Trellis2Pipeline {
             subdiv_logits: decoded.subdiv_logits,
             tex_latent: None,
             tex_attrs: None,
+            textured: None,
         })
     }
 
@@ -1227,7 +1794,8 @@ impl Trellis2Pipeline {
     /// Texture SLAT stage (512): re-normalize the shape SLAT, sample the
     /// (normalized) texture latent with `tex_dit_512` on the shape latent
     /// coords, de-normalize with the texture vectors. The flow DiT is
-    /// dropped before the de-normalization.
+    /// dropped before the de-normalization. `params` are the resolved
+    /// texture sampler parameters (`resolve_stage_params`).
     pub fn sample_tex_slat(
         &self,
         cond: &Tensor,
@@ -1235,7 +1803,7 @@ impl Trellis2Pipeline {
         coords: &[[i32; 3]],
         noise: Option<&Tensor>,
         seed: u64,
-        steps: usize,
+        params: &Trellis2SamplerParams,
         device: &Device,
     ) -> Result<Tensor> {
         self.sample_tex_slat_stage(
@@ -1246,32 +1814,42 @@ impl Trellis2Pipeline {
             coords,
             noise,
             seed,
-            steps,
+            params,
             device,
         )
     }
 
-    /// Texture SLAT stage (cascade/1024): same sampler params with the
-    /// `tex_dit_1024` checkpoint (reference conditions the texture stage on
-    /// `cond_1024`).
+    /// Texture SLAT stage (cascade/1024 + `1536_cascade`): same sampler
+    /// params with the `tex_dit_1024` checkpoint (reference conditions the
+    /// texture stage on `cond_1024`); `hr_grid_resolution` picks the
+    /// elastic validation bound for the HR coord grid. `noise` allows an
+    /// injected `[N, 32]` start (test surface; `None` = seeded RNG).
+    #[allow(clippy::too_many_arguments)]
     pub fn sample_tex_slat_hr(
         &self,
         cond: &Tensor,
         shape_slat_denorm: &Tensor,
         coords: &[[i32; 3]],
+        noise: Option<&Tensor>,
         seed: u64,
-        steps: usize,
+        params: &Trellis2SamplerParams,
         device: &Device,
+        hr_grid_resolution: usize,
     ) -> Result<Tensor> {
+        let config = if hr_grid_resolution > 64 {
+            Trellis2SlatConfig::tex_1536()
+        } else {
+            Trellis2SlatConfig::tex_1024()
+        };
         self.sample_tex_slat_stage(
             "tex_dit_1024",
-            Trellis2SlatConfig::tex_1024(),
+            config,
             cond,
             shape_slat_denorm,
             coords,
-            None,
+            noise,
             seed,
-            steps,
+            params,
             device,
         )
     }
@@ -1290,7 +1868,7 @@ impl Trellis2Pipeline {
         coords: &[[i32; 3]],
         noise: Option<&Tensor>,
         seed: u64,
-        steps: usize,
+        params: &Trellis2SamplerParams,
         device: &Device,
     ) -> Result<Tensor> {
         if shape_slat_denorm
@@ -1326,10 +1904,6 @@ impl Trellis2Pipeline {
                 message: format!("failed to load TRELLIS.2 {stage}: {source}"),
             }
         })?;
-        let params = Trellis2SamplerParams {
-            steps,
-            ..self.config.tex_sampler.clone()
-        };
         let (slat_norm, _trace) = sample_sparse(
             &|x: &Tensor, t_model: f32, c: &Tensor, cs: &[[i32; 3]]| {
                 dit.forward(x, &shape_slat_norm, cs, t_model, c)
@@ -1338,7 +1912,7 @@ impl Trellis2Pipeline {
             &noise,
             cond,
             cond,
-            &params,
+            params,
         )
         .map_err(|source| Lux3dError::CanonicalWeightsValidation {
             message: format!("Trellis2 texture SLAT sampling failed: {source}"),
@@ -1428,6 +2002,17 @@ impl Trellis2Pipeline {
         mesh.validate()
     }
 
+    /// Texture-export stage (upstream `to_glb` UV unwrap + bake); see
+    /// [`build_trellis2_textured_mesh`] for the behavior and the clean-skip
+    /// conditions.
+    fn build_textured_mesh(
+        &self,
+        mesh: &crate::geometry::Trellis2MeshBuffers,
+        options: &Trellis2TextureExportOptions,
+    ) -> Result<Option<Trellis2TexturedMesh>> {
+        build_trellis2_textured_mesh(mesh, options)
+    }
+
     fn assemble_mesh(
         &self,
         resolution: u32,
@@ -1462,6 +2047,27 @@ impl Trellis2Pipeline {
         )
     }
 
+    /// Geometry post-process of the assembled dual-grid mesh (upstream
+    /// `decode_latent` `fill_holes` + `to_glb` cleaning order, implemented by
+    /// `mesh_ops::postprocess_mesh`). Runs BEFORE `attach_texture` so the
+    /// final (possibly re-topologized) vertices are the ones the texture
+    /// stage samples PBR colors for — no vertex-color remap is needed on the
+    /// production path, because `assemble_mesh` always produces
+    /// `vertex_colors = None`.
+    ///
+    /// With `options.enabled = false` the input buffers are returned
+    /// untouched (byte-identical to the pre-postprocess pipeline). The
+    /// `voxel_coords` / `voxel_attrs` payload, `resolution` and channel count
+    /// pass through unchanged; only `vertices` / `faces` (and, defensively,
+    /// a pre-attached `vertex_colors` buffer) can change.
+    fn postprocess_decoded_mesh(
+        &self,
+        mesh: crate::geometry::Trellis2MeshBuffers,
+        options: &Trellis2MeshPostprocessOptions,
+    ) -> Result<crate::geometry::Trellis2MeshBuffers> {
+        self.geometry.postprocess_decoded_mesh(mesh, options)
+    }
+
     /// Core execution dispatch: the 512 path or the 1024 cascade. `cond_hr`
     /// is the cascade's 1024 conditioning (`None` -> reuse `cond`, the
     /// documented `run_with_latents` behavior). `tex_latent_override` is an
@@ -1481,10 +2087,36 @@ impl Trellis2Pipeline {
         device: &Device,
         options: &Trellis2RunOptions,
     ) -> Result<Trellis2Stages> {
+        // Resolved per-stage sampler params: stage overrides > legacy steps
+        // fields > pipeline-config defaults (`resolve_stage_params`).
+        let ss_params = resolve_stage_params(
+            &self.config.ss_sampler,
+            options.ss_sampler.as_ref(),
+            options.ss_steps,
+        );
+        let shape_params = resolve_stage_params(
+            &self.config.shape_sampler,
+            options.shape_sampler.as_ref(),
+            options.shape_steps,
+        );
+        let tex_params = resolve_stage_params(
+            &self.config.tex_sampler,
+            options.tex_sampler.as_ref(),
+            options.tex_steps,
+        );
+        // Fail fast on invalid mesh post-process / texture-export options
+        // (no-ops when disabled).
+        options.postprocess.validate()?;
+        options.texture_export.validate()?;
         match options.pipeline_type {
-            Trellis2PipelineType::R512 => self.run_core_512(
+            Trellis2PipelineType::R512 => self.run_core_single(
                 cond,
                 neg_cond,
+                cond,
+                "shape_dit_512",
+                Trellis2SlatConfig::shape_512(),
+                "tex_dit_512",
+                Trellis2SlatConfig::tex_512(),
                 ss_noise,
                 coords_override,
                 shape_noise,
@@ -1492,11 +2124,18 @@ impl Trellis2Pipeline {
                 tex_latent_override,
                 device,
                 options,
+                &ss_params,
+                &shape_params,
+                &tex_params,
             ),
-            Trellis2PipelineType::Cascade1024 => self.run_core_cascade_1024(
+            Trellis2PipelineType::R1024 => self.run_core_single(
                 cond,
                 neg_cond,
                 cond_hr.unwrap_or(cond),
+                "shape_dit_1024",
+                Trellis2SlatConfig::shape_1024(),
+                "tex_dit_1024",
+                Trellis2SlatConfig::tex_1024(),
                 ss_noise,
                 coords_override,
                 shape_noise,
@@ -1504,19 +2143,63 @@ impl Trellis2Pipeline {
                 tex_latent_override,
                 device,
                 options,
+                &ss_params,
+                &shape_params,
+                &tex_params,
             ),
-            other => Err(self.resolutions_error(other)),
+            Trellis2PipelineType::Cascade1024 => self.run_core_cascade(
+                cond,
+                neg_cond,
+                cond_hr.unwrap_or(cond),
+                TRELLIS2_CASCADE_HR_RESOLUTION,
+                ss_noise,
+                coords_override,
+                shape_noise,
+                shape_latent_override,
+                tex_latent_override,
+                device,
+                options,
+                &ss_params,
+                &shape_params,
+                &tex_params,
+            ),
+            Trellis2PipelineType::Cascade1536 => self.run_core_cascade(
+                cond,
+                neg_cond,
+                cond_hr.unwrap_or(cond),
+                TRELLIS2_CASCADE_1536_TARGET_RESOLUTION,
+                ss_noise,
+                coords_override,
+                shape_noise,
+                shape_latent_override,
+                tex_latent_override,
+                device,
+                options,
+                &ss_params,
+                &shape_params,
+                &tex_params,
+            ),
         }
     }
 
-    /// 512 core: SS stage (unless `coords_override`), shape SLAT stage
-    /// (unless `shape_latent_override`), texture SLAT stage (unless
-    /// `tex_latent_override` or `with_texture = false`), VAE decode + mesh.
+    /// Single-resolution core for `512` and `1024` (shared; the reference
+    /// duplicates the two branches in `run(...)`): SS stage (unless
+    /// `coords_override`) on `cond_ss`, shape SLAT stage (unless
+    /// `shape_latent_override`) and texture SLAT stage (unless
+    /// `tex_latent_override` or `with_texture = false`) on `cond_shape`,
+    /// VAE decode + mesh at the variant's resolution. `neg_cond` belongs to
+    /// `cond_ss`; the shape/tex negative cond is `zeros_like(cond_shape)`
+    /// exactly like the reference `get_cond`.
     #[allow(clippy::too_many_arguments)]
-    fn run_core_512(
+    fn run_core_single(
         &self,
-        cond: &Tensor,
+        cond_ss: &Tensor,
         neg_cond: &Tensor,
+        cond_shape: &Tensor,
+        shape_stage: &str,
+        shape_config: Trellis2SlatConfig,
+        tex_stage: &str,
+        tex_config: Trellis2SlatConfig,
         ss_noise: Option<&Tensor>,
         coords_override: Option<Vec<[i32; 3]>>,
         shape_noise: Option<&Tensor>,
@@ -1524,17 +2207,25 @@ impl Trellis2Pipeline {
         tex_latent_override: Option<&Tensor>,
         device: &Device,
         options: &Trellis2RunOptions,
+        ss_params: &Trellis2SamplerParams,
+        shape_params: &Trellis2SamplerParams,
+        tex_params: &Trellis2SamplerParams,
     ) -> Result<Trellis2Stages> {
         let (ss_resolution, shape_resolution) = self.resolutions(options)?;
+        let neg_cond_shape = Tensor::zeros_like(cond_shape).map_err(|source| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!("Trellis2 negative cond allocation failed: {source}"),
+            }
+        })?;
         let (z_s, ss_coords) = match coords_override {
             Some(coords) => (None, coords),
             None => {
                 let (z_s, coords) = self.sample_sparse_structure(
-                    cond,
+                    cond_ss,
                     neg_cond,
                     ss_noise,
                     options.seed,
-                    options.ss_steps,
+                    ss_params,
                     device,
                     ss_resolution,
                 )?;
@@ -1564,30 +2255,40 @@ impl Trellis2Pipeline {
                 }
                 latent.clone()
             }
-            None => self.sample_shape_slat(
-                cond,
-                neg_cond,
+            None => self.sample_shape_slat_stage(
+                shape_stage,
+                shape_config,
+                0x534C_4154_5F4E_4F49,
+                cond_shape,
+                &neg_cond_shape,
                 &ss_coords,
                 shape_noise,
                 options.seed,
-                options.shape_steps,
+                shape_params,
                 device,
             )?,
         };
         // Texture SLAT on the shape latent coords (reference order: after
         // the shape stage, before the decodes).
-        let tex_latent = self.texture_latent_512(
-            cond,
+        let tex_latent = self.texture_latent_single(
+            cond_shape,
             &shape_latent,
             &ss_coords,
+            tex_stage,
+            tex_config,
             tex_latent_override,
             device,
             options,
+            tex_params,
         )?;
         let (decoded, mesh) =
             self.decode_shape_vae(&ss_coords, &shape_latent, device, shape_resolution)?;
         let mut mesh =
             self.assemble_mesh(shape_resolution, mesh, &decoded.coords, &decoded.feats)?;
+        // Geometry post-process (upstream `to_glb` cleaning) BEFORE the
+        // texture stage: the re-topologized vertices are the ones the
+        // per-vertex PBR color sampling sees.
+        mesh = self.postprocess_decoded_mesh(mesh, &options.postprocess)?;
         let tex_attrs = match &tex_latent {
             Some(tex_latent) => {
                 let (tex_coords, attrs) =
@@ -1601,8 +2302,11 @@ impl Trellis2Pipeline {
             }
             None => None,
         };
+        // Texture export (upstream `to_glb` UV unwrap + bake). Skips cleanly
+        // for geometry-only runs (see `build_textured_mesh`).
+        let textured = self.build_textured_mesh(&mesh, &options.texture_export)?;
         Ok(Trellis2Stages {
-            cond: cond.clone(),
+            cond: cond_ss.clone(),
             neg_cond: neg_cond.clone(),
             z_s,
             ss_coords: ss_coords.clone(),
@@ -1617,21 +2321,25 @@ impl Trellis2Pipeline {
             subdiv_logits: decoded.subdiv_logits,
             tex_latent,
             tex_attrs,
+            textured,
         })
     }
 
-    /// Shared texture-latent step for the 512 core: `None` when
-    /// `with_texture` is off; the injected de-normalized latent when
+    /// Shared texture-latent step for the single-resolution core: `None`
+    /// when `with_texture` is off; the injected de-normalized latent when
     /// provided (validated against the coord count); sampled otherwise.
     #[allow(clippy::too_many_arguments)]
-    fn texture_latent_512(
+    fn texture_latent_single(
         &self,
         cond: &Tensor,
         shape_latent: &Tensor,
         coords: &[[i32; 3]],
+        tex_stage: &str,
+        tex_config: Trellis2SlatConfig,
         tex_latent_override: Option<&Tensor>,
         device: &Device,
         options: &Trellis2RunOptions,
+        tex_params: &Trellis2SamplerParams,
     ) -> Result<Option<Tensor>> {
         if !options.with_texture {
             return Ok(None);
@@ -1655,33 +2363,39 @@ impl Trellis2Pipeline {
                 }
                 Ok(Some(latent.clone()))
             }
-            None => Ok(Some(self.sample_tex_slat(
+            None => Ok(Some(self.sample_tex_slat_stage(
+                tex_stage,
+                tex_config,
                 cond,
                 shape_latent,
                 coords,
                 None,
                 options.seed,
-                options.tex_steps,
+                tex_params,
                 device,
             )?)),
         }
     }
 
-    /// 1024 cascade core (reference `run(...)`, `pipeline_type =
-    /// '1024_cascade'`): SS stage at 32^3 on `cond` (the reference
-    /// conditions the SS stage on `cond_512`), LR shape SLAT (unless
-    /// `shape_latent_override` — the injected de-normalized LR slat), shape
-    /// VAE `upsample(slat, 4)` -> HR quantization + token budget, HR shape
-    /// SLAT on `cond_hr`, texture SLAT on `cond_hr` with `tex_dit_1024` on
-    /// the HR quantized coords, decode at `hr_resolution` + mesh. Model
-    /// residency stays sequential: LR DiT -> drop, shape VAE -> drop, HR
-    /// DiT -> drop, tex DiT -> drop, shape VAE (decode) -> drop, tex VAE.
+    /// Cascade core shared by `1024_cascade` and `1536_cascade` (reference
+    /// `run(...)`, `sample_shape_slat_cascade(resolution = target)`): SS
+    /// stage at 32^3 on `cond` (the reference conditions the SS stage on
+    /// `cond_512`), LR shape SLAT (unless `shape_latent_override` — the
+    /// injected de-normalized LR slat), shape VAE `upsample(slat, 4)` -> HR
+    /// quantization + token budget starting at `target_resolution` (the
+    /// loop's stop resolution stays 1024), HR shape SLAT on `cond_hr` with
+    /// `shape_dit_1024`, texture SLAT on `cond_hr` with `tex_dit_1024` on
+    /// the HR quantized coords, decode at the returned `hr_resolution` +
+    /// mesh. Model residency stays sequential: LR DiT -> drop, shape VAE ->
+    /// drop, HR DiT -> drop, tex DiT -> drop, shape VAE (decode) -> drop,
+    /// tex VAE.
     #[allow(clippy::too_many_arguments)]
-    fn run_core_cascade_1024(
+    fn run_core_cascade(
         &self,
         cond: &Tensor,
         neg_cond: &Tensor,
         cond_hr: &Tensor,
+        target_resolution: u32,
         ss_noise: Option<&Tensor>,
         coords_override: Option<Vec<[i32; 3]>>,
         lr_noise: Option<&Tensor>,
@@ -1689,6 +2403,9 @@ impl Trellis2Pipeline {
         tex_latent_override: Option<&Tensor>,
         device: &Device,
         options: &Trellis2RunOptions,
+        ss_params: &Trellis2SamplerParams,
+        shape_params: &Trellis2SamplerParams,
+        tex_params: &Trellis2SamplerParams,
     ) -> Result<Trellis2Stages> {
         let (ss_resolution, _) = self.resolutions(options)?;
         let (z_s, ss_coords) = match coords_override {
@@ -1699,7 +2416,7 @@ impl Trellis2Pipeline {
                     neg_cond,
                     ss_noise,
                     options.seed,
-                    options.ss_steps,
+                    ss_params,
                     device,
                     ss_resolution,
                 )?;
@@ -1736,7 +2453,7 @@ impl Trellis2Pipeline {
                 &ss_coords,
                 lr_noise,
                 options.seed,
-                options.shape_steps,
+                shape_params,
                 device,
             )?,
         };
@@ -1745,6 +2462,7 @@ impl Trellis2Pipeline {
                 &ss_coords,
                 &lr_slat,
                 options.max_num_tokens,
+                target_resolution,
                 device,
             )?;
         if quant_coords.is_empty() {
@@ -1752,12 +2470,14 @@ impl Trellis2Pipeline {
                 "Trellis2 cascade quantized the upsampled coords to zero HR tokens",
             ));
         }
+        let hr_grid = (hr_resolution / 16) as usize;
         let hr_slat = self.sample_shape_slat_hr(
             cond_hr,
             &quant_coords,
             options.seed,
-            options.shape_steps,
+            shape_params,
             device,
+            hr_grid,
         )?;
         // Texture SLAT on the HR quantized coords, conditioned on `cond_hr`
         // (reference texture stage uses the 1024 conditioning + DiT).
@@ -1768,10 +2488,16 @@ impl Trellis2Pipeline {
             tex_latent_override,
             device,
             options,
+            tex_params,
+            hr_grid,
         )?;
         let (decoded, mesh) =
             self.decode_shape_vae(&quant_coords, &hr_slat, device, hr_resolution)?;
         let mut mesh = self.assemble_mesh(hr_resolution, mesh, &decoded.coords, &decoded.feats)?;
+        // Geometry post-process (upstream `to_glb` cleaning) BEFORE the
+        // texture stage: the re-topologized vertices are the ones the
+        // per-vertex PBR color sampling sees.
+        mesh = self.postprocess_decoded_mesh(mesh, &options.postprocess)?;
         let tex_attrs = match &tex_latent {
             Some(tex_latent) => {
                 let (tex_coords, attrs) = self.decode_tex_attrs(
@@ -1789,6 +2515,9 @@ impl Trellis2Pipeline {
             }
             None => None,
         };
+        // Texture export (upstream `to_glb` UV unwrap + bake). Skips cleanly
+        // for geometry-only runs (see `build_textured_mesh`).
+        let textured = self.build_textured_mesh(&mesh, &options.texture_export)?;
         Ok(Trellis2Stages {
             cond: cond.clone(),
             neg_cond: neg_cond.clone(),
@@ -1805,11 +2534,13 @@ impl Trellis2Pipeline {
             subdiv_logits: decoded.subdiv_logits,
             tex_latent,
             tex_attrs,
+            textured,
         })
     }
 
     /// Shared texture-latent step for the cascade core: identical guards to
-    /// [`Self::texture_latent_512`] with the 1024 texture stage.
+    /// [`Self::texture_latent_single`] with the 1024 texture stage and the
+    /// elastic validation bound for the HR grid.
     #[allow(clippy::too_many_arguments)]
     fn texture_latent_cascade(
         &self,
@@ -1819,6 +2550,8 @@ impl Trellis2Pipeline {
         tex_latent_override: Option<&Tensor>,
         device: &Device,
         options: &Trellis2RunOptions,
+        tex_params: &Trellis2SamplerParams,
+        hr_grid_resolution: usize,
     ) -> Result<Option<Tensor>> {
         if !options.with_texture {
             return Ok(None);
@@ -1846,22 +2579,38 @@ impl Trellis2Pipeline {
                 cond_hr,
                 hr_slat,
                 quant_coords,
+                None,
                 options.seed,
-                options.tex_steps,
+                tex_params,
                 device,
+                hr_grid_resolution,
             )?)),
         }
     }
 
-    /// The shared "pipeline type not implemented" error.
-    fn resolutions_error(&self, pipeline_type: Trellis2PipelineType) -> Lux3dError {
-        Lux3dError::ModelAssetResolution {
-            message: format!(
-                "Trellis2 pipeline type `{}` is not implemented in this slice (the 1024 \
-                 cascade is implemented); use `512` or `1024_cascade`",
-                pipeline_type.as_str()
-            ),
+    /// Guard the single-output entry points against the multi-sample mode:
+    /// the upstream `run(num_samples)` batch is emulated by
+    /// [`Self::run_many_from_path`] / [`Self::run_many_with_latents`]
+    /// (sequential per-sample seed offsets), so `num_samples != 1` must not
+    /// silently run once.
+    fn check_single_sample(options: &Trellis2RunOptions) -> Result<()> {
+        if options.num_samples != 1 {
+            return Err(Lux3dError::ContractValidation {
+                message: format!(
+                    "Trellis2 num_samples = {} requires the run_many_* entry points \
+                     (sequential seed-offset emulation); the single-output runs accept \
+                     num_samples = 1 only",
+                    options.num_samples
+                ),
+            });
         }
+        Ok(())
+    }
+
+    /// Does the variant need a second conditioning pass at 1024 (the SS
+    /// stage is always conditioned on `cond_512`)?
+    fn needs_cond_1024(pipeline_type: Trellis2PipelineType) -> bool {
+        !matches!(pipeline_type, Trellis2PipelineType::R512)
     }
 
     /// Run the pipeline on an image path: preprocess -> DINOv3 -> SS -> SLAT
@@ -1872,21 +2621,23 @@ impl Trellis2Pipeline {
         device: &Device,
         options: &Trellis2RunOptions,
     ) -> Result<crate::contracts::Trellis2Mesh> {
+        Self::check_single_sample(options)?;
         let stages = self.run_from_path_with_stages(path, device, options)?;
         let mesh = stages.mesh.expect("run_from_path always produces a mesh");
         mesh.to_contract()
     }
 
     /// [`Self::run_from_path`] returning the full per-stage outputs. The
-    /// cascade branch crops the source once (after at most one RMBG-2.0 run)
-    /// and resizes that crop to both 512 and 1024, matching the reference
-    /// `preprocess_image` -> `get_cond(512)`/`get_cond(1024)` flow.
+    /// 1024-conditioned branches crop the source once (after at most one
+    /// RMBG-2.0 run) and resize that crop to both 512 and 1024, matching the
+    /// reference `preprocess_image` -> `get_cond(512)`/`get_cond(1024)` flow.
     pub fn run_from_path_with_stages(
         &self,
         path: &Path,
         device: &Device,
         options: &Trellis2RunOptions,
     ) -> Result<Trellis2Stages> {
+        Self::check_single_sample(options)?;
         if !options.preprocess {
             return Err(Lux3dError::InvalidInput(
                 "run_from_path requires options.preprocess = true; use run_prepared for \
@@ -1898,17 +2649,8 @@ impl Trellis2Pipeline {
         let crop = self
             .preprocess
             .prepare_crop_from_path(path, self.background_remover())?;
-        if options.pipeline_type == Trellis2PipelineType::Cascade1024 {
-            let preprocess_hr = self.cascade_preprocess_hr()?;
-            let prepared = self.preprocess.resize_crop(&crop)?;
-            let prepared_hr = preprocess_hr.resize_crop(&crop)?;
-            let (cond, neg_cond) = self.image_conditioning(&prepared, device)?;
-            let pixel_values_hr = preprocess_hr
-                .normalized_pixel_values(&prepared_hr, device)
-                .map_err(|source| Lux3dError::CanonicalWeightsValidation {
-                    message: format!("Trellis2 DINOv3 input normalization failed: {source}"),
-                })?;
-            let (cond_hr, _neg_hr) = self.dino_conditioning_pixels(&pixel_values_hr, device)?;
+        if Self::needs_cond_1024(options.pipeline_type) {
+            let (cond, neg_cond, cond_hr) = self.conditioning_512_and_1024(&crop, device)?;
             return self.run_core(
                 &cond,
                 &neg_cond,
@@ -1926,11 +2668,33 @@ impl Trellis2Pipeline {
         self.run_prepared(&prepared, device, options)
     }
 
+    /// `cond_512` + `cond_1024` from one source crop (the reference
+    /// `preprocess_image` -> `get_cond([image], 512)` +
+    /// `get_cond([image], 1024)`): the crop is resized to each DINOv3 input
+    /// resolution exactly once.
+    fn conditioning_512_and_1024(
+        &self,
+        crop: &crate::preprocess::Trellis2PreparedCrop,
+        device: &Device,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let preprocess_hr = self.cascade_preprocess_hr()?;
+        let prepared = self.preprocess.resize_crop(crop)?;
+        let prepared_hr = preprocess_hr.resize_crop(crop)?;
+        let (cond, neg_cond) = self.image_conditioning(&prepared, device)?;
+        let pixel_values_hr = preprocess_hr
+            .normalized_pixel_values(&prepared_hr, device)
+            .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                message: format!("Trellis2 DINOv3 input normalization failed: {source}"),
+            })?;
+        let (cond_hr, _neg_hr) = self.dino_conditioning_pixels(&pixel_values_hr, device)?;
+        Ok((cond, neg_cond, cond_hr))
+    }
+
     /// Run the pipeline on an already-preprocessed image.
     ///
-    /// Cascade1024 note: the prepared image only carries the 512 crop, so
-    /// `cond_1024` is built by LANCZOS-resizing the prepared pixels to 1024
-    /// (a documented double-resample approximation —
+    /// 1024-conditioned variants note: the prepared image only carries the
+    /// 512 crop, so `cond_1024` is built by LANCZOS-resizing the prepared
+    /// pixels to 1024 (a documented double-resample approximation —
     /// [`Self::run_from_path_with_stages`] re-prepares from the source and
     /// is exact).
     pub fn run_prepared(
@@ -1939,13 +2703,14 @@ impl Trellis2Pipeline {
         device: &Device,
         options: &Trellis2RunOptions,
     ) -> Result<Trellis2Stages> {
+        Self::check_single_sample(options)?;
         let (cond, neg_cond) = self.image_conditioning(prepared, device)?;
-        let cond_hr = match options.pipeline_type {
-            Trellis2PipelineType::Cascade1024 => {
+        let cond_hr = match Self::needs_cond_1024(options.pipeline_type) {
+            true => {
                 let (cond_hr, _neg) = self.cascade_cond_1024_from_prepared(prepared, device)?;
                 Some(cond_hr)
             }
-            _ => None,
+            false => None,
         };
         self.run_core(
             &cond,
@@ -1966,16 +2731,16 @@ impl Trellis2Pipeline {
     /// * `ss_init`: sparse-structure flow noise `[1, 8, R, R, R]`.
     /// * `shape_init`: de-normalized shape latent `[N, 32]` on the SS coords
     ///   — when provided the LR shape SLAT sampler is skipped. `512` decodes
-    ///   it directly; `1024_cascade` treats it as the LR slat (upsample ->
+    ///   it directly; the cascades treat it as the LR slat (upsample ->
     ///   quantize -> HR sample -> decode; the row count must match the
     ///   decoded coords).
     /// * `tex_init`: de-normalized texture latent `[N, 32]` on the shape
     ///   latent coords — when provided the texture SLAT sampler is skipped
-    ///   (`512` decodes it on the SS coords; `1024_cascade` on the HR
+    ///   (`512` decodes it on the SS coords; `1024`/cascade paths on the HR
     ///   quantized coords). Requires `with_texture`; must be `None` when
     ///   texture is off.
     ///
-    /// Cascade1024 note: the frozen surface carries a single `cond`, so the
+    /// Cascade note: the frozen surface carries a single `cond`, so the
     /// injected cond feeds both the LR (`cond_512`) and HR (`cond_1024`)
     /// stages — cross-attention accepts any context length and the injected
     /// parity runs supply the cond they compare against.
@@ -1988,6 +2753,43 @@ impl Trellis2Pipeline {
         device: &Device,
         options: &Trellis2RunOptions,
     ) -> Result<crate::contracts::Trellis2Mesh> {
+        Self::check_single_sample(options)?;
+        self.run_with_latents_many_inner(
+            cond,
+            ss_init,
+            shape_init,
+            tex_init,
+            device,
+            &options.clone(),
+        )
+        .map(|mut stages| {
+            stages
+                .pop()
+                .expect("run_with_latents_many_inner yields num_samples stages")
+        })
+        .and_then(|stages| {
+            let mesh = stages
+                .mesh
+                .expect("run_with_latents always produces a mesh");
+            mesh.to_contract()
+        })
+    }
+
+    /// Multi-sample surface (`num_samples > 1`): the upstream
+    /// `run(num_samples)` batching is emulated by running the deterministic
+    /// stages sequentially, sample `i` with seed `options.seed + i` over the
+    /// SAME injected conditioning and stage tensors. This is NOT batched DiT
+    /// inference; `num_samples = 1` is bit-identical to
+    /// [`Self::run_with_latents`].
+    pub fn run_many_with_latents(
+        &self,
+        cond: &Tensor,
+        ss_init: &Tensor,
+        shape_init: Option<&Tensor>,
+        tex_init: Option<&Tensor>,
+        device: &Device,
+        options: &Trellis2RunOptions,
+    ) -> Result<Vec<Trellis2Stages>> {
         if tex_init.is_some() && !options.with_texture {
             return Err(Lux3dError::InvalidInput(
                 "tex_init requires options.with_texture = true (texture is disabled)",
@@ -1996,26 +2798,104 @@ impl Trellis2Pipeline {
         if !matches!(options.pipeline_type, Trellis2PipelineType::R512) {
             self.resolutions(options)?;
         }
+        self.run_with_latents_many_inner(cond, ss_init, shape_init, tex_init, device, options)
+    }
+
+    fn run_with_latents_many_inner(
+        &self,
+        cond: &Tensor,
+        ss_init: &Tensor,
+        shape_init: Option<&Tensor>,
+        tex_init: Option<&Tensor>,
+        device: &Device,
+        options: &Trellis2RunOptions,
+    ) -> Result<Vec<Trellis2Stages>> {
+        let count = if options.num_samples == 0 {
+            return Err(Lux3dError::InvalidInput(
+                "Trellis2 num_samples must be >= 1",
+            ));
+        } else {
+            options.num_samples
+        };
         let neg_cond =
             Tensor::zeros_like(cond).map_err(|source| Lux3dError::CanonicalWeightsValidation {
                 message: format!("Trellis2 negative cond allocation failed: {source}"),
             })?;
-        let stages = self.run_core(
-            cond,
-            &neg_cond,
-            None,
-            Some(ss_init),
-            None,
-            None,
-            shape_init,
-            tex_init,
-            device,
-            options,
-        )?;
-        let mesh = stages
-            .mesh
-            .expect("run_with_latents always produces a mesh");
-        mesh.to_contract()
+        let mut stages = Vec::with_capacity(count);
+        for index in 0..count {
+            let mut sample_options = options.clone();
+            sample_options.num_samples = 1;
+            sample_options.seed = options.seed.wrapping_add(index as u64);
+            stages.push(self.run_core(
+                cond,
+                &neg_cond,
+                None,
+                Some(ss_init),
+                None,
+                None,
+                shape_init,
+                tex_init,
+                device,
+                &sample_options,
+            )?);
+        }
+        Ok(stages)
+    }
+
+    /// Multi-sample surface from an image path (`num_samples > 1`): the
+    /// upstream `run(num_samples)` batching is emulated by running the
+    /// deterministic stages sequentially, sample `i` with seed
+    /// `options.seed + i` over the SAME preprocessing and conditioning (the
+    /// crop and both DINOv3 passes run once). This is NOT batched DiT
+    /// inference; `num_samples = 1` returns exactly one element and is
+    /// bit-identical to [`Self::run_from_path_with_stages`].
+    pub fn run_many_from_path(
+        &self,
+        path: &Path,
+        device: &Device,
+        options: &Trellis2RunOptions,
+    ) -> Result<Vec<Trellis2Stages>> {
+        if options.num_samples == 0 {
+            return Err(Lux3dError::InvalidInput(
+                "Trellis2 num_samples must be >= 1",
+            ));
+        }
+        if !options.preprocess {
+            return Err(Lux3dError::InvalidInput(
+                "run_many_from_path requires options.preprocess = true; use \
+                 run_many_with_latents for pre-conditioned runs",
+            ));
+        }
+        let crop = self
+            .preprocess
+            .prepare_crop_from_path(path, self.background_remover())?;
+        let (cond, neg_cond, cond_hr) = if Self::needs_cond_1024(options.pipeline_type) {
+            let (cond, neg_cond, cond_hr) = self.conditioning_512_and_1024(&crop, device)?;
+            (cond, neg_cond, Some(cond_hr))
+        } else {
+            let prepared = self.preprocess.resize_crop(&crop)?;
+            let (cond, neg_cond) = self.image_conditioning(&prepared, device)?;
+            (cond, neg_cond, None)
+        };
+        let mut stages = Vec::with_capacity(options.num_samples);
+        for index in 0..options.num_samples {
+            let mut sample_options = options.clone();
+            sample_options.num_samples = 1;
+            sample_options.seed = options.seed.wrapping_add(index as u64);
+            stages.push(self.run_core(
+                &cond,
+                &neg_cond,
+                cond_hr.as_ref(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                device,
+                &sample_options,
+            )?);
+        }
+        Ok(stages)
     }
 
     /// Write the mesh buffers with the TRELLIS.2 export stage.

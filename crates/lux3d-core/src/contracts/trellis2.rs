@@ -4,8 +4,9 @@ use crate::contracts::{ModelFamily, SpatialSize, TensorContract};
 
 /// Pipeline variant selected by `pipeline_type` in the TRELLIS.2 reference
 /// configs. `512` runs the single-resolution shape path, `1024` runs the
-/// single-resolution path at 64^3 sparse structure, and `1024_cascade` runs
-/// the 32^3 -> 1024 shape cascade (the reference default).
+/// single-resolution path at 64^3 sparse structure, and the cascade variants
+/// run the 32^3 -> HR shape cascade (`1024_cascade` is the reference
+/// default, `1536_cascade` targets 1536 with the same 1024 stop resolution).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Trellis2PipelineType {
     #[serde(rename = "512")]
@@ -14,6 +15,8 @@ pub enum Trellis2PipelineType {
     R1024,
     #[serde(rename = "1024_cascade")]
     Cascade1024,
+    #[serde(rename = "1536_cascade")]
+    Cascade1536,
 }
 
 impl Trellis2PipelineType {
@@ -22,6 +25,7 @@ impl Trellis2PipelineType {
             Self::R512 => "512",
             Self::R1024 => "1024",
             Self::Cascade1024 => "1024_cascade",
+            Self::Cascade1536 => "1536_cascade",
         }
     }
 }

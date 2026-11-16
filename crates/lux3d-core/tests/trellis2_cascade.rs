@@ -34,7 +34,7 @@ use candle_core::{DType, Device, Tensor};
 use lux3d_core::runtime::{
     TRELLIS2_CASCADE_HR_RESOLUTION, TRELLIS2_CASCADE_LR_RESOLUTION,
     TRELLIS2_CASCADE_UPSAMPLE_TIMES, Trellis2Pipeline, quantize_hr_coords,
-    quantize_hr_coords_with_stop,
+    quantize_hr_coords_with_stop, resolve_stage_params,
 };
 use lux3d_core::test_support::workspace_root;
 
@@ -682,6 +682,9 @@ fn cascade_shape_stage_smoke_real_weights() {
     let cond_hr = Tensor::zeros((1, 4101, 1024), DType::F32, &Device::Cpu).expect("cond hr");
 
     let started = std::time::Instant::now();
+    // Same resolution the run cores use with no overrides: the pipeline
+    // config defaults with the test step count.
+    let params = resolve_stage_params(&pipeline.config.shape_sampler, None, steps);
     let cascade = pipeline
         .sample_shape_slat_cascade(
             &cond_lr,
@@ -689,8 +692,9 @@ fn cascade_shape_stage_smoke_real_weights() {
             &coords,
             None,
             42,
-            steps,
+            &params,
             49152,
+            TRELLIS2_CASCADE_HR_RESOLUTION,
             &Device::Cpu,
         )
         .expect("cascade shape stage");
@@ -925,17 +929,23 @@ fn cascade_full_cuda_e2e() {
             .write_mesh_with_pbr(&buffers, &glb_path)
             .expect("export pbr pair");
         let bin_bytes = std::fs::read(&sidecar).expect("sidecar bytes");
-        assert_eq!(&bin_bytes[..8], lux3d_core::export::pbrvox::MAGIC.as_slice());
+        assert_eq!(
+            &bin_bytes[..8],
+            lux3d_core::export::pbrvox::MAGIC.as_slice()
+        );
         let count = u64::from_le_bytes(bin_bytes[16..24].try_into().expect("count"));
         assert_eq!(count, buffers.voxel_count() as u64);
         let json_path = temp.join("cascade_mesh.pbr.json");
-        let json: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(&json_path).expect("pbr json"),
-        )
-        .expect("pbr json parse");
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&json_path).expect("pbr json"))
+                .expect("pbr json parse");
         assert_eq!(json["resolution"], buffers.resolution);
         assert_eq!(json["voxel_count"], buffers.voxel_count());
-        println!("cascade pbr sidecar: {} voxels, {}", count, sidecar.display());
+        println!(
+            "cascade pbr sidecar: {} voxels, {}",
+            count,
+            sidecar.display()
+        );
     }
     drop(vram);
     let _ = std::fs::remove_dir_all(&temp);

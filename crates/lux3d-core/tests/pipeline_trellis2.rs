@@ -50,8 +50,9 @@ fn e2e_device() -> Device {
         .to_lowercase();
     match requested.as_str() {
         "cpu" => Device::Cpu,
-        "cuda" => Device::new_cuda(0)
-            .expect("LUX3D_TRELLIS2_E2E_DEVICE=cuda requires a CUDA device"),
+        "cuda" => {
+            Device::new_cuda(0).expect("LUX3D_TRELLIS2_E2E_DEVICE=cuda requires a CUDA device")
+        }
         "vulkan" => Device::new_vulkan(0)
             .expect("LUX3D_TRELLIS2_E2E_DEVICE=vulkan requires a Vulkan device"),
         "wgpu" => {
@@ -100,10 +101,7 @@ const RAW_STAGE_FILES: [(&str, &str); 9] = [
         "tex_dit_1024",
         "ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.safetensors",
     ),
-    (
-        "tex_dec",
-        "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors",
-    ),
+    ("tex_dec", "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors"),
 ];
 
 #[test]
@@ -276,9 +274,10 @@ fn raw_dir_rejects_missing_stage_files() {
     assert_eq!(pipeline.config.shape_slat_mean, vec![1.0; 32]);
     assert_eq!(pipeline.config.shape_slat_std, vec![2.0; 32]);
 
-    // The single-resolution `1024` pipeline variant is rejected before any
-    // weight loading (it lands with the texture stage T7; the cascade is
-    // implemented since T6). The SS flow latent is [1, 8, 16^3].
+    // The single-resolution `1024` and `1536_cascade` variants are now
+    // implemented: they are no longer rejected up front, so with placeholder
+    // stage files the run fails at weight loading instead (the "not
+    // implemented" slice error is gone). The SS flow latent is [1, 8, 16^3].
     let cond = Tensor::zeros((1, 4), candle_core::DType::F32, &Device::Cpu).expect("cond");
     let ss_init = Tensor::zeros(
         (1usize, 8, 16, 16, 16),
@@ -286,15 +285,58 @@ fn raw_dir_rejects_missing_stage_files() {
         &Device::Cpu,
     )
     .expect("ss init");
+    for pipeline_type in [
+        Trellis2PipelineType::R1024,
+        Trellis2PipelineType::Cascade1536,
+    ] {
+        let options = Trellis2RunOptions {
+            pipeline_type,
+            ..Trellis2RunOptions::default()
+        };
+        let error = pipeline
+            .run_with_latents(&cond, &ss_init, None, None, &Device::Cpu, &options)
+            .expect_err("placeholder weights fail at load time");
+        let message = error.to_string();
+        assert!(
+            !message.contains("not implemented"),
+            "`{}` must be implemented now: {message}",
+            pipeline_type.as_str()
+        );
+    }
+
+    // num_samples > 1 on the single-output entry points must be rejected
+    // before any weight loading (use run_many_* for multi-sample runs).
     let options = Trellis2RunOptions {
-        pipeline_type: Trellis2PipelineType::R1024,
+        num_samples: 2,
         ..Trellis2RunOptions::default()
     };
     let error = pipeline
         .run_with_latents(&cond, &ss_init, None, None, &Device::Cpu, &options)
-        .expect_err("single-resolution 1024 rejected until T7");
-    let message = error.to_string();
-    assert!(message.contains("not implemented"), "message: {message}");
+        .expect_err("num_samples > 1 needs run_many_with_latents");
+    assert!(
+        error.to_string().contains("run_many"),
+        "unexpected num_samples message: {error}"
+    );
+    let error = pipeline
+        .run_from_path(&dir.join("missing.png"), &Device::Cpu, &options)
+        .expect_err("num_samples > 1 needs run_many_from_path");
+    assert!(
+        error.to_string().contains("run_many"),
+        "unexpected num_samples message: {error}"
+    );
+
+    // num_samples = 0 is rejected by the run_many entry points.
+    let options = Trellis2RunOptions {
+        num_samples: 0,
+        ..Trellis2RunOptions::default()
+    };
+    let error = pipeline
+        .run_many_with_latents(&cond, &ss_init, None, None, &Device::Cpu, &options)
+        .expect_err("num_samples = 0 rejected");
+    assert!(
+        error.to_string().contains("num_samples"),
+        "unexpected num_samples message: {error}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -419,6 +461,113 @@ fn pipeline_golden_shape_decode_at_oracle_resolution() {
     let contract = mesh.to_contract().expect("contract");
     assert_eq!(contract.vertices.len(), 7666 * 3);
     assert_eq!(contract.faces.len(), 12186 * 3);
+}
+
+/// Gated pipeline-level post-process check: the golden decoded mesh runs
+/// through `Trellis2GeometryStage::postprocess_decoded_mesh` (the exact
+/// helper the run paths apply before `attach_texture`) with the default
+/// upstream options and with decimation; the disabled option must be
+/// byte-identical. Skips without the raw dir or the golden fixture.
+#[test]
+fn pipeline_golden_mesh_postprocess_options() {
+    use lux3d_core::runtime::Trellis2MeshPostprocessOptions;
+
+    let Some(raw) = raw_dir() else {
+        eprintln!("SKIP: TRELLIS.2 raw checkpoint dir not found (set LUX3D_TRELLIS2_RAW_DIR)");
+        return;
+    };
+    let golden = golden_dir();
+    if !golden.join("slat_coords.npy").is_file() {
+        eprintln!("SKIP: VAE oracle golden missing at {}", golden.display());
+        return;
+    }
+
+    let slat_coords: ndarray::Array2<i32> =
+        ndarray_npy::read_npy(golden.join("slat_coords.npy")).expect("slat_coords");
+    let slat_feats: ndarray::Array2<f32> =
+        ndarray_npy::read_npy(golden.join("slat_feats.npy")).expect("slat_feats");
+    let coords: Vec<[i32; 3]> = (0..slat_coords.nrows())
+        .map(|i| {
+            [
+                slat_coords[[i, 0]],
+                slat_coords[[i, 1]],
+                slat_coords[[i, 2]],
+            ]
+        })
+        .collect();
+    let latent = Tensor::from_vec(
+        slat_feats.iter().copied().collect::<Vec<f32>>(),
+        (slat_feats.nrows(), 32),
+        &Device::Cpu,
+    )
+    .expect("latent tensor");
+
+    let pipeline =
+        Trellis2Pipeline::load_from_raw_dir(&raw, &Device::Cpu).expect("raw-dir pipeline");
+    let decoded = pipeline
+        .decode_shape_slat(&coords, &latent, 128, &Device::Cpu)
+        .expect("golden decode");
+    let mesh = decoded.mesh.expect("decode produces a mesh");
+    let original_faces = mesh.face_count();
+    let original_vertices = mesh.vertex_count();
+
+    // Disabled: byte-identical pass-through.
+    let untouched = pipeline
+        .geometry
+        .postprocess_decoded_mesh(
+            mesh.clone(),
+            &Trellis2MeshPostprocessOptions {
+                enabled: false,
+                ..Trellis2MeshPostprocessOptions::default()
+            },
+        )
+        .expect("disabled postprocess");
+    assert_eq!(untouched, mesh);
+
+    // Enabled with the upstream defaults (1e6 target >> face count:
+    // cleanup-only in practice) — the payload must survive untouched and
+    // the geometry must stay valid.
+    let cleaned = pipeline
+        .geometry
+        .postprocess_decoded_mesh(mesh.clone(), &Trellis2MeshPostprocessOptions::default())
+        .expect("default postprocess");
+    assert_eq!(cleaned.resolution, mesh.resolution);
+    assert_eq!(cleaned.voxel_coords, mesh.voxel_coords);
+    assert_eq!(cleaned.voxel_attrs, mesh.voxel_attrs);
+    assert_eq!(cleaned.voxel_attr_channels, mesh.voxel_attr_channels);
+    assert_eq!(None, cleaned.vertex_colors, "colors attach AFTER cleanup");
+    let vertex_count = cleaned.vertex_count();
+    assert!(
+        cleaned
+            .faces
+            .iter()
+            .all(|&i| i >= 0 && (i as usize) < vertex_count)
+    );
+    cleaned.validate().expect("cleaned buffers valid");
+    println!(
+        "postprocess default: {original_vertices} -> {} vertices, {original_faces} -> {} faces",
+        cleaned.vertex_count(),
+        cleaned.face_count()
+    );
+
+    // Decimation target is respected on a real mesh.
+    let target = original_faces / 4;
+    let decimated = pipeline
+        .geometry
+        .postprocess_decoded_mesh(
+            mesh,
+            &Trellis2MeshPostprocessOptions {
+                decimation_target: target,
+                ..Trellis2MeshPostprocessOptions::default()
+            },
+        )
+        .expect("decimating postprocess");
+    let face_count = decimated.face_count();
+    assert!(
+        face_count > 0 && face_count <= target,
+        "decimation target {target} respected, got {face_count}"
+    );
+    decimated.validate().expect("decimated buffers valid");
 }
 
 /// Fully gated real-weight 512 image-to-mesh run. See the module docs for

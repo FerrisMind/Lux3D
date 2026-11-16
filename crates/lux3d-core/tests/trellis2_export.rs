@@ -298,3 +298,162 @@ fn export_plan_mentions_colors_and_sidecar() {
     assert!(notes.contains("vertex colors"));
     assert!(notes.contains("pbrvox.bin"));
 }
+
+/// The upstream GLB-only axis conversion: `(x, y, z) -> (x, z, -y)`
+/// (`to_glb`, postprocess.py:313). The transform is a rotation with
+/// determinant +1, so the signed volume (winding) is preserved.
+#[test]
+fn glb_axis_conversion_swaps_yz_and_negates_y() {
+    use lux3d_core::export::to_glb_axes;
+
+    let converted = to_glb_axes(&[0.1, 0.2, 0.3]);
+    assert_eq!(converted, vec![0.1, 0.3, -0.2]);
+
+    // Batch conversion + Y/Z swap independent of sign.
+    let converted = to_glb_axes(&[1.0, 2.0, 3.0, -1.0, -2.0, -3.0]);
+    assert_eq!(converted, vec![1.0, 3.0, -2.0, -1.0, -3.0, 2.0]);
+
+    // Determinant +1: the signed volume of a closed mesh is unchanged, so
+    // face winding stays valid without reversing indices.
+    let vertices: Vec<f32> = [
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 1.0],
+        [1.0, 1.0, 1.0],
+        [0.0, 1.0, 1.0],
+    ]
+    .iter()
+    .flatten()
+    .copied()
+    .collect();
+    let faces: [usize; 36] = [
+        0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, 0, 4, 7, 0, 7, 3,
+        1, 2, 6, 1, 6, 5,
+    ];
+    let signed_volume = |vertices: &[f32], faces: &[usize]| -> f32 {
+        faces
+            .chunks_exact(3)
+            .map(|f| {
+                let (a, b, c) = (
+                    &vertices[f[0] * 3..f[0] * 3 + 3],
+                    &vertices[f[1] * 3..f[1] * 3 + 3],
+                    &vertices[f[2] * 3..f[2] * 3 + 3],
+                );
+                let bc = [
+                    b[1] * c[2] - b[2] * c[1],
+                    b[2] * c[0] - b[0] * c[2],
+                    b[0] * c[1] - b[1] * c[0],
+                ];
+                (a[0] * bc[0] + a[1] * bc[1] + a[2] * bc[2]) / 6.0
+            })
+            .sum()
+    };
+    let original = signed_volume(&vertices, &faces);
+    let converted = signed_volume(&to_glb_axes(&vertices), &faces);
+    assert!((original - 1.0).abs() < 1e-6);
+    assert!((converted - original).abs() < 1e-6, "winding preserved");
+}
+
+/// GLB output re-parse: the POSITION accessor carries the converted
+/// vertices `(x, y, z) -> (x, z, -y)` and COLOR_0 values pass through
+/// unchanged; face indices are identical.
+#[test]
+fn glb_export_applies_axis_conversion_and_keeps_colors() {
+    let stage = Trellis2ExportStage;
+    let mut mesh = textured_buffers();
+    // Replace positions/colors with a known single-triangle case.
+    mesh.vertices = vec![0.1, 0.2, 0.3, 1.0, 0.0, -0.5, -0.25, 0.5, 0.75];
+    mesh.faces = vec![0, 1, 2];
+    mesh.voxel_coords = vec![0, 0, 0];
+    mesh.voxel_attrs = vec![0.9, 0.1, 0.1, 0.0, 0.6, 1.0];
+    mesh.voxel_attr_channels = pbrvox::CHANNELS;
+    mesh.vertex_colors = Some(vec![0.9, 0.1, 0.1, 0.2, 0.5, 0.8, 1.0, 0.0, 0.25]);
+
+    let dir = temp_dir("glb-axes");
+    let path = dir.join("mesh.glb");
+    assert!(matches!(
+        stage.write_mesh(&mesh, &path).expect("glb"),
+        MeshFormat::Glb
+    ));
+
+    // Re-parse the container: JSON chunk + binary chunk.
+    let bytes = std::fs::read(&path).expect("glb bytes");
+    let json_len = u32::from_le_bytes(bytes[12..16].try_into().expect("len")) as usize;
+    let json: serde_json::Value =
+        serde_json::from_slice(&bytes[20..20 + json_len]).expect("glb json");
+    let bin_offset = 20 + json_len + 8;
+    let bin_len = u32::from_le_bytes(
+        bytes[bin_offset - 8..bin_offset - 4]
+            .try_into()
+            .expect("bin len"),
+    ) as usize;
+    let bin = &bytes[bin_offset..bin_offset + bin_len];
+
+    // First vertex: (0.1, 0.2, 0.3) -> GLB (0.1, 0.3, -0.2).
+    let read_f32 =
+        |offset: usize| f32::from_le_bytes(bin[offset..offset + 4].try_into().expect("f32"));
+    assert_eq!(read_f32(0), 0.1);
+    assert_eq!(read_f32(4), 0.3);
+    assert_eq!(read_f32(8), -0.2);
+    // Second vertex: (1.0, 0.0, -0.5) -> GLB (1.0, -0.5, 0.0).
+    assert_eq!(read_f32(12), 1.0);
+    assert_eq!(read_f32(16), -0.5);
+    assert_eq!(read_f32(20), 0.0);
+
+    // Colors pass through unchanged (after the 9 position floats).
+    assert_eq!(read_f32(36), 0.9);
+    assert_eq!(read_f32(40), 0.1);
+    assert_eq!(read_f32(44), 0.1);
+    assert_eq!(read_f32(48), 0.2);
+
+    // Face indices are unchanged by the rotation (det +1).
+    let indices_offset = 36 + 9 * 4;
+    let read_u32 =
+        |offset: usize| u32::from_le_bytes(bin[offset..offset + 4].try_into().expect("u32"));
+    assert_eq!(read_u32(indices_offset), 0);
+    assert_eq!(read_u32(indices_offset + 4), 1);
+    assert_eq!(read_u32(indices_offset + 8), 2);
+
+    // The POSITION accessor bounds reflect the converted frame: Y column
+    // (0.3, -0.5, 0.75), Z column (-0.2, -0.0, -0.5).
+    let position_min = &json["accessors"][0]["min"];
+    assert_eq!(position_min[0].as_f64(), Some(-0.25));
+    assert_eq!(position_min[1].as_f64(), Some(-0.5));
+    assert_eq!(position_min[2].as_f64(), Some(-0.5));
+    let position_max = &json["accessors"][0]["max"];
+    assert_eq!(position_max[1].as_f64(), Some(0.75));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// OBJ/PLY keep the decoded reference frame: no axis conversion.
+#[test]
+fn obj_and_ply_keep_reference_frame() {
+    let stage = Trellis2ExportStage;
+    let mut mesh = textured_buffers();
+    mesh.vertices = vec![0.1, 0.2, 0.3, 1.0, 0.0, -0.5, -0.25, 0.5, 0.75];
+    mesh.faces = vec![0, 1, 2];
+    mesh.vertex_colors = None;
+
+    let dir = temp_dir("reference-frame");
+    let obj = dir.join("mesh.obj");
+    stage.write_mesh(&mesh, &obj).expect("obj");
+    let obj_text = std::fs::read_to_string(&obj).expect("obj text");
+    assert!(obj_text.contains("v 0.10000000 0.20000000 0.30000001"));
+    assert!(obj_text.contains("v 1.00000000 0.00000000 -0.50000000"));
+
+    let ply = dir.join("mesh.ply");
+    stage.write_mesh(&mesh, &ply).expect("ply");
+    let ply_text = std::fs::read_to_string(&ply).expect("ply text");
+    assert!(ply_text.contains("\n0.1 0.2 0.3\n"));
+    assert!(ply_text.contains("\n1 0 -0.5\n"));
+
+    // The explicit OBJ writer keeps the same contract.
+    let explicit = dir.join("explicit.obj");
+    stage.write_obj(&mesh, &explicit).expect("explicit obj");
+    let explicit_text = std::fs::read_to_string(&explicit).expect("explicit text");
+    assert!(explicit_text.contains("v 0.10000000 0.20000000 0.30000001"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

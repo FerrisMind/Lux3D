@@ -361,6 +361,18 @@ impl Trellis2SlatConfig {
         }
     }
 
+    /// The same `shape_dit_1024` checkpoint used by the `1536_cascade` HR
+    /// stage: the reference `ElasticSLatFlowModel` is grid-agnostic (RoPE is
+    /// built from the token coords, `resolution` is only the nominal training
+    /// grid), so HR coords on the 1536/16 = 96 cell grid are valid. The field
+    /// is used solely as the coordinate-range validation bound.
+    pub const fn shape_1536() -> Self {
+        Self {
+            resolution: 96,
+            ..Self::shape_1024()
+        }
+    }
+
     /// `slat_flow_imgshape2tex_dit_1_3B_512_bf16` (texture SLAT flow, 512
     /// stage): identical transformer to the shape flow with a 64-channel
     /// input (`sp.sparse_cat([noise32, shape_slat_norm32], dim=-1)`) and a
@@ -378,6 +390,15 @@ impl Trellis2SlatConfig {
         Self {
             resolution: 64,
             ..Self::tex_512()
+        }
+    }
+
+    /// The same `tex_dit_1024` checkpoint used by the `1536_cascade` texture
+    /// stage on the 96-cell HR grid (see [`Self::shape_1536`]).
+    pub const fn tex_1536() -> Self {
+        Self {
+            resolution: 96,
+            ..Self::tex_1024()
         }
     }
 

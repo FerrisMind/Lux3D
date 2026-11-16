@@ -220,6 +220,35 @@ impl Trellis2Preprocess {
         self.prepare_crop_from_dynamic_image(&image, remover)
     }
 
+    /// Decode the source without crop or background removal, returning RGB
+    /// samples in `[0, 1]` (`preprocess_image = false`).
+    pub fn load_raw_input_from_path(source: &Path) -> Result<Trellis2RawInput> {
+        let image = ImageReader::open(source)
+            .map_err(|_| Lux3dError::InvalidInput("failed to open TRELLIS.2 input image"))?
+            .decode()
+            .map_err(|_| Lux3dError::InvalidInput("failed to decode TRELLIS.2 input image"))?;
+        let rgb = image.to_rgb8();
+        let (width, height) = rgb.dimensions();
+        if width == 0 || height == 0 {
+            return Err(Lux3dError::InvalidInput("TRELLIS.2 input image is empty"));
+        }
+        let values = rgb
+            .pixels()
+            .map(|pixel| {
+                [
+                    pixel[0] as f32 / 255.0,
+                    pixel[1] as f32 / 255.0,
+                    pixel[2] as f32 / 255.0,
+                ]
+            })
+            .collect();
+        Ok(Trellis2RawInput {
+            original_size: SpatialSize { width, height },
+            rgba: None,
+            rgb: Some(values),
+        })
+    }
+
     /// Run the reference crop on an already-decoded image.
     pub fn prepare_crop_from_dynamic_image(
         &self,
@@ -897,6 +926,26 @@ mod tests {
 
     fn rgb(x: u8, y: u8, z: u8) -> Rgb<u8> {
         Rgb([x, y, z])
+    }
+
+    #[test]
+    fn raw_input_loader_skips_rmbg_and_crop() {
+        let path =
+            std::env::temp_dir().join(format!("lux3d-trellis2-raw-{}.png", std::process::id()));
+        let mut image = RgbImage::new(4, 4);
+        image.put_pixel(0, 0, rgb(255, 0, 0));
+        image.put_pixel(3, 3, rgb(0, 128, 255));
+        image.save(&path).expect("save raw input fixture");
+        let raw = Trellis2Preprocess::load_raw_input_from_path(&path).expect("load raw input");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(raw.original_size.width, 4);
+        assert_eq!(raw.original_size.height, 4);
+        assert!(raw.rgba.is_none());
+        let pixels = raw.rgb.expect("rgb samples");
+        assert_eq!(pixels.len(), 16);
+        assert_eq!(pixels[0], [1.0, 0.0, 0.0]);
+        assert!((pixels[15][1] - 128.0 / 255.0).abs() < 1e-6);
+        assert!((pixels[15][2] - 1.0).abs() < 1e-6);
     }
 
     #[test]

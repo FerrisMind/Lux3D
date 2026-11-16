@@ -77,6 +77,7 @@ fn trellis2_pipeline_type_uses_reference_config_strings() {
         (Trellis2PipelineType::R512, "512"),
         (Trellis2PipelineType::R1024, "1024"),
         (Trellis2PipelineType::Cascade1024, "1024_cascade"),
+        (Trellis2PipelineType::Cascade1536, "1536_cascade"),
     ] {
         assert_eq!(variant.as_str(), name);
         let body = serde_json::to_string(&variant).expect("serialize pipeline type");

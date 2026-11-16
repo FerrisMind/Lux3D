@@ -362,7 +362,8 @@ fn trellis2_locator_finds_raw_component_files_in_locator_order() {
         FutureWeightLoader::CandleMmapSafetensors,
         weights.future_loader
     );
-    assert!(weights.license_note.contains("MIT (Microsoft)"));
+    assert!(weights.license_note.contains("MIT"));
+    assert!(weights.license_note.contains("microsoft/TRELLIS.2-4B"));
     assert!(weights.license_note.contains("DINOv3"));
 
     // Missing one component must fail loudly (no partial plans).

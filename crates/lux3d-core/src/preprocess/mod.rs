@@ -15,7 +15,7 @@ pub use trellis2::{
 };
 pub use triposg::{TripoSgPreparedInputs, TripoSgPreprocessStage};
 pub use triposr::TripoPreprocessStage;
-pub use vggt::{VggtPreparedInputs, VggtPreprocessStage};
+pub use vggt::{VggtOriginalCoords, VggtPreparedInputs, VggtPreprocessMode, VggtPreprocessStage};
 
 /// Crate-internal re-export: the cascade's `run_prepared` entry resizes the
 /// prepared 512 crop to the 1024 DINOv3 input (T6).

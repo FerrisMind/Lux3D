@@ -22,8 +22,15 @@
 //!   otherwise `quad_split_2 = [0,1,3,3,1,2]`. Quads are emitted in
 //!   `(voxel, axis)` row-major order, two triangles each.
 //!
-//! No hole filling, decimation, remeshing or orientation unification (the
-//! reference `Mesh.fill_holes()` post-step is a documented exclusion).
+//! No hole filling, decimation, remeshing or orientation unification HERE:
+//! the extraction stays verbatim against the reference CUDA kernel. The
+//! reference `Mesh.fill_holes()` post-step (decode-time) and the
+//! `to_glb` cleaning order run as a separate pipeline pass
+//! (`mesh_ops::postprocess_mesh` via
+//! `Trellis2GeometryStage::postprocess_decoded_mesh`) before the texture
+//! stage, controlled by `Trellis2MeshPostprocessOptions` (enabled by
+//! default; disable with `Trellis2RunOptions::postprocess.enabled = false`
+//! for the raw extraction).
 
 use std::collections::HashMap;
 
