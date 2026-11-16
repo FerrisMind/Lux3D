@@ -120,6 +120,17 @@ fn load_linear(vb: VarBuilder, in_dim: usize, out_dim: usize, bias: bool) -> Can
 
 /// Keep packed weights for the quantized dtypes; dequantize raw F16/F32 GGUF
 /// entries so they behave exactly like the dense safetensors path.
+///
+/// WGPU override: every packed GGML dtype is dequantized to dense F32 at
+/// load, because its packed-weight `quantized_matmul` shader runs at ~2.8
+/// GFLOP/s on the 32x32 tile (measured 192 ms per q8 4096x1024x1024 GEMM on
+/// an RTX 3060), so a q8 TRELLIS.2 stage spends ~162 s per sampler step in
+/// that kernel while the dense f32 warp-tile matmul takes ~18 ms for the same
+/// shape. Dequantizing each stage's weights once at load (then dropping the
+/// packed QTensor) trades ~4x weight VRAM for ~10x GEMM throughput; stages
+/// are loaded and dropped sequentially, so the peak stays inside 12 GiB.
+/// `LUX3D_WGPU_DEQUANT_WEIGHTS=0` restores packed weights (including the
+/// K-quant path with its Q8K dispatch limit).
 fn quantized_linear(
     qt: QTensor,
     vb: &VarBuilder,
@@ -133,10 +144,14 @@ fn quantized_linear(
             qt.shape()
         );
     }
-    if matches!(
-        qt.dtype(),
-        GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
-    ) {
+    let wgpu_dense = vb.device().is_wgpu()
+        && std::env::var("LUX3D_WGPU_DEQUANT_WEIGHTS").map_or(true, |v| v != "0");
+    if wgpu_dense
+        || matches!(
+            qt.dtype(),
+            GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
+        )
+    {
         let weight = qt.dequantize(vb.device())?.to_dtype(DType::F32)?;
         return Ok(Some(Linear {
             inner: LinearInner::Dense(candle_nn::Linear::new(weight, bias)),
