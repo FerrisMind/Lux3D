@@ -554,6 +554,106 @@ fn flash_compact_dmc_mesh_matches_trimesh_processing() {
     assert_eq!(compact.faces, vec![0, 1, 2, 0, 1, 2, 3, 1, 2]);
 }
 
+/// The bounds override threads through the DMC world mapping: the SAME
+/// synthetic SDF field (a sphere in grid space) decoded at two different
+/// world windows produces the same surface, translated into each window's
+/// ABSOLUTE frame (no re-normalization), with every vertex inside the
+/// requested bounds. This is the decoder-free stand-in for
+/// `TripoSgRunOptions::bounds` (the option only forwards the window into
+/// `TripoSgFlashGrid::bounds`, which is what this test drives directly).
+#[test]
+fn flash_dmc_honors_bounds_override() {
+    let dims = 8usize;
+    let depth = 3u32; // world divisor 2^3 = 8, grid units -> world = v / 8 * size
+    let radius_grid = 2.2_f32;
+    // Positive-inside field: r - dist from the grid center (z-fastest order).
+    let mut values = Vec::with_capacity(dims * dims * dims);
+    for x in 0..dims {
+        for y in 0..dims {
+            for z in 0..dims {
+                let distance = ((x as f32 - 3.5).powi(2)
+                    + (y as f32 - 3.5).powi(2)
+                    + (z as f32 - 3.5).powi(2))
+                .sqrt();
+                values.push(radius_grid - distance);
+            }
+        }
+    }
+
+    let bounds_a = [-2.0_f32, -2.0, -2.0, 2.0, 2.0, 2.0];
+    let bounds_b = [10.0_f32, 10.0, 10.0, 14.0, 14.0, 14.0];
+    let grid_for = |bounds: [f32; 6]| lux3d_core::runtime::TripoSgFlashGrid {
+        depth,
+        dims,
+        bounds,
+        values: values.clone(),
+    };
+
+    let mesh_a = flash_dual_marching_cubes(&grid_for(bounds_a)).expect("dmc at bounds A");
+    let mesh_b = flash_dual_marching_cubes(&grid_for(bounds_b)).expect("dmc at bounds B");
+    assert!(
+        !mesh_a.faces.is_empty() && !mesh_b.faces.is_empty(),
+        "the synthetic sphere must produce a surface at both windows"
+    );
+
+    // World geometry of window A: center at bounds_a.min + 3.5/8 * 4 on each
+    // axis, radius 2.2/8 * 4.
+    let expected_center = [-0.25_f32, -0.25, -0.25];
+    let expected_radius = 1.1_f32;
+    let tolerance = 0.5_f32; // > half a cell diagonal (0.43)
+    for vertex in mesh_a.vertices.chunks_exact(3) {
+        for axis in 0..3 {
+            assert!(
+                vertex[axis] >= bounds_a[axis] && vertex[axis] <= bounds_a[axis + 3],
+                "vertex {vertex:?} escaped bounds A {bounds_a:?}"
+            );
+        }
+        let distance = ((vertex[0] - expected_center[0]).powi(2)
+            + (vertex[1] - expected_center[1]).powi(2)
+            + (vertex[2] - expected_center[2]).powi(2))
+        .sqrt();
+        assert!(
+            (distance - expected_radius).abs() <= tolerance,
+            "vertex {vertex:?} is {distance} from the expected sphere radius \
+             {expected_radius}"
+        );
+    }
+
+    // Window B is window A translated by +12 on every axis: the identical
+    // field must yield the identical topology and the same vertices shifted
+    // into the absolute frame of B.
+    assert_eq!(
+        mesh_a.faces, mesh_b.faces,
+        "topology must be bounds-independent"
+    );
+    assert_eq!(mesh_a.vertices.len(), mesh_b.vertices.len());
+    for (a, b) in mesh_a
+        .vertices
+        .chunks_exact(3)
+        .zip(mesh_b.vertices.chunks_exact(3))
+    {
+        for axis in 0..3 {
+            assert!(
+                (a[axis] + 12.0 - b[axis]).abs() <= 1e-5,
+                "window-B vertex {b:?} is not window-A vertex {a:?} shifted by 12"
+            );
+        }
+        for axis in 0..3 {
+            assert!(
+                b[axis] >= bounds_b[axis] && b[axis] <= bounds_b[axis + 3],
+                "vertex {b:?} escaped bounds B {bounds_b:?}"
+            );
+        }
+    }
+    println!(
+        "bounds override: window A {} verts / {} faces, window B {} verts / {} faces",
+        mesh_a.vertices.len() / 3,
+        mesh_a.faces.len() / 3,
+        mesh_b.vertices.len() / 3,
+        mesh_b.faces.len() / 3
+    );
+}
+
 #[test]
 fn flash_dmc_synthetic_plane() {
     let path = runtime_root()

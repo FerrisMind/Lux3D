@@ -20,12 +20,18 @@
 //!
 //! ## Mesh extraction / export
 //!
-//! `extract_mesh` decodes the hierarchical SDF grid at the canonical
-//! `+/-1.005` bounds (level 0, positive = inside) and assembles the CPU mesh
-//! through the TripoSG geometry stage; device mesh buffers are materialized
-//! on the latents' device. `export_mesh` moves the buffers to CPU and writes
-//! GLB/OBJ/PLY/STL according to the output extension; `export_obj` keeps the
-//! legacy OBJ-only entry point.
+//! `extract_mesh` decodes the hierarchical SDF grid at the run's bounds (the
+//! canonical `+/-1.005` cube unless `TripoSgRunOptions::bounds` overrides
+//! them — the override threads through both the flash DiffDMC and the
+//! dense/hierarchical MC path and moves the query window WITHOUT changing the
+//! absolute world frame of the returned vertices) at level 0 (positive =
+//! inside) and assembles the CPU mesh through the TripoSG geometry stage;
+//! device mesh buffers are materialized on the latents' device. When
+//! `TripoSgRunOptions::faces` is set, the reference `--faces` postprocess
+//! (pymeshlab merge-close-vertices + quadric decimation to the target face
+//! count) runs on the extracted mesh. `export_mesh` moves the buffers to CPU
+//! and writes GLB/OBJ/PLY/STL according to the output extension; `export_obj`
+//! keeps the legacy OBJ-only entry point.
 
 use std::{path::Path, sync::Arc};
 
@@ -34,7 +40,7 @@ use candle_core::{DType, Device, Tensor};
 use super::{
     DeviceLocalCache, RmbgConfig, RmbgModel,
     triposg_dino::TripoSgDinoEncoder,
-    triposg_dit::{TripoSgDiT, denoise_with_dtype},
+    triposg_dit::TripoSgDiT,
     triposg_field::hierarchical_sdf_grid,
     triposg_flash::{compact_dmc_mesh, flash_dual_marching_cubes, flash_sdf_grid},
     triposg_vae::{
@@ -45,13 +51,15 @@ use crate::{
     AuxiliaryWeightSetPaths, CanonicalWeightSetPaths, ModelAssetOptions, ModelFamily, Result,
     error::Lux3dError,
     export::{MeshFormat, TripoSgExportStage},
-    geometry::{TripoSgGeometryStage, TripoSgMeshCpu},
+    geometry::{TripoSgGeometryStage, TripoSgMeshCpu, merge_close_vertices, simplify_mesh},
     load_auxiliary_canonical_weights, load_canonical_weights,
     neural::TripoSgNeuralStage,
     preprocess::TripoSgPreprocessStage,
 };
 
-use super::triposg_dit::TripoSgTransformerConfig;
+use super::triposg_dit::{
+    RectifiedFlowSchedule, SCHEDULER_SHIFT, TripoSgTransformerConfig, denoise_with_schedule,
+};
 
 /// TripoSG latent channel count (`transformer.in_channels` ==
 /// `vae.latent_channels` == 64 in the shipped config).
@@ -61,6 +69,11 @@ pub(crate) const TRIPOSG_LATENT_CHANNELS: usize = 64;
 /// (the reference `bbox_size = 2.01` cube; see `pipeline_defaults.bounds` in
 /// the canonical `resolved_config.json`).
 const CANONICAL_BOUNDS: [f32; 6] = [-1.005, -1.005, -1.005, 1.005, 1.005, 1.005];
+
+/// `--faces` merge-close threshold as a fraction of the mesh bbox diagonal:
+/// pymeshlab's `meshing_merge_close_vertices` default (`1/10000 of bounding
+/// box diagonal`, per the official filter documentation).
+const PYMESHLAB_MERGE_CLOSE_BBOX_DIAGONAL_FRACTION: f64 = 1.0 / 10_000.0;
 
 /// Iso level the surface is extracted at (the decoder returns negated logits,
 /// so positive = inside and the surface sits at 0).
@@ -74,9 +87,24 @@ const MAX_OCTREE_DEPTH: u32 = 10;
 /// `TripoSGPipeline` call in `pipeline_triposg.py` (`num_inference_steps=50`,
 /// `guidance_scale=7.0`, `num_tokens=2048`, dense depth 8 / hierarchical
 /// depth 9, `num_chunks`-equivalent query chunk 16384).
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// Upstream knobs without a field here:
+/// - `num_shapes_per_prompt` (>1) is not supported: every TripoSG path in
+///   Lux3D is batch-1 by contract (the VAE decoder and the CFG denoise loop
+///   both enforce batch 1), so multi-shape generation would need a batched
+///   rewrite of the whole decode stack. `num_shapes_per_prompt = 1` (the
+///   reference default) is the only behavior.
+/// - `latents` / `generator` / `attention_kwargs` / callback hooks: latents
+///   are injected through `infer_with_latents`, the Lux3D RNG replaces the
+///   torch generator (module docs), and the remaining plumbing has no
+///   numerical effect.
+#[derive(Debug, Clone, PartialEq)]
 pub struct TripoSgRunOptions {
     /// Rectified-flow Euler steps (reference `num_inference_steps`).
+    ///
+    /// Ignored when [`Self::timesteps`] is `Some` (upstream
+    /// `retrieve_timesteps` derives `num_inference_steps` from the explicit
+    /// schedule length).
     pub steps: usize,
     /// Classifier-free guidance scale (batch order `[uncond, cond]`).
     pub guidance_scale: f32,
@@ -97,6 +125,47 @@ pub struct TripoSgRunOptions {
     pub flash_octree_depth: u32,
     /// Maximum number of SDF query points per decoder pass.
     pub query_chunk_size: usize,
+    /// Explicit timestep schedule override (reference
+    /// `TripoSGPipeline.__call__(timesteps=...)` via `retrieve_timesteps`).
+    ///
+    /// When `Some`, the denoise loop runs EXACTLY these timesteps and
+    /// [`Self::steps`] is ignored (upstream derives `num_inference_steps`
+    /// from the list length); sigmas are `timestep / 1000` plus the
+    /// scheduler shift (see
+    /// [`RectifiedFlowSchedule::from_timesteps`](super::triposg_dit::RectifiedFlowSchedule::from_timesteps)
+    /// for the full semantics and the shipped-scheduler caveat). Validation
+    /// requires a non-empty list of finite values; the schedule is otherwise
+    /// used as given (no monotonicity check, matching upstream). When
+    /// `None`, the default linear schedule for `steps` is used and the
+    /// behavior is bit-identical to the pre-override pipeline.
+    pub timesteps: Option<Vec<f32>>,
+    /// SDF query bounds override `[min_x, min_y, min_z, max_x, max_y,
+    /// max_z]` (reference `TripoSGPipeline.__call__(bounds=...)`, default
+    /// `(-1.005, ..., 1.005)` = [`CANONICAL_BOUNDS`]).
+    ///
+    /// `None` uses the canonical bounds. When set, BOTH decode paths (flash
+    /// DiffDMC and dense/hierarchical marching cubes) query and map vertices
+    /// inside this window; the returned mesh stays in the same ABSOLUTE
+    /// world frame (no re-normalization). Must be finite with
+    /// `min < max` per axis.
+    pub bounds: Option<[f32; 6]>,
+    /// Target face count after mesh extraction (reference `--faces` in
+    /// `scripts/inference_triposg.py`).
+    ///
+    /// `Some(n)` with `n > 0` and a mesh that has more than `n` faces runs
+    /// the upstream pymeshlab sequence — `meshing_merge_close_vertices()`
+    /// followed by `meshing_decimation_quadric_edge_collapse(targetfacenum=n)`
+    /// — implemented as [`merge_close_vertices`] (threshold = 1/10000 of the
+    /// mesh bbox diagonal, the pymeshlab filter default) plus the meshopt
+    /// quadric-style [`simplify_mesh`]. `Some(0)` and `None` leave the mesh
+    /// unchanged (upstream's `if faces > 0` guard), and a target at or above
+    /// the current face count is a no-op (upstream returns the mesh
+    /// unchanged). The TripoSG mesh carries positions/faces only, so there
+    /// are no per-vertex attributes to remap.
+    ///
+    /// [`merge_close_vertices`]: crate::geometry::merge_close_vertices
+    /// [`simplify_mesh`]: crate::geometry::simplify_mesh
+    pub faces: Option<usize>,
 }
 
 impl Default for TripoSgRunOptions {
@@ -111,6 +180,9 @@ impl Default for TripoSgRunOptions {
             use_flash_decoder: true,
             flash_octree_depth: 9,
             query_chunk_size: 16384,
+            timesteps: None,
+            bounds: None,
+            faces: None,
         }
     }
 }
@@ -118,10 +190,13 @@ impl Default for TripoSgRunOptions {
 impl TripoSgRunOptions {
     /// Validate the options before any weights are touched. The checks match
     /// the pipeline invariants: at least one denoise step and one latent
-    /// token, octree depths within the 1024-side grid cap, and a finite
-    /// guidance scale.
+    /// token, octree depths within the 1024-side grid cap, a finite guidance
+    /// scale, a non-empty finite custom timestep schedule (when given), and
+    /// finite bounds with `min < max` per axis (when given).
     pub fn validate(&self) -> Result<()> {
-        if self.steps == 0 {
+        if self.timesteps.is_none() && self.steps == 0 {
+            // With an explicit schedule, `steps` is ignored (upstream derives
+            // num_inference_steps from the schedule length).
             return Err(Lux3dError::CanonicalWeightsValidation {
                 message: format!("TripoSG steps must be at least 1, got {}", self.steps),
             });
@@ -167,7 +242,51 @@ impl TripoSgRunOptions {
                 ),
             });
         }
+        if let Some(timesteps) = &self.timesteps {
+            if timesteps.is_empty() {
+                return Err(Lux3dError::CanonicalWeightsValidation {
+                    message: "TripoSG timesteps must not be empty".to_string(),
+                });
+            }
+            if let Some(index) = timesteps.iter().position(|value| !value.is_finite()) {
+                return Err(Lux3dError::CanonicalWeightsValidation {
+                    message: format!(
+                        "TripoSG timesteps[{index}] must be finite, got {}",
+                        timesteps[index]
+                    ),
+                });
+            }
+        }
+        if let Some(bounds) = self.bounds {
+            for (axis, window) in [
+                ("x", (bounds[0], bounds[3])),
+                ("y", (bounds[1], bounds[4])),
+                ("z", (bounds[2], bounds[5])),
+            ] {
+                let (min, max) = window;
+                if !min.is_finite() || !max.is_finite() {
+                    return Err(Lux3dError::CanonicalWeightsValidation {
+                        message: format!(
+                            "TripoSG bounds {axis} axis must be finite, got [{min}, {max}]"
+                        ),
+                    });
+                }
+                if min >= max {
+                    return Err(Lux3dError::CanonicalWeightsValidation {
+                        message: format!(
+                            "TripoSG bounds {axis} axis must have min < max, got \
+                             [{min}, {max}]"
+                        ),
+                    });
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// The SDF query bounds this run decodes at (override or canonical).
+    pub fn effective_bounds(&self) -> [f32; 6] {
+        self.bounds.unwrap_or(CANONICAL_BOUNDS)
     }
 }
 
@@ -183,7 +302,9 @@ pub struct TripoSgInferenceOutput {
     pub image_embeds: Tensor,
     /// `[1, num_tokens, 64]` seeded standard-normal init latents.
     pub latents_init: Tensor,
-    /// `[1, num_tokens, 64]` latents after `steps` rectified-flow Euler steps.
+    /// `[1, num_tokens, 64]` latents after the rectified-flow Euler schedule
+    /// (`steps` steps, or exactly `options.timesteps` when the explicit
+    /// schedule override is set).
     pub latents: Tensor,
 }
 
@@ -457,6 +578,12 @@ impl TripoSgPipeline {
     /// `[1, num_tokens, 64]` (batch 1), e.g. from [`Self::sample_latents`] or
     /// a parity baseline. `image_embeds` is the conditional DINOv2 context;
     /// the uncond branch is `zeros_like` inside the denoise loop.
+    ///
+    /// The schedule is the linear rectified-flow Euler schedule for
+    /// `options.steps`, or — when `options.timesteps` is `Some` — the exact
+    /// explicit schedule (`RectifiedFlowSchedule::from_timesteps`), with the
+    /// step count derived from the schedule length like upstream
+    /// `retrieve_timesteps`.
     pub fn infer_with_latents(
         &self,
         image_embeds: &Tensor,
@@ -466,11 +593,15 @@ impl TripoSgPipeline {
         options.validate()?;
         Self::validate_latents(latents_init, options.num_tokens)?;
         let bundle = self.bundle_for(latents_init.device())?;
-        denoise_with_dtype(
+        let scheduler = match &options.timesteps {
+            Some(timesteps) => RectifiedFlowSchedule::from_timesteps(timesteps, SCHEDULER_SHIFT),
+            None => RectifiedFlowSchedule::new(options.steps, SCHEDULER_SHIFT),
+        };
+        denoise_with_schedule(
             &bundle.dit,
             latents_init,
             image_embeds,
-            options.steps,
+            &scheduler,
             options.guidance_scale,
             self.dtype,
         )
@@ -550,9 +681,17 @@ impl TripoSgPipeline {
             })
     }
 
-    /// Decode the SDF field for `latents [1, num_tokens, 64]` at the canonical
-    /// `+/-1.005` bounds and assemble the level-0 marching-cubes mesh. The
-    /// buffers are materialized on `latents.device()`.
+    /// Decode the SDF field for `latents [1, num_tokens, 64]` at the run's
+    /// bounds (canonical `+/-1.005` unless `options.bounds` overrides them)
+    /// and assemble the level-0 marching-cubes mesh. The buffers are
+    /// materialized on `latents.device()` in the SAME absolute world frame —
+    /// a bounds override only moves the query window, it never re-normalizes
+    /// the returned coordinates.
+    ///
+    /// When `options.faces` is `Some(n > 0)` and the extracted mesh has more
+    /// than `n` faces, the upstream `--faces` postprocess runs
+    /// (`meshing_merge_close_vertices` + quadric decimation to `n`; see the
+    /// option docs).
     pub fn extract_mesh(
         &self,
         latents: &Tensor,
@@ -569,13 +708,14 @@ impl TripoSgPipeline {
                 ),
             }
         })?;
-        let mesh_cpu = if options.use_flash_decoder {
+        let bounds = options.effective_bounds();
+        let mut mesh_cpu = if options.use_flash_decoder {
             // Reference default (`use_flash_decoder=True`): hierarchical
             // flash SDF query schedule + clean-room DiffDMC.
             let grid = flash_sdf_grid(
                 &bundle.vae,
                 &latents,
-                CANONICAL_BOUNDS,
+                bounds,
                 options.flash_octree_depth,
                 options.query_chunk_size,
             )
@@ -594,7 +734,7 @@ impl TripoSgPipeline {
             TripoSgMeshCpu {
                 resolution: grid.dims.saturating_sub(1) as u32,
                 sdf_level: CANONICAL_SDF_LEVEL,
-                bounds: CANONICAL_BOUNDS,
+                bounds,
                 vertices: mesh.vertices,
                 faces: mesh.faces,
             }
@@ -602,7 +742,7 @@ impl TripoSgPipeline {
             let grid = hierarchical_sdf_grid(
                 &bundle.vae,
                 &latents,
-                CANONICAL_BOUNDS,
+                bounds,
                 options.dense_octree_depth,
                 options.hierarchical_octree_depth,
                 options.query_chunk_size,
@@ -612,6 +752,18 @@ impl TripoSgPipeline {
             })?;
             self.geometry.assemble_cpu(&grid)?
         };
+
+        // Reference `--faces` (scripts/inference_triposg.py::simplify_mesh):
+        // merge close vertices then quadric-decimate, only when the mesh has
+        // MORE faces than the target (otherwise upstream returns it
+        // unchanged). TripoSG meshes are positions+faces only, so no vertex
+        // attributes need remapping.
+        if let Some(target_faces) = options.faces {
+            if target_faces > 0 && mesh_cpu.faces.len() / 3 > target_faces {
+                let simplified = simplify_triposg_mesh(&mesh_cpu, target_faces)?;
+                mesh_cpu = simplified;
+            }
+        }
 
         let device = latents.device().clone();
         let vertex_count = mesh_cpu.vertices.len() / 3;
@@ -661,9 +813,10 @@ impl TripoSgPipeline {
             .map_err(|source| Lux3dError::CanonicalWeightsValidation {
                 message: format!("failed to gather TripoSG mesh faces on cpu: {source}"),
             })?;
-        // The device buffers don't carry grid metadata (resolution lives in
-        // the SDF grid, which is consumed inside extract_mesh); exporters only
-        // read vertices/faces.
+        // The device buffers don't carry grid metadata (resolution and the
+        // query bounds live in the SDF grid, which is consumed inside
+        // extract_mesh); exporters only read vertices/faces, so the bounds
+        // here are descriptive metadata only (canonical default).
         Ok(TripoSgMeshCpu {
             resolution: 0,
             sdf_level: CANONICAL_SDF_LEVEL,
@@ -691,6 +844,72 @@ impl TripoSgPipeline {
         }
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// `--faces` postprocess (pymeshlab merge-close + quadric decimation)
+// ---------------------------------------------------------------------------
+
+/// `simplify_mesh` from `scripts/inference_triposg.py`: pymeshlab
+/// `meshing_merge_close_vertices()` (default threshold = 1/10000 of the mesh
+/// bbox diagonal) followed by
+/// `meshing_decimation_quadric_edge_collapse(targetfacenum=n)`. The decimation
+/// uses meshopt's quadric-style simplifier (`simplify_mesh`, target-error 1.0
+/// so the face count dominates) — a same-family algorithm, NOT pymeshlab's
+/// exact solver, so the surviving topology can differ from a pymeshlab run at
+/// equal face counts (the TRELLIS.2 export path made the same substitution).
+///
+/// The caller guarantees `target_faces > 0` and a face count above the
+/// target; the mesh keeps its bounds/sdf-level metadata and the result stays
+/// in the same absolute world frame.
+fn simplify_triposg_mesh(mesh: &TripoSgMeshCpu, target_faces: usize) -> Result<TripoSgMeshCpu> {
+    let vertex_count = mesh.vertices.len() / 3;
+    let mut bbox_min = [f64::INFINITY; 3];
+    let mut bbox_max = [f64::NEG_INFINITY; 3];
+    for vertex in mesh.vertices.chunks_exact(3) {
+        for axis in 0..3 {
+            bbox_min[axis] = bbox_min[axis].min(f64::from(vertex[axis]));
+            bbox_max[axis] = bbox_max[axis].max(f64::from(vertex[axis]));
+        }
+    }
+    let diagonal = if vertex_count == 0 {
+        0.0
+    } else {
+        (bbox_max[0] - bbox_min[0])
+            .powi(2)
+            .max((bbox_max[1] - bbox_min[1]).powi(2))
+            .max((bbox_max[2] - bbox_min[2]).powi(2))
+            .sqrt()
+    };
+    let epsilon = (diagonal * PYMESHLAB_MERGE_CLOSE_BBOX_DIAGONAL_FRACTION) as f32;
+
+    // TripoSG mesh faces are zero-based and in range by construction
+    // (both extraction paths emit validated indices); a defensive remap
+    // keeps a malformed buffer from panicking.
+    let faces_u32 = mesh
+        .faces
+        .iter()
+        .map(|&index| {
+            u32::try_from(index).map_err(|_| {
+                Lux3dError::InvalidInput("TripoSG mesh face index is negative (mesh is corrupt)")
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let merged = merge_close_vertices(&mesh.vertices, &faces_u32, epsilon);
+    let simplified = simplify_mesh(&merged.vertices, &merged.faces, target_faces);
+
+    Ok(TripoSgMeshCpu {
+        resolution: mesh.resolution,
+        sdf_level: mesh.sdf_level,
+        bounds: mesh.bounds,
+        vertices: simplified.vertices,
+        faces: simplified
+            .faces
+            .iter()
+            .map(|&index| i64::from(index))
+            .collect(),
+    })
 }
 
 // ---------------------------------------------------------------------------

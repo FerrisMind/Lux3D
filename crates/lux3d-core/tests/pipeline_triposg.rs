@@ -301,6 +301,169 @@ fn pipeline_mesh_and_export_smoke() {
         flash_started.elapsed()
     );
 
+    // --- Bounds override + `--faces` postprocess ---------------------------
+    // Flash depth 5 (31-resolution schedule -> 32^3 dense queries) is the
+    // cheapest reference schedule; the object intersects it (same reason the
+    // 5/5 hierarchical run above is non-empty).
+    let flash5_faces = |bounds: Option<[f32; 6]>, faces: Option<usize>| {
+        pipeline
+            .extract_mesh(
+                &latents,
+                &TripoSgRunOptions {
+                    use_flash_decoder: true,
+                    flash_octree_depth: 5,
+                    query_chunk_size: 4096,
+                    bounds,
+                    faces,
+                    ..Default::default()
+                },
+            )
+            .expect("flash depth-5 mesh")
+    };
+
+    let baseline5 = flash5_faces(None, None);
+    let baseline5_face_count = baseline5.faces.dims()[0];
+    let baseline5_vertex_count = baseline5.vertices.dims()[0];
+    assert!(
+        baseline5_face_count > 0,
+        "flash depth-5 mesh must be non-empty"
+    );
+    println!(
+        "flash depth-5 baseline: {baseline5_vertex_count} verts, {baseline5_face_count} faces"
+    );
+
+    // An explicit CANONICAL bounds window must equal the None default
+    // (bit-identical extraction).
+    let canonical5 = flash5_faces(Some([-1.005, -1.005, -1.005, 1.005, 1.005, 1.005]), None);
+    assert_eq!(
+        canonical5.faces.dims(),
+        baseline5.faces.dims(),
+        "explicit canonical bounds must match the default run"
+    );
+    assert_eq!(
+        canonical5.vertices.dims(),
+        baseline5.vertices.dims(),
+        "explicit canonical bounds must match the default run"
+    );
+
+    // A window far away from the object: the decoder sees fully
+    // out-of-distribution coordinates (the reference behaves the same — the
+    // latent SDF is only trained on the canonical [-1, 1] window), so the
+    // logits there are arbitrary and DMC still emits a garbage surface. The
+    // decisive assertion is the FRAME: every vertex must lie inside the
+    // overridden window (with the ignored canonical bounds they would land
+    // in [-1.005, 1.005] instead).
+    let far_window = [2.0_f32, 2.0, 2.0, 3.0, 3.0, 3.0];
+    let far5 = flash5_faces(Some(far_window), None);
+    assert!(
+        far5.faces.dims()[0] > 0 && far5.vertices.dims()[0] > 0,
+        "the far-window decode must produce (garbage) geometry inside the window"
+    );
+    let far5_vertices = far5
+        .vertices
+        .flatten_all()
+        .expect("flatten")
+        .to_vec1::<f32>()
+        .expect("vec");
+    // DMC vertices sit in padded-grid coordinates and DiffDMC subtracts 1
+    // before the world mapping, so a boundary patch can land up to ONE CELL
+    // outside the window (v < 0 -> world < min); the reference behaves the
+    // same. Tolerance = window size / 2^depth.
+    let cell = (far_window[3] - far_window[0]) / (1 << 5) as f32;
+    for vertex in far5_vertices.chunks_exact(3) {
+        for axis in 0..3 {
+            assert!(
+                vertex[axis] >= far_window[axis] - cell
+                    && vertex[axis] <= far_window[axis + 3] + cell,
+                "far-window vertex {vertex:?} escaped the overridden bounds \
+                 {far_window:?} (cell {cell})"
+            );
+        }
+        // Decisive frame check: NOT the canonical frame (which would place
+        // vertices near [-1.005, 1.005], ~3 cells below this window's min).
+        assert!(
+            vertex.iter().all(|&value| value > 1.5),
+            "far-window vertex {vertex:?} is not in the overridden world frame"
+        );
+    }
+
+    // The non-flash hierarchical path threads the override too: the world
+    // mapping of the marching-cubes mesh uses the overridden bounds.
+    let far_hier = pipeline
+        .extract_mesh(
+            &latents,
+            &TripoSgRunOptions {
+                use_flash_decoder: false,
+                dense_octree_depth: 5,
+                hierarchical_octree_depth: 5,
+                query_chunk_size: 4096,
+                bounds: Some(far_window),
+                ..Default::default()
+            },
+        )
+        .expect("hierarchical far-window mesh");
+    let far_hier_vertices = far_hier
+        .vertices
+        .flatten_all()
+        .expect("flatten")
+        .to_vec1::<f32>()
+        .expect("vec");
+    assert!(
+        far_hier.faces.dims()[0] == 0 || !far_hier_vertices.is_empty(),
+        "hierarchical far-window run must stay consistent"
+    );
+    for vertex in far_hier_vertices.chunks_exact(3) {
+        for axis in 0..3 {
+            assert!(
+                vertex[axis] >= far_window[axis] && vertex[axis] <= far_window[axis + 3],
+                "hierarchical far-window vertex {vertex:?} escaped {far_window:?}"
+            );
+        }
+    }
+
+    // `--faces` (Some(1) forces a strict reduction below the baseline).
+    let simplified5 = flash5_faces(None, Some(1));
+    let simplified5_face_count = simplified5.faces.dims()[0];
+    assert!(
+        simplified5_face_count < baseline5_face_count,
+        "faces = 1 must decimate below {baseline5_face_count}, got \
+         {simplified5_face_count}"
+    );
+    let simplified_vertices = simplified5
+        .vertices
+        .flatten_all()
+        .expect("flatten")
+        .to_vec1::<f32>()
+        .expect("vec");
+    let simplified_vertex_count = simplified5.vertices.dims()[0];
+    assert!(
+        simplified_vertices.iter().all(|value| value.is_finite()),
+        "simplified vertices must be finite"
+    );
+    assert!(
+        simplified5
+            .faces
+            .flatten_all()
+            .expect("flatten")
+            .to_vec1::<i64>()
+            .expect("vec")
+            .iter()
+            .all(|index| (0..simplified_vertex_count as i64).contains(index)),
+        "simplified faces must reference existing vertices"
+    );
+    println!("faces=1 decimation: {baseline5_face_count} -> {simplified5_face_count} faces");
+
+    // `--faces` no-ops: Some(0) is the upstream "disabled" sentinel and a
+    // target above the current face count returns the mesh unchanged.
+    assert_eq!(
+        flash5_faces(None, Some(0)).faces.dims()[0],
+        baseline5_face_count
+    );
+    assert_eq!(
+        flash5_faces(None, Some(usize::MAX)).faces.dims()[0],
+        baseline5_face_count
+    );
+
     // Export and verify the OBJ text.
     let export_started = Instant::now();
     let nonce = SystemTime::now()
@@ -352,11 +515,103 @@ fn pipeline_mesh_and_export_smoke() {
 }
 
 // ---------------------------------------------------------------------------
+// 2b. FP16 inference smoke (CPU)
+// ---------------------------------------------------------------------------
+
+/// The full TripoSG path under `load_with_dtype(F16)`: the bundle (DINOv2,
+/// DiT, VAE) loads from the canonical package as F16 (no F32-only buffer
+/// breaks), the DINOv2 forward runs with F16 activations and returns F32
+/// embeds, and the F16 VAE decodes the baseline latents into a valid mesh
+/// (public outputs are F32). The F16 DiT FORWARD is deliberately not run on
+/// CPU (a single step costs minutes there; the denoise loop only casts
+/// latents/conditioning to the network dtype and the Euler update stays F32,
+/// both exercised here through the load + decode stages).
+#[test]
+fn pipeline_f16_smoke() {
+    let baseline_path = smoke_baseline_path();
+    assert!(
+        baseline_path.is_file(),
+        "TripoSG smoke baseline artifact is missing: {} (generate it with \
+         tools/python_baseline/triposg_dump.py)",
+        baseline_path.display()
+    );
+
+    let pipeline =
+        TripoSgPipeline::load_with_dtype(model_asset_options(ModelFamily::TripoSg), DType::F16)
+            .expect("TripoSG pipeline load with F16 dtype");
+
+    // DINOv2 conditioning in F16 (pixel values are cast to the network dtype
+    // internally; the embeds come back as F32).
+    let prepared = pipeline
+        .prepare_inputs_from_path(
+            &repo_root().join("test-assets").join("mesh-input.png"),
+            &Device::Cpu,
+        )
+        .expect("TripoSG prepared inputs");
+    let image_embeds = pipeline
+        .image_embeds(&prepared.pixel_values)
+        .expect("TripoSG F16 image embeds");
+    assert_eq!(image_embeds.dims(), [1, 257, 1024]);
+    assert_eq!(
+        image_embeds.dtype(),
+        DType::F32,
+        "embeds must return as F32"
+    );
+    let embed_values = image_embeds
+        .flatten_all()
+        .expect("embed flatten")
+        .to_vec1::<f32>()
+        .expect("embed vec");
+    assert!(
+        embed_values.iter().all(|value| value.is_finite()),
+        "F16 image embeds must be finite"
+    );
+
+    // VAE decode in F16 from the baseline denoised latents (the cheapest
+    // non-empty setting: hierarchical 5/5, 32^3 queries).
+    let latents = load_baseline_tensor(&baseline_path, "triposg.latents_step_final", &Device::Cpu);
+    let options = TripoSgRunOptions {
+        use_flash_decoder: false,
+        dense_octree_depth: 5,
+        hierarchical_octree_depth: 5,
+        query_chunk_size: 4096,
+        ..Default::default()
+    };
+    let mesh = pipeline.extract_mesh(&latents, &options).expect("F16 mesh");
+    assert_eq!(
+        mesh.vertices.dtype(),
+        DType::F32,
+        "vertices must return F32"
+    );
+    assert_eq!(mesh.faces.dtype(), DType::I64);
+    assert!(
+        mesh.vertices.dims()[0] > 0 && mesh.faces.dims()[0] > 0,
+        "F16 decode must produce a non-empty mesh, got {mesh:?}"
+    );
+    let vertex_values = mesh
+        .vertices
+        .flatten_all()
+        .expect("vertex flatten")
+        .to_vec1::<f32>()
+        .expect("vertex vec");
+    assert!(
+        vertex_values.iter().all(|value| value.is_finite()),
+        "F16 mesh vertices must be finite"
+    );
+    println!(
+        "F16 smoke: embeds finite, mesh {} verts / {} faces",
+        mesh.vertices.dims()[0],
+        mesh.faces.dims()[0]
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 3. Run-option validation (no weights touched)
 // ---------------------------------------------------------------------------
 
-/// Zero steps / zero tokens / octree depth 11 / non-finite guidance must all
-/// be rejected with messages naming the offending field.
+/// Zero steps / zero tokens / octree depth 11 / non-finite guidance / an
+/// empty or non-finite custom timestep schedule / non-finite or inverted
+/// bounds must all be rejected with messages naming the offending field.
 #[test]
 fn options_are_validated() {
     let cases = [
@@ -409,6 +664,55 @@ fn options_are_validated() {
             },
             "guidance_scale",
         ),
+        (
+            TripoSgRunOptions {
+                timesteps: Some(Vec::new()),
+                ..Default::default()
+            },
+            "timesteps",
+        ),
+        (
+            TripoSgRunOptions {
+                timesteps: Some(vec![1000.0, f32::NAN, 500.0]),
+                ..Default::default()
+            },
+            "timesteps",
+        ),
+        (
+            TripoSgRunOptions {
+                timesteps: Some(vec![1000.0, f32::INFINITY]),
+                ..Default::default()
+            },
+            "timesteps",
+        ),
+        (
+            TripoSgRunOptions {
+                bounds: Some([f32::NAN, -1.0, -1.0, 1.0, 1.0, 1.0]),
+                ..Default::default()
+            },
+            "bounds",
+        ),
+        (
+            TripoSgRunOptions {
+                bounds: Some([-1.0, -1.0, -1.0, 1.0, f32::INFINITY, 1.0]),
+                ..Default::default()
+            },
+            "bounds",
+        ),
+        (
+            TripoSgRunOptions {
+                bounds: Some([-1.0, -1.0, -1.0, -2.0, 1.0, 1.0]),
+                ..Default::default()
+            },
+            "bounds",
+        ),
+        (
+            TripoSgRunOptions {
+                bounds: Some([-1.0, -1.0, -1.0, 1.0, 1.0, -1.0]),
+                ..Default::default()
+            },
+            "bounds",
+        ),
     ];
 
     for (options, field) in cases {
@@ -431,6 +735,47 @@ fn options_are_validated() {
     TripoSgRunOptions::default()
         .validate()
         .expect("defaults valid");
+
+    // With an explicit timestep schedule, `steps` is ignored (upstream
+    // retrieve_timesteps derives the step count from the schedule length),
+    // so steps = 0 is no longer an error.
+    TripoSgRunOptions {
+        steps: 0,
+        timesteps: Some(vec![1000.0, 500.0]),
+        ..Default::default()
+    }
+    .validate()
+    .expect("steps is ignored when an explicit schedule is given");
+
+    // faces: Some(0) is the upstream "disabled" sentinel (no-op), not an
+    // error; any other target is accepted (a target at or above the current
+    // face count is handled as a no-op at extraction time).
+    TripoSgRunOptions {
+        faces: Some(0),
+        ..Default::default()
+    }
+    .validate()
+    .expect("faces = 0 means disabled");
+    TripoSgRunOptions {
+        faces: Some(1),
+        ..Default::default()
+    }
+    .validate()
+    .expect("faces = 1 is a valid decimation target");
+
+    // effective_bounds: None -> canonical, Some -> the override verbatim.
+    assert_eq!(
+        TripoSgRunOptions::default().effective_bounds(),
+        [-1.005, -1.005, -1.005, 1.005, 1.005, 1.005]
+    );
+    assert_eq!(
+        TripoSgRunOptions {
+            bounds: Some([0.0, 0.0, 0.0, 1.0, 1.0, 1.0]),
+            ..Default::default()
+        }
+        .effective_bounds(),
+        [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -524,6 +869,9 @@ fn triposg_golden_pipeline_from_path_cuda() {
             use_flash_decoder: true,
             flash_octree_depth: 9,
             query_chunk_size: 16384,
+            timesteps: None,
+            bounds: None,
+            faces: None,
         },
         "golden defaults must stay 50/7.0/42/2048/8/9/flash-9/16384"
     );

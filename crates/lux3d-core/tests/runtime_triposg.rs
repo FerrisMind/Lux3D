@@ -215,6 +215,86 @@ fn rectified_flow_step_is_euler_update() {
 }
 
 // ---------------------------------------------------------------------------
+// Custom timesteps override (retrieve_timesteps parity)
+// ---------------------------------------------------------------------------
+
+/// Explicit timesteps equal to the default linear schedule must reproduce the
+/// default schedule EXACTLY (sigmas AND the DiT-facing timesteps) — this is
+/// the "explicit linear timesteps == default" equivalence property.
+#[test]
+fn rectified_flow_from_timesteps_reproduces_default_schedule() {
+    for steps in [1usize, 2, 8, 50] {
+        let default = RectifiedFlowSchedule::new(steps, 1.0);
+        let timesteps = default.timesteps();
+        let explicit = RectifiedFlowSchedule::from_timesteps(&timesteps, 1.0);
+        assert_eq!(
+            explicit.sigmas, default.sigmas,
+            "from_timesteps must reproduce the default sigmas bit-exactly for \
+             steps={steps}"
+        );
+        assert_eq!(
+            explicit.timesteps(),
+            timesteps,
+            "from_timesteps must reproduce the DiT-facing timesteps bit-exactly \
+             for steps={steps}"
+        );
+    }
+}
+
+/// A custom schedule runs EXACTLY its own steps: `sigmas.len() == n + 1`
+/// (terminal 0 appended), `timestep(i) == f32(sigma_i * 1000)` with
+/// `sigma_i = t_i / 1000` (shift 1 identity), and the Euler step uses the
+/// caller's sigma spacing (`x + (sigma_i - sigma_{i+1}) * v`), not a uniform
+/// one.
+#[test]
+fn rectified_flow_from_timesteps_runs_exactly_those_steps() {
+    let timesteps = [1000.0_f32, 640.0, 320.0, 40.0];
+    let schedule = RectifiedFlowSchedule::from_timesteps(&timesteps, 1.0);
+    assert_eq!(schedule.sigmas.len(), timesteps.len() + 1);
+    assert_eq!(schedule.sigmas[4], 0.0, "terminal sigma");
+    for (i, &timestep) in timesteps.iter().enumerate() {
+        let expected_sigma = (f64::from(timestep) / 1000.0) as f32;
+        assert_eq!(schedule.sigmas[i], expected_sigma, "sigma at step {i}");
+        // Same f32 multiply as `RectifiedFlowSchedule::timestep`.
+        assert_eq!(schedule.timestep(i), expected_sigma * 1000.0);
+    }
+
+    // Euler update with a non-uniform schedule: sigma_0 - sigma_1 = 0.36.
+    let velocity =
+        Tensor::from_vec(vec![1.0f32, -1.0], (1, 1, 2), &Device::Cpu).expect("velocity tensor");
+    let sample = Tensor::from_vec(vec![0.5f32, 0.5], (1, 1, 2), &Device::Cpu).expect("sample");
+    let updated = schedule.step(0, &velocity, &sample).expect("step");
+    let updated = updated
+        .flatten_all()
+        .expect("flat")
+        .to_vec1::<f32>()
+        .expect("vec");
+    assert!((updated[0] - (0.5 + 0.36)).abs() < 1e-6);
+    assert!((updated[1] - (0.5 - 0.36)).abs() < 1e-6);
+}
+
+/// The schedule is used AS GIVEN (upstream parity): a non-descending list is
+/// not rejected; its Euler deltas simply follow the raw sigma spacing
+/// (negative for ascending steps), exactly like diffusers'
+/// `FlowMatchEulerDiscreteScheduler.step` would.
+#[test]
+fn rectified_flow_from_timesteps_uses_schedule_as_given() {
+    let schedule = RectifiedFlowSchedule::from_timesteps(&[100.0_f32, 500.0, 1000.0], 1.0);
+    // sigma: [0.1, 0.5, 1.0, 0.0] — ascending steps, then the terminal 0.
+    assert_eq!(schedule.sigmas.len(), 4);
+    let velocity = Tensor::from_vec(vec![1.0f32], (1, 1, 1), &Device::Cpu).expect("velocity");
+    let sample = Tensor::from_vec(vec![0.0f32], (1, 1, 1), &Device::Cpu).expect("sample");
+    // Step 0 delta = 0.1 - 0.5 = -0.4 (negative, used verbatim).
+    let updated = schedule.step(0, &velocity, &sample).expect("step");
+    let value = updated
+        .flatten_all()
+        .expect("flat")
+        .to_vec1::<f32>()
+        .expect("vec");
+    assert!((value[0] + 0.4).abs() < 1e-6);
+}
+
+// ---------------------------------------------------------------------------
 // Task 3b: DiT velocity / scheduler step / 2-step CFG denoise CUDA parity
 // against the smoke baseline (skips with a clear message when CUDA or the
 // baseline artifact is unavailable).

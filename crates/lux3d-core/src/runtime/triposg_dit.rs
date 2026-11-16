@@ -30,6 +30,15 @@
 //! primitives; self-attention scores are computed in query chunks
 //! (`LUX3D_TRIPOSG_ATTN_CHUNK`, default 1024) to bound peak memory on 12 GiB
 //! GPUs.
+//!
+//! ## Custom timesteps
+//!
+//! [`RectifiedFlowSchedule::from_timesteps`] implements the explicit
+//! timestep override (`retrieve_timesteps(scheduler, ..., timesteps)`):
+//! `sigmas = timesteps / 1000` + shift transform + terminal 0, and the denoise
+//! loop runs exactly `len(timesteps)` steps. See the fn docs for the shipped
+//! `RectifiedFlowScheduler` caveat (upstream's `set_timesteps` has no
+//! `timesteps` parameter and would reject the override).
 
 use std::sync::OnceLock;
 
@@ -533,12 +542,58 @@ pub struct RectifiedFlowSchedule {
     pub sigmas: Vec<f32>,
 }
 
+/// `shift` of the shipped TripoSG scheduler config
+/// (`scheduler_config.shift == 1` in the canonical `resolved_config.json`).
+/// `shift = 1` is the identity transform; the schedule helpers keep it as an
+/// explicit parameter so a config change is a one-line diff.
+pub const SCHEDULER_SHIFT: f32 = 1.0;
+
+/// `num_train_timesteps` of the shipped scheduler config (1000). Custom
+/// timesteps are converted to sigmas as `timestep / SCHEDULER_NUM_TRAIN_TIMESTEPS`,
+/// matching both the reference `RectifiedFlowScheduler` and diffusers'
+/// `FlowMatchEulerDiscreteScheduler`.
+pub const SCHEDULER_NUM_TRAIN_TIMESTEPS: f64 = 1000.0;
+
 impl RectifiedFlowSchedule {
     pub fn new(steps: usize, shift: f32) -> Self {
         let mut sigmas = Vec::with_capacity(steps + 1);
         for i in 0..steps {
             let timestep = (1.0 - i as f64 / steps as f64) * 1000.0;
             let sigma = timestep / 1000.0;
+            let sigma = shift as f64 * sigma / (1.0 + (shift as f64 - 1.0) * sigma);
+            sigmas.push(sigma as f32);
+        }
+        sigmas.push(0.0);
+        Self { sigmas }
+    }
+
+    /// Explicit timestep schedule (custom `timesteps` override).
+    ///
+    /// Mirrors the custom-timesteps semantics of diffusers'
+    /// `FlowMatchEulerDiscreteScheduler.set_timesteps(timesteps=...)` — the
+    /// scheduler class the reference `retrieve_timesteps` helper is written
+    /// for: `sigmas = timesteps / num_train_timesteps`, the configured
+    /// `shift` transform applied, and a terminal 0.0 appended. The denoise
+    /// loop then runs EXACTLY `timesteps.len()` steps (`num_inference_steps`
+    /// is derived from the list length, as in `retrieve_timesteps`).
+    ///
+    /// Upstream caveat (documented deviation): the SHIPPED TripoSG scheduler
+    /// is `triposg.schedulers.scheduling_rectified_flow.RectifiedFlowScheduler`
+    /// (see the canonical `resolved_config.json` `scheduler_config`), whose
+    /// `set_timesteps` has no `timesteps` parameter — upstream,
+    /// `retrieve_timesteps` would raise
+    /// `"The current scheduler class ...'s set_timesteps does not support
+    /// custom timestep schedules"` for this configuration. Lux3D implements
+    /// the override with the FlowMatch semantics above so an explicit
+    /// schedule is usable; with `shift = 1` the sigma transform is the
+    /// identity. The list is used AS GIVEN (no monotonicity requirement,
+    /// matching upstream): a non-descending schedule produces negative
+    /// Euler deltas `sigma_i - sigma_{i+1}` there too. Callers should pass
+    /// descending values in `(0, 1000]`.
+    pub fn from_timesteps(timesteps: &[f32], shift: f32) -> Self {
+        let mut sigmas = Vec::with_capacity(timesteps.len() + 1);
+        for &timestep in timesteps {
+            let sigma = f64::from(timestep) / SCHEDULER_NUM_TRAIN_TIMESTEPS;
             let sigma = shift as f64 * sigma / (1.0 + (shift as f64 - 1.0) * sigma);
             sigmas.push(sigma as f32);
         }
@@ -610,7 +665,23 @@ pub fn denoise_with_dtype(
     guidance: f32,
     dtype: DType,
 ) -> CandleResult<Tensor> {
-    let scheduler = RectifiedFlowSchedule::new(steps, 1.0);
+    let scheduler = RectifiedFlowSchedule::new(steps, SCHEDULER_SHIFT);
+    denoise_with_schedule(dit, latents_init, cond, &scheduler, guidance, dtype)
+}
+
+/// [`denoise_with_dtype`] with a caller-built schedule — the custom
+/// `timesteps` override path (`RectifiedFlowSchedule::from_timesteps`). The
+/// loop runs `schedule.sigmas.len() - 1` steps, i.e. exactly the number of
+/// timesteps the schedule was built from.
+pub fn denoise_with_schedule(
+    dit: &TripoSgDiT,
+    latents_init: &Tensor,
+    cond: &Tensor,
+    scheduler: &RectifiedFlowSchedule,
+    guidance: f32,
+    dtype: DType,
+) -> CandleResult<Tensor> {
+    let steps = scheduler.sigmas.len().saturating_sub(1);
     let latents_init = latents_init.to_dtype(dtype)?;
     let cond = cond.to_dtype(dtype)?;
     let uncond_cond = Tensor::zeros_like(&cond)?;
