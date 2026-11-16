@@ -889,9 +889,12 @@ texels, 30 MB PBR GLB with base-color and metallic-roughness PNGs. A geometry-on
 run (`--no-postprocess`, 12,679,988 faces) unwraps to 164 charts / 2 atlases at 512 in
 647 s, confirming chart count tracks connected components (plus normal-based splitting),
 not raw face count. Geometry-only q8\_0 512 smoke on the same package also passed on
-Vulkan (484 s) and WGPU (2-step run, 736 s; a 12-step WGPU run was still going after
-~40 min and was stopped) with `cpu_fallback=0` and valid `[-0.5, 0.5]` GLBs — WGPU is
-functional for TRELLIS.2 but impractically slow for q8 today (debug CLI timings).
+Vulkan and WGPU with `cpu_fallback=0` and valid `[-0.5, 0.5]` GLBs. Release-CLI wall time
+for one sampler step is 97 s (CUDA), 129 s (Vulkan; 111 s with
+`CANDLE_VULKAN_INFLIGHT_MAX_BYTES=1073741824`) and 303 s (WGPU with
+`CANDLE_WGPU_INFLIGHT_MAX_BYTES=268435456`; the default WGPU budgets OOM the shape
+sampler on the 12 GiB test card). At 12 steps the same run takes 167 s (CUDA) and 376 s
+(Vulkan); the isolated SS 3D decoder is 0.6–1.8 s after the layout/kernel fixes.
 
 **Tests:** CLI `run_args` texture-mesh mapping/rejection cases; `trellis2_texture`
 missing-checkpoint test ✅
@@ -1007,9 +1010,19 @@ Also touched: `crates/lux3d-core/tests/vggt_export.rs` (fixture gains empty `pos
 - **TRELLIS.2 approximations:** meshopt simplification/cleanup vs cumesh; xatlas vs cumesh
   unwrap; TELEA-approximation inpaint vs `cv2.inpaint`; synthesized occupancy guides vs
   upstream sparse caches.
-- **TRELLIS.2 WGPU throughput:** q8 WGPU inference is functionally correct but very slow
-  (2 steps in 736 s with the debug CLI; a 12-step run was stopped after ~40 min), versus
-  CUDA 177 s / Vulkan 484 s for 12 steps. Treat WGPU as experimental for TRELLIS.2.
+- **TRELLIS.2 backend throughput:** on q8\_0 the 12-step 512 geometry pipeline takes
+  167 s on CUDA and 376 s on Vulkan; the gap is concentrated in the DiT samplers
+  (Vulkan SS sample 147 s vs 52 s, shape spatial 164 s vs 58 s), while the SS 3D
+  decoder (0.6–1.8 s), shape VAE and postprocess are at CUDA parity. Candle's Vulkan
+  profile attributes the residual gap to submission/drain overhead (5,473 `flush_drain`
+  calls, 71 s of a 122 s run; ~69.6k dispatches dominate the rest), not GEMM math: q8
+  and dense f32 GEMMs both measure ~18 ms for the sampler's 4096x1536x1536 shape. WGPU's
+  packed q8 matmul shader is ~10x slower than its dense f32 GEMM (192 ms vs 18 ms for
+  4096x1024x1024), so Lux3D dequantizes all packed GGML weights once at load on WGPU
+  (stages load and drop sequentially; `LUX3D_WGPU_DEQUANT_WEIGHTS=0` restores packed
+  weights, including the K-quant path with its Q8K dispatch limit) and a 1-step geometry
+  run takes 303 s with reduced allocation budgets, versus 97 s on CUDA. Treat WGPU as
+  experimental for TRELLIS.2.
 - **VGGT tracking:** explicit query points only. Automatic query selection (ALIKED/SP
   keypoints, DINO query-frame ranking), multi-query-frame reordering and non-visible track
   completion are not implemented.

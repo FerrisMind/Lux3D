@@ -443,11 +443,14 @@ occupancies — voxel IoU measures that topology drift, not positional error:
 
 Quantized DiT linears are also faster than F32: Q8_0 and below run the 12-step
 512 pipeline in ~96–101 s versus 135 s for F32 and 143 s for F16, because
-`QMatMul` kernels skip the F32 dequantize pass. Q8_0/Q6_K are the production
-choices (F@1% ≥ 0.98, normals ≥ 0.90); Q5_K/Q4_K are preview-grade. The
-`1024_cascade` path was verified end-to-end with Q4_K quantized weights
-(2-step run with texture: SS DiT, shape DiTs at 512/1024 and texture DiT all
-load through `QMatMul` and decode).
+`QMatMul` kernels skip the F32 dequantize pass. (WGPU is the exception: its
+packed q8 matmul shader is ~10x slower than the dense f32 GEMM, so Lux3D
+dequantizes q8 weights once at load on WGPU; `LUX3D_WGPU_DEQUANT_WEIGHTS=0`
+restores the packed path. See the backend coverage note below.) Q8_0/Q6_K are
+the production choices (F@1% ≥ 0.98, normals ≥ 0.90); Q5_K/Q4_K are
+preview-grade. The `1024_cascade` path was verified end-to-end with Q4_K
+quantized weights (2-step run with texture: SS DiT, shape DiTs at 512/1024 and
+texture DiT all load through `QMatMul` and decode).
 
 Backend coverage with real weights (same input, seed 42): the geometry-only
 512 run passes on CPU, CUDA, Vulkan and WGPU; the full `1024_cascade` run with
@@ -455,12 +458,22 @@ texture passes on CUDA in 438 s with a **7.8 GiB peak** on a 12 GiB RTX 3060.
 F16 and Q8_0 GGUF variants run on all four testable backends. K-quants
 (Q4_K/Q5_K/Q6_K) run on CPU, CUDA and Vulkan but fail on WGPU at this model
 size because candle's WGPU Q8K activation-roundtrip dispatch exceeds the
-65,535-workgroup limit for the 8,192-wide MLP; Q8_0 is the safe quantized
-choice on WGPU until the candle kernel is fixed. Vulkan additionally needed a
+65,535-workgroup limit for the 8,192-wide MLP; that limit applies to the packed
+path (`LUX3D_WGPU_DEQUANT_WEIGHTS=0`), because by default WGPU dequantizes
+quantized weights at load (see below). Q8_0 is the tested quantized choice on
+WGPU until the candle kernel is fixed. Vulkan additionally needed a
 Lux3D-side workaround for candle's unclamped `index_select` dispatch above
 65,535 rows (the sparse VAE gathers reach ~500k rows at resolution 512); the
 runtime splits those gathers into limit-sized chunks, after which Vulkan
 matches CPU/CUDA geometry and is run-to-run deterministic.
+
+Measured q8_0 512 geometry-only wall time (RTX 3060 12 GiB, release CLI, one
+sampler step): CUDA 97 s, Vulkan 129 s (`CANDLE_VULKAN_INFLIGHT_MAX_BYTES=1073741824`
+brings it to 111 s), WGPU 303 s (`CANDLE_WGPU_INFLIGHT_MAX_BYTES=268435456`;
+the default WGPU budgets OOM the shape sampler on this card). At 12 steps:
+CUDA 167 s, Vulkan 376 s. The Vulkan SS 3D decoder itself is 0.6–1.8 s after
+the layout/kernel fixes; the remaining Vulkan gap is candle-side submission and
+drain overhead in the DiT samplers (see `FEATURES.md` known gaps).
 
 ### Run Inference
 
