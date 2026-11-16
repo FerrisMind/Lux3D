@@ -59,11 +59,18 @@ fn get_f32(
 /// cross-correlation, zero padding, stride 1).
 #[derive(Debug)]
 pub(crate) struct Conv3d {
-    /// `[27, in_channels, out_channels]` F32, `k = kd*9 + kh*3 + kw`.
-    /// Pre-transposed at load: extracting one `[C, O]` kernel per offset from
-    /// the `[O, C, 3, 3, 3]` checkpoint tensor copies a strided rank-5 view and
-    /// cost one tiny device copy per output/input channel on Vulkan.
-    weight27: Tensor,
+    /// Per-offset kernels `[in_channels, out_channels]` F32, `k = kd*9 +
+    /// kh*3 + kw`, each a standalone contiguous tensor with start offset 0.
+    ///
+    /// Keeping them as views into one `[27, C, O]` tensor looked cheaper at
+    /// load time but was catastrophic on Vulkan: a view with a start offset
+    /// above 65535 elements (any `k > 0` at C=512) makes candle's
+    /// RHS-transpose fallback materialize the kernel through
+    /// `vkCmdCopyBuffer` with one region per element (262k regions for a
+    /// 512x512 kernel, ~20 ms per GEMM, ~11 s per SS decode).
+    kernels: Vec<Tensor>,
+    in_channels: usize,
+    out_channels: usize,
     bias: Option<Tensor>,
     padding: usize,
 }
@@ -82,63 +89,135 @@ impl Conv3d {
             (out_channels, in_channels, kernel, kernel, kernel),
             "weight",
         )?;
-        // [O, C, kd, kh, kw] -> [O, C, 27] -> [27, C, O]: flatten the kernel
-        // axes in memory order (kw fastest) and move them in front, so each
-        // forward offset is one contiguous `[C, O]` view.
+        // [O, C, kd, kh, kw] -> [27, C, O]: flatten the kernel axes in memory
+        // order (kw fastest), then split into per-offset owned `[C, O]`
+        // tensors so each matmul consumes the kernel directly.
         let weight27 = weight
             .reshape((out_channels, in_channels, kernel * kernel * kernel))?
             .permute((2, 1, 0))?
             .contiguous()?;
+        let kernels = (0..kernel * kernel * kernel)
+            .map(|k| weight27.narrow(0, k, 1)?.squeeze(0)?.affine(1.0, 0.0))
+            .collect::<CandleResult<Vec<_>>>()?;
         let bias = if bias {
             Some(get_f32(&vb, out_channels, "bias")?)
         } else {
             None
         };
         Ok(Self {
-            weight27,
+            kernels,
+            in_channels,
+            out_channels,
             bias,
             padding,
         })
     }
 
-    /// `x: [B, C, X, Y, Z]` -> `[B, O, X, Y, Z]` (stride 1, even padding).
-    pub fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
-        let (batch, in_channels, dx, dy, dz) = xs.dims5()?;
-        let (kernel_offsets, weight_in, out_channels) = self.weight27.dims3()?;
-        if weight_in != in_channels || kernel_offsets != 27 {
+    /// Rewrite the output channels from the reference pixel-shuffle order
+    /// `c*8 + s0*4 + s1*2 + s2` to sub-voxel major `(s0*4 + s1*2 + s2)*C + c`.
+    ///
+    /// Used only by the two upsample blocks. With this order each of the 8
+    /// sub-voxel planes is a contiguous `[B, X, Y, Z, C]` slice, and the
+    /// shuffle is three `stack`+`reshape` interleaves along Z, Y, X. Those
+    /// copies go through `Tensor::cat`'s 2D copy path, whereas the reference
+    /// order needs a rank-8 permutation that Vulkan materializes with one
+    /// copy per leading index (0.3-0.6 s per upsample).
+    fn reorder_output_channels_subvoxel_major(&mut self) -> CandleResult<()> {
+        const SUBVOXELS: usize = 8;
+        if self.out_channels % SUBVOXELS != 0 {
             candle_core::bail!(
-                "Conv3d weight {:?} does not match input [B, {in_channels}, ..] with 3^3 kernel",
-                self.weight27.dims()
+                "pixel-shuffle output channels {} not divisible by 8",
+                self.out_channels
+            );
+        }
+        let groups = self.out_channels / SUBVOXELS;
+        for kernel in &mut self.kernels {
+            let (cin, cout) = kernel.dims2()?;
+            *kernel = kernel
+                .reshape((cin, groups, SUBVOXELS))?
+                .permute((0, 2, 1))?
+                .contiguous()?
+                .reshape((cin, cout))?;
+        }
+        if let Some(bias) = self.bias.take() {
+            let cout = bias.dim(0)?;
+            self.bias = Some(
+                bias.reshape((groups, SUBVOXELS))?
+                    .permute((1, 0))?
+                    .contiguous()?
+                    .reshape(cout)?,
+            );
+        }
+        Ok(())
+    }
+
+    /// `x: [B, C, X, Y, Z]` -> `[B, O, X, Y, Z]` (stride 1, even padding).
+    /// Reference wrapper for the cross-correlation test; the decoder itself
+    /// runs [`Self::forward_channels_last`] end-to-end.
+    #[cfg(test)]
+    pub fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
+        let channels_last = xs.permute((0, 2, 3, 4, 1))?.contiguous()?;
+        self.forward_channels_last(&channels_last)?
+            .permute((0, 4, 1, 2, 3))
+    }
+
+    /// Channels-last 3D convolution: `[B, X, Y, Z, C]` -> `[B, X, Y, Z, O]`.
+    ///
+    /// The SS decoder keeps every activation in this layout so the 3D
+    /// convolution never transposes `[B*XYZ, C]`.
+    ///
+    /// Vulkan copies strided rank>4 layouts through
+    /// `materialize_rank_gt4_compact`, which emits one copy per leading index
+    /// (and, for large offsets, one `vkCmdCopyBuffer` region per row). A
+    /// direct `[B, X, Y, Z, C]` window therefore cost hundreds of submissions
+    /// per offset. Instead, one `affine(1, 0)` materialization per kd slice
+    /// resets the storage offset and collapses the spatial axes into a rank-4
+    /// `[B*X, Yp, Zp, C]` matrix; each kh/kw window is then a 4D strided view
+    /// with a small offset, which Vulkan copies with a single dispatch.
+    /// `k = kd*9 + kh*3 + kw` matches `kernels`' order.
+    pub fn forward_channels_last(&self, xs: &Tensor) -> CandleResult<Tensor> {
+        let (batch, dx, dy, dz, in_channels) = xs.dims5()?;
+        if in_channels != self.in_channels || self.kernels.len() != 27 {
+            candle_core::bail!(
+                "Conv3d kernels ({}, {}) do not match input [B, .., C={in_channels}] with 3^3 kernel",
+                self.kernels.len(),
+                self.in_channels
             );
         }
         if self.padding > dx || self.padding > dy || self.padding > dz {
             candle_core::bail!("Conv3d padding larger than input dims");
         }
         let (ox, oy, oz) = (dx, dy, dz); // stride 1, symmetric padding keeps size.
+        let out_channels = self.out_channels;
+        let p = self.padding;
         let padded = xs
-            .pad_with_zeros(2, self.padding, self.padding)?
-            .pad_with_zeros(3, self.padding, self.padding)?
-            .pad_with_zeros(4, self.padding, self.padding)?;
+            .pad_with_zeros(1, p, p)?
+            .pad_with_zeros(2, p, p)?
+            .pad_with_zeros(3, p, p)?;
+        let (yp, zp) = (oy + 2 * p, oz + 2 * p);
+        let rows = batch * ox;
         let tokens = ox * oy * oz;
         let mut acc: Option<Tensor> = None;
         for kd_offset in 0..3 {
+            // `affine(1, 0)` yields a fresh contiguous buffer with offset 0.
+            // (`copy()` cannot be used here: it keeps the source layout's
+            // start offset, which then indexes past the copied storage.)
+            // Resetting the offset keeps every rank-4 kh/kw window copy below
+            // the copy shader's 16-bit offset limit, so each window is one
+            // dispatch instead of one region per row.
+            let slab = padded
+                .narrow(1, kd_offset, ox)?
+                .reshape((rows, yp, zp, in_channels))?
+                .affine(1.0, 0.0)?;
             for kh_offset in 0..3 {
                 for kw_offset in 0..3 {
-                    // [B, C, X, Y, Z] window at this kernel offset.
-                    let shifted = padded
-                        .narrow(2, kd_offset, ox)?
-                        .narrow(3, kh_offset, oy)?
-                        .narrow(4, kw_offset, oz)?;
-                    // [B*XYZ, C]
-                    let columns = shifted
-                        .reshape((batch, in_channels, tokens))?
-                        .transpose(1, 2)?
+                    let columns = slab
+                        .narrow(1, kh_offset, oy)?
+                        .narrow(2, kw_offset, oz)?
                         .contiguous()?
                         .reshape((batch * tokens, in_channels))?;
-                    // [C, O] view of the matching kernel offset.
                     let k = kd_offset * 9 + kh_offset * 3 + kw_offset;
-                    let kernel = self.weight27.narrow(0, k, 1)?.squeeze(0)?;
-                    let part = columns.matmul(&kernel)?; // [B*XYZ, O]
+                    let part = columns.matmul(&self.kernels[k])?; // [B*XYZ, O]
                     acc = Some(match acc {
                         None => part,
                         Some(existing) => existing.add(&part)?,
@@ -151,8 +230,7 @@ impl Conv3d {
         if let Some(bias) = &self.bias {
             out = out.broadcast_add(&bias.reshape((1, 1, 1, 1, out_channels))?)?;
         }
-        // [B, O, X, Y, Z]
-        out.permute((0, 4, 1, 2, 3))
+        Ok(out)
     }
 }
 
@@ -173,16 +251,15 @@ impl ChannelLayerNorm {
         })
     }
 
-    pub fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
-        let (_batch, channels, _, _, _) = xs.dims5()?;
-        let mean = xs.mean_keepdim(1)?;
-        let centered = xs.broadcast_sub(&mean)?;
-        let var = centered.sqr()?.mean_keepdim(1)?;
-        let denom = var.affine(1.0, 1e-5)?.sqrt()?;
-        let normalized = centered.broadcast_div(&denom)?;
-        let weight = self.weight.reshape((1, channels, 1, 1, 1))?;
-        let bias = self.bias.reshape((1, channels, 1, 1, 1))?;
-        normalized.broadcast_mul(&weight)?.broadcast_add(&bias)
+    /// Channels-last variant (`[B, X, Y, Z, C]`, norm over the last axis).
+    ///
+    /// Uses the backend's fused layer-norm. The manual mean/sub/sqr/div
+    /// sequence materializes each rank-5 broadcast through Vulkan's
+    /// `materialize_rank_gt4_compact`, which walks one copy per leading index
+    /// and made a single 64^3 norm cost ~1.7 s; the fused kernel flattens to
+    /// `[rows, C]` and normalizes in one dispatch.
+    pub fn forward_channels_last(&self, xs: &Tensor) -> CandleResult<Tensor> {
+        candle_nn::ops::layer_norm(xs, &self.weight, &self.bias, 1e-5)
     }
 }
 
@@ -206,17 +283,20 @@ impl ResBlock3d {
         })
     }
 
-    pub fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
-        let h = self.norm1.forward(xs)?.silu()?;
-        let h = self.conv1.forward(&h)?;
-        let h = self.norm2.forward(&h)?.silu()?;
-        let h = self.conv2.forward(&h)?;
+    /// Channels-last block (`[B, X, Y, Z, C]`).
+    pub fn forward_channels_last(&self, xs: &Tensor) -> CandleResult<Tensor> {
+        let h = self.norm1.forward_channels_last(xs)?.silu()?;
+        let h = self.conv1.forward_channels_last(&h)?;
+        let h = self.norm2.forward_channels_last(&h)?.silu()?;
+        let h = self.conv2.forward_channels_last(&h)?;
         h.add(xs)
     }
 }
 
-/// `pixel_shuffle_3d(x, 2)` (`modules/spatial.py`):
+/// `pixel_shuffle_3d(x, 2)` (`modules/spatial.py`), the reference
+/// channels-first shuffle pinned by the channel-order test:
 /// `out[b, c_, 2x+s0, 2y+s1, 2z+s2] = in[b, 8*c_ + 4*s0 + 2*s1 + s2, x, y, z]`.
+#[cfg(test)]
 pub(crate) fn pixel_shuffle_3d(xs: &Tensor) -> CandleResult<Tensor> {
     let (batch, channels, dx, dy, dz) = xs.dims5()?;
     if channels % 8 != 0 {
@@ -228,6 +308,39 @@ pub(crate) fn pixel_shuffle_3d(xs: &Tensor) -> CandleResult<Tensor> {
     xs.reshape(&[batch, out_channels, dx * 2, dy * 2, dz * 2])
 }
 
+/// Channels-last `pixel_shuffle_3d` for convolution outputs whose channels
+/// were reordered by [`Conv3d::reorder_output_channels_subvoxel_major`]:
+/// `[B, X, Y, Z, 8*C]` -> `[B, 2X, 2Y, 2Z, C]`.
+///
+/// Each sub-voxel plane `q = s0*4 + s1*2 + s2` is contiguous, so interleaving
+/// along Z, then Y, then X is a `stack` + adjacent-dims `reshape` (metadata
+/// only, the copy inside `stack` runs through the backend's 2D cat/copy path).
+fn pixel_shuffle_3d_subvoxel_major(xs: &Tensor) -> CandleResult<Tensor> {
+    let (batch, dx, dy, dz, channels) = xs.dims5()?;
+    if channels % 8 != 0 {
+        candle_core::bail!("pixel_shuffle_3d expects channels divisible by 8, got {channels}");
+    }
+    let c = channels / 8;
+    let plane = |q: usize| xs.narrow(4, q * c, c);
+    let mut z_planes = Vec::with_capacity(4);
+    for s0 in 0..2usize {
+        for s1 in 0..2usize {
+            let q = s0 * 4 + s1 * 2;
+            let low = plane(q)?;
+            let high = plane(q + 1)?;
+            // [B, X, Y, Z, 2, C] -> [B, X, Y, 2Z, C] (z, s2 interleaved).
+            z_planes.push(Tensor::stack(&[&low, &high], 4)?.reshape((batch, dx, dy, dz * 2, c))?);
+        }
+    }
+    // [B, X, Y, 2, 2Z, C] -> [B, X, 2Y, 2Z, C] (y, s1 interleaved).
+    let y0 =
+        Tensor::stack(&[&z_planes[0], &z_planes[1]], 3)?.reshape((batch, dx, dy * 2, dz * 2, c))?;
+    let y1 =
+        Tensor::stack(&[&z_planes[2], &z_planes[3]], 3)?.reshape((batch, dx, dy * 2, dz * 2, c))?;
+    // [B, X, 2, 2Y, 2Z, C] -> [B, 2X, 2Y, 2Z, C] (x, s0 interleaved).
+    Tensor::stack(&[&y0, &y1], 2)?.reshape((batch, dx * 2, dy * 2, dz * 2, c))
+}
+
 /// Decoder upsample block (`UpsampleBlock3d`, mode "conv"):
 /// `Conv3d(ch_in, ch_out * 8, 3, pad 1)` then `pixel_shuffle_3d(.., 2)`.
 #[derive(Debug)]
@@ -237,14 +350,18 @@ pub(crate) struct UpsampleBlock3d {
 
 impl UpsampleBlock3d {
     pub fn load(vb: VarBuilder, in_channels: usize, out_channels: usize) -> CandleResult<Self> {
-        Ok(Self {
-            conv: Conv3d::load(vb.pp("conv"), in_channels, out_channels * 8, 3, 1, true)?,
-        })
+        let mut conv = Conv3d::load(vb.pp("conv"), in_channels, out_channels * 8, 3, 1, true)?;
+        // Reference channel order is `c*8 + s0*4 + s1*2 + s2`; reorder to
+        // `(s0*4 + s1*2 + s2)*C + c` so the pixel shuffle becomes three
+        // adjacent-axis interleaves instead of a rank-8 permutation.
+        conv.reorder_output_channels_subvoxel_major()?;
+        Ok(Self { conv })
     }
 
-    pub fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
-        let h = self.conv.forward(xs)?;
-        pixel_shuffle_3d(&h)
+    /// Channels-last upsample (`[B, X, Y, Z, C]`).
+    pub fn forward_channels_last(&self, xs: &Tensor) -> CandleResult<Tensor> {
+        let h = self.conv.forward_channels_last(xs)?;
+        pixel_shuffle_3d_subvoxel_major(&h)
     }
 }
 
@@ -363,22 +480,63 @@ impl Trellis2SsDecoder {
                 self.input_layer_weight_in()
             );
         }
-        let mut h = self.input_layer.forward(xs)?;
-        for block in &self.middle_block {
-            h = block.forward(&h)?;
+        // Convert to channels-last once for the whole decoder. Every block
+        // then stays in `[B, X, Y, Z, C]`, so the convs never transpose.
+        let profile = std::env::var_os("LUX3D_SS_DEC_PROFILE").is_some();
+        let mut start = std::time::Instant::now();
+        let mut h = xs.permute((0, 2, 3, 4, 1))?.contiguous()?;
+        if profile {
+            eprintln!(
+                "[ss-dec] to channels-last: {:.2}s",
+                start.elapsed().as_secs_f64()
+            );
+            start = std::time::Instant::now();
         }
-        for block in &self.blocks {
+        h = self.input_layer.forward_channels_last(&h)?;
+        if profile {
+            eprintln!("[ss-dec] input conv: {:.2}s", start.elapsed().as_secs_f64());
+            start = std::time::Instant::now();
+        }
+        for (index, block) in self.middle_block.iter().enumerate() {
+            h = block.forward_channels_last(&h)?;
+            if profile {
+                eprintln!(
+                    "[ss-dec] middle {index}: {:.2}s",
+                    start.elapsed().as_secs_f64()
+                );
+                start = std::time::Instant::now();
+            }
+        }
+        for (index, block) in self.blocks.iter().enumerate() {
             h = match block {
-                DecoderBlock::Res(res) => res.forward(&h)?,
-                DecoderBlock::Up(up) => up.forward(&h)?,
+                DecoderBlock::Res(res) => res.forward_channels_last(&h)?,
+                DecoderBlock::Up(up) => up.forward_channels_last(&h)?,
             };
+            if profile {
+                eprintln!(
+                    "[ss-dec] block {index}: {:.2}s",
+                    start.elapsed().as_secs_f64()
+                );
+                start = std::time::Instant::now();
+            }
         }
-        let h = self.out_norm.forward(&h)?.silu()?;
-        self.out_conv.forward(&h)
+        let h = self.out_norm.forward_channels_last(&h)?.silu()?;
+        if profile {
+            eprintln!("[ss-dec] out norm: {:.2}s", start.elapsed().as_secs_f64());
+            start = std::time::Instant::now();
+        }
+        let out = self
+            .out_conv
+            .forward_channels_last(&h)?
+            .permute((0, 4, 1, 2, 3))?;
+        if profile {
+            eprintln!("[ss-dec] out conv: {:.2}s", start.elapsed().as_secs_f64());
+        }
+        Ok(out)
     }
 
     fn input_layer_weight_in(&self) -> usize {
-        self.input_layer.weight27.dim(1).unwrap_or(0)
+        self.input_layer.in_channels
     }
 }
 
@@ -511,8 +669,19 @@ mod tests {
             .and_then(|t| t.permute((2, 1, 0)))
             .and_then(|t| t.contiguous())
             .expect("weight27");
+        let kernels = (0..27)
+            .map(|k| {
+                weight27
+                    .narrow(0, k, 1)
+                    .and_then(|t| t.squeeze(0))
+                    .and_then(|t| t.affine(1.0, 0.0))
+            })
+            .collect::<candle_core::Result<Vec<_>>>()
+            .expect("kernels");
         let conv = Conv3d {
-            weight27,
+            kernels,
+            in_channels: in_ch,
+            out_channels: out_ch,
             bias: Some(bias.clone()),
             padding: 1,
         };
