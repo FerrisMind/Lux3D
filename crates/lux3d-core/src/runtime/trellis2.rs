@@ -1416,6 +1416,8 @@ impl Trellis2Pipeline {
                 })?
             }
         };
+        let stage_time = std::env::var_os("LUX3D_STAGE_TIME").is_some();
+        let mut stage_start = std::time::Instant::now();
         let vb = self.stage_var_builder("ss_flow", device)?;
         let ss_dit =
             Trellis2SsDit::load(vb, &Trellis2SsConfig::trellis_2_4b()).map_err(|source| {
@@ -1423,6 +1425,13 @@ impl Trellis2Pipeline {
                     message: format!("failed to load TRELLIS.2 ss_flow: {source}"),
                 }
             })?;
+        if stage_time {
+            eprintln!(
+                "[stage] trellis2 ss dit load: {:.2}s",
+                stage_start.elapsed().as_secs_f64()
+            );
+            stage_start = std::time::Instant::now();
+        }
         let (z_s, _trace) = sample_dense(
             &|x: &Tensor, t_model: f32, c: &Tensor| ss_dit.forward(x, t_model, c),
             &noise,
@@ -1434,12 +1443,26 @@ impl Trellis2Pipeline {
             message: format!("Trellis2 SS sampling failed: {source}"),
         })?;
         drop(ss_dit);
+        if stage_time {
+            eprintln!(
+                "[stage] trellis2 ss sample: {:.2}s",
+                stage_start.elapsed().as_secs_f64()
+            );
+            stage_start = std::time::Instant::now();
+        }
 
         let vb = self.stage_var_builder("ss_dec", device)?;
         let decoder = Trellis2SsDecoder::load(vb, &Trellis2SsDecoderConfig::ss_dec_16l8())
             .map_err(|source| Lux3dError::CanonicalWeightsValidation {
                 message: format!("failed to load TRELLIS.2 ss_dec: {source}"),
             })?;
+        if stage_time {
+            eprintln!(
+                "[stage] trellis2 ss dec load: {:.2}s",
+                stage_start.elapsed().as_secs_f64()
+            );
+            stage_start = std::time::Instant::now();
+        }
         let logits =
             decoder
                 .forward(&z_s)
@@ -1447,11 +1470,24 @@ impl Trellis2Pipeline {
                     message: format!("Trellis2 SS decode failed: {source}"),
                 })?;
         drop(decoder);
+        if stage_time {
+            eprintln!(
+                "[stage] trellis2 ss decode: {:.2}s",
+                stage_start.elapsed().as_secs_f64()
+            );
+            stage_start = std::time::Instant::now();
+        }
         let coords4 = occupancy_coords(&logits, ss_resolution).map_err(|source| {
             Lux3dError::CanonicalWeightsValidation {
                 message: format!("Trellis2 occupancy extraction failed: {source}"),
             }
         })?;
+        if stage_time {
+            eprintln!(
+                "[stage] trellis2 ss occupancy: {:.2}s",
+                stage_start.elapsed().as_secs_f64()
+            );
+        }
         let coords: Vec<[i32; 3]> = coords4
             .iter()
             .filter(|c| c[0] == 0)
@@ -2190,7 +2226,7 @@ impl Trellis2Pipeline {
     /// VAE decode + mesh at the variant's resolution. `neg_cond` belongs to
     /// `cond_ss`; the shape/tex negative cond is `zeros_like(cond_shape)`
     /// exactly like the reference `get_cond`.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, unused_assignments)]
     fn run_core_single(
         &self,
         cond_ss: &Tensor,
@@ -2217,6 +2253,20 @@ impl Trellis2Pipeline {
                 message: format!("Trellis2 negative cond allocation failed: {source}"),
             }
         })?;
+        let stage_time = std::env::var_os("LUX3D_STAGE_TIME").is_some();
+        let mut stage_start = std::time::Instant::now();
+        macro_rules! stage_done {
+            ($name:expr) => {
+                if stage_time {
+                    eprintln!(
+                        "[stage] trellis2 {}: {:.2}s",
+                        $name,
+                        stage_start.elapsed().as_secs_f64()
+                    );
+                    stage_start = std::time::Instant::now();
+                }
+            };
+        }
         let (z_s, ss_coords) = match coords_override {
             Some(coords) => (None, coords),
             None => {
@@ -2232,6 +2282,7 @@ impl Trellis2Pipeline {
                 (Some(z_s), coords)
             }
         };
+        stage_done!("ss");
         if ss_coords.is_empty() {
             return Err(Lux3dError::InvalidInput(
                 "Trellis2 sparse structure decoded to zero active voxels",
@@ -2268,6 +2319,7 @@ impl Trellis2Pipeline {
                 device,
             )?,
         };
+        stage_done!("shape spatial");
         // Texture SLAT on the shape latent coords (reference order: after
         // the shape stage, before the decodes).
         let tex_latent = self.texture_latent_single(
@@ -2281,14 +2333,17 @@ impl Trellis2Pipeline {
             options,
             tex_params,
         )?;
+        stage_done!("texture spatial");
         let (decoded, mesh) =
             self.decode_shape_vae(&ss_coords, &shape_latent, device, shape_resolution)?;
+        stage_done!("shape vae");
         let mut mesh =
             self.assemble_mesh(shape_resolution, mesh, &decoded.coords, &decoded.feats)?;
         // Geometry post-process (upstream `to_glb` cleaning) BEFORE the
         // texture stage: the re-topologized vertices are the ones the
         // per-vertex PBR color sampling sees.
         mesh = self.postprocess_decoded_mesh(mesh, &options.postprocess)?;
+        stage_done!("postprocess");
         let tex_attrs = match &tex_latent {
             Some(tex_latent) => {
                 let (tex_coords, attrs) =
@@ -2298,6 +2353,7 @@ impl Trellis2Pipeline {
                     "guided texture decode coords must equal the shape decode coords"
                 );
                 self.attach_texture(&mut mesh, &decoded.coords, &attrs, shape_resolution)?;
+                stage_done!("texture vae");
                 Some(attrs)
             }
             None => None,
@@ -2305,6 +2361,7 @@ impl Trellis2Pipeline {
         // Texture export (upstream `to_glb` UV unwrap + bake). Skips cleanly
         // for geometry-only runs (see `build_textured_mesh`).
         let textured = self.build_textured_mesh(&mesh, &options.texture_export)?;
+        stage_done!("texture export");
         Ok(Trellis2Stages {
             cond: cond_ss.clone(),
             neg_cond: neg_cond.clone(),
