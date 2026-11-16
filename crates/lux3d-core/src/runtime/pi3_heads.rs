@@ -1,6 +1,6 @@
-use candle_core::{D, IndexOp, Result as CandleResult, Tensor};
 use super::nn_blocks::Linear;
 use crate::weights::VarBuilder;
+use candle_core::{D, IndexOp, Result as CandleResult, Tensor};
 
 use super::{
     nn_blocks::linear, nn_blocks::linear_fwd, point_camera_ops::camera_pose_from_components,

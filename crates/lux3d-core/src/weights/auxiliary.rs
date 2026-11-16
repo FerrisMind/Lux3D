@@ -125,7 +125,9 @@ pub fn load_auxiliary_canonical_weights(
         if gguf_file.is_file() {
             return load_standalone_aux_gguf(gguf_file, expected_family);
         }
-        return Err(Lux3dError::MissingCanonicalArtifact { path: canonical_file });
+        return Err(Lux3dError::MissingCanonicalArtifact {
+            path: canonical_file,
+        });
     }
 
     for required in [

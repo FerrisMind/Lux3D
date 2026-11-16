@@ -1,9 +1,9 @@
 use std::{collections::HashMap, sync::Mutex};
 
-use candle_core::{D, IndexOp, Result as CandleResult, Tensor};
-use candle_nn::{LayerNorm, Module, layer_norm};
 use super::nn_blocks::Linear;
 use crate::weights::VarBuilder;
+use candle_core::{D, IndexOp, Result as CandleResult, Tensor};
+use candle_nn::{LayerNorm, Module, layer_norm};
 
 use super::{
     nn_blocks::linear_fwd,
