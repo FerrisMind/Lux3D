@@ -384,7 +384,7 @@ pub fn write_obj(mesh: &MeshView<'_>, path: &Path, style: ObjStyle) -> Result<()
     })
 }
 
-fn write_glb_container(path: &Path, json: &[u8], binary: &[u8]) -> Result<()> {
+pub(crate) fn write_glb_container(path: &Path, json: &[u8], binary: &[u8]) -> Result<()> {
     const MAGIC: u32 = 0x4654_6C67;
     const VERSION: u32 = 2;
     const JSON_CHUNK: u32 = 0x4E4F_534A;
