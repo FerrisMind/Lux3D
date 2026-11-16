@@ -510,11 +510,16 @@ the camera head, and the DPT point/depth heads from the canonical package.
 
 ### US-13.2: VGGT preprocess matches the reference loader
 As a user, I get the same crop/resize/pad/normalization as
-`vggt.utils.load_fn.load_and_preprocess_images(mode="crop")`.
+`vggt.utils.load_fn.load_and_preprocess_images(mode="crop")`, plus the pad recipe and
+single-image sources.
 
 **Functions:**
 - `preprocess/vggt.rs:VggtPreprocessStage::prepare_inputs_from_path()` ✅
+- `preprocess/vggt.rs:VggtPreprocessStage::prepare_inputs_from_path_with_mode()` —
+  `--preprocess-mode crop|pad` (pad: largest side 518, white-padded 518x518 square,
+  no pixels discarded) ✅
 - `preprocess/vggt.rs:VggtPreprocessStage::target_size_for()` ✅
+- Single-image file sources (`.png/.jpg/.jpeg/.webp/.bmp/.tif/.tiff` — one-frame scene) ✅
 - Pillow-compatible integer BICUBIC resampler (0.0 delta vs baseline) ✅
 
 ### US-13.3: VGGT inference and export
@@ -522,12 +527,23 @@ As a user, I can run multi-frame inference and export a confidence-filtered PLY.
 
 **Functions:**
 - `runtime/vggt.rs:VggtPipeline::infer_from_path()` / `infer_tensors()` ✅
+- `runtime/vggt.rs:VggtPipeline::infer_from_path_with_options()` /
+  `infer_prepared_with_options()` — dtype / preprocess mode / interval / sequential
+  `batch_size` chunking (`merge_vggt_inference_outputs`) ✅
+- `runtime/vggt.rs:VggtPipeline::load_with_options()` — `--vggt-dtype` load dtype ✅
 - `runtime/vggt.rs:VggtPipeline::run_aggregator()` ✅
 - `runtime/vggt.rs:decode_pose()` — quaternion XYZW to extrinsics/intrinsics ✅
+- `runtime/vggt.rs:VggtInferenceOutput::world_points_from_depth()` — reference
+  `unproject_depth_map_to_point_map` depth unprojection ✅
 - `geometry/vggt.rs:VggtGeometryStage::assemble_cpu()` — strict `conf > threshold` ✅
 - `export/vggt.rs:VggtExportStage::write_ply()` ✅
+- `export/colmap.rs:write_feedforward_colmap()` — upstream `demo_colmap.py`
+  feedforward mode (`cameras.bin`/`images.bin`/`points3D.bin`, PINHOLE per image,
+  depth-confidence gate + point cap, rescaled intrinsics) ✅
 - `runtime/vggt.rs:VggtPipeline::export_ply_with_threshold()` ✅
-- CLI `run vggt`; server `vggt` point-cloud jobs ✅
+- `runtime/vggt.rs:VggtPipeline::export_inference_npz()` — includes the stacked
+  `pose_enc_list` `[K, S, 9]` ✅
+- CLI `run vggt` (see US-13.4); server `vggt` point-cloud jobs ✅
 
 **Tests:** `runtime_vggt` (CUDA parity vs Python baseline; requires a CUDA device),
 `vggt_preprocess` (CPU golden RGB + normalized parity), `vggt_export` (CPU),
@@ -537,7 +553,45 @@ CPU and Vulkan numeric parity was verified manually (PLY vertex count and bbox a
 Python baseline; see `.swarm/results/backends-and-bench.md`). The automated parity test is
 CUDA-only; Metal has no test host in this repository.
 
-**Excluded:** native track head (`vggt_track_head`) — recorded in the contract; weights are never loaded.
+**Excluded:** track auto-query/keypoint extraction (ALIKED/SP keypoints, DINO
+query-frame ranking) — tracking requires explicit queries, see US-13.4.
+
+### US-13.4: VGGT CLI run surface (exports + tracking)
+As a user, I can run `lux3d run vggt` with the full VGGT option surface: preprocess mode,
+load dtype, batch chunking, COLMAP feedforward export, depth-unprojected point clouds and
+explicit-query tracking.
+
+**Functions:**
+- `cli.rs:VggtRunArgs` — flattened VGGT-only flag family; every flag is rejected for
+  the other families (`reject_vggt_only_options`) ✅
+- `--preprocess-mode crop|pad` (default crop) → `VggtRunOptions.preprocess_mode` ✅
+- `--vggt-dtype f32|f16|bf16` (default f32) → `VggtPipeline::load_with_options` ✅
+- `--batch-size N` (default 1; 0 rejected) → sequential frame chunks, NOT one attention
+  pass; documented in the flag help ✅
+- `--colmap-dir` + `--colmap-conf-threshold` (default 5.0) + `--colmap-max-points`
+  (default 100000) → `write_feedforward_colmap` + `ColmapExportStats` print ✅
+- `--depth-points` + `--depth-conf-threshold` (default 1.0) → depth-unprojected
+  PLY/XYZ point cloud from `world_points_from_depth()` ✅
+- `--track-queries '<json>'` (objects or `[frame,x,y]` arrays; frame must be 0,
+  x/y in [0, 518); parse: `parse_vggt_track_queries`) + `--track-output` (default
+  `<source-stem>_tracks.json`) + `--track-iters` (default 4) →
+  `run_with_tracks` + `{"coords", "visibility", "confidence"}` JSON ✅
+- `--track-points-ply` — one colored vertex per query (frame-0 world point at the
+  query pixel) ✅
+- `--dump-npz` includes `pose_enc_list` and works together with the track options ✅
+- Single-image `--source` accepted for `vggt` ✅
+
+**Excluded:** track auto-query/keypoint extraction is not available in the CLI —
+`--track-queries` requires explicit query points.
+
+**Tests:** `tests/run_args.rs` (`run_vggt_parses_vggt_flags`,
+`run_vggt_flags_default_to_historical_behavior`,
+`run_vggt_enum_flags_reject_unknown_values`,
+`run_vggt_hyphen_values_parse_for_track_queries_but_not_thresholds`,
+`run_model_rejects_vggt_batch_size_zero_at_dispatch_before_weights`,
+`run_model_rejects_vggt_only_flag_at_dispatch_before_weights`) and the in-crate
+`cli::tests` VGGT tests (option mapping, query JSON formats, track JSON
+serialization, family rejection, COLMAP image-name listing, default track path) ✅
 
 ---
 
@@ -578,13 +632,17 @@ reference-default flash decoder/DiffDMC (or the dense/hierarchical marching-cube
 - `runtime/triposg.rs:TripoSgPipeline::infer_from_path()` / `infer_with_latents()` ✅
 - `runtime/triposg.rs:TripoSgPipeline::sample_latents()` — seeded SplitMix64/Box-Muller (not torch-RNG-identical) ✅
 - `runtime/triposg_dit.rs:denoise()` — rectified-flow Euler, CFG 7.0, uncond/cond batch order ✅
-- `runtime/triposg_flash.rs:flash_sdf_grid()` — reference resolution schedule, mini-grid dense pass, near-surface mask/dilation/refinement, NaN sentinel ✅
+- `runtime/triposg_dit.rs:RectifiedFlowSchedule::from_timesteps()` — explicit `timesteps` run-option override (sigmas = t/1000 + shift, terminal 0, step count = list length); shipped `RectifiedFlowScheduler` has no upstream `set_timesteps(timesteps=)` and would reject it (documented deviation) ✅
+- `runtime/triposg.rs:TripoSgRunOptions` — upstream `pipeline_triposg.py` call options: steps / guidance / seed / num_tokens (2048) / dense 8 / hierarchical 9 / flash depth 9 / `use_flash_decoder=true` / query chunk, plus `timesteps` override, `bounds` override (canonical ±1.005 default, absolute frame preserved in both decode paths; the CLI also accepts the upstream scalar shorthand `b` = symmetric cube `[-b, b]`) and `faces` (`--faces` merge-close + quadric decimation) ✅
+- `geometry/mesh_ops.rs:merge_close_vertices()` — pymeshlab `meshing_merge_close_vertices` equivalent (spatial hash, first-index representative, default threshold 1/10000 of bbox diagonal) ✅
+- `runtime/triposg.rs:extract_mesh()` — `--faces` postprocess (`merge_close_vertices` + meshopt quadric `simplify_mesh` to the target face count; no-op at/below target or `faces ≤ 0`) ✅
+- `runtime/triposg_flash.rs:flash_sdf_grid()` — reference resolution schedule, mini-grid dense pass (FULL dense query, not narrow-band), near-surface mask/dilation/refinement, NaN sentinel ✅
 - `runtime/triposg_flash.rs:flash_dual_marching_cubes()` — clean-room DMC (patch averaging, quads, min-max-cosine triangulation, world mapping) ✅
 - `runtime/triposg_field.rs:hierarchical_sdf_grid()` — non-flash dense depth 8 + refinement to depth 9 ✅
 - `geometry/triposg.rs:TripoSgGeometryStage::assemble_cpu()` — non-flash level 0, position-bit dedup ✅
 - `runtime/triposg.rs:TripoSgPipeline::encode_point_cloud*()` — full VAE encode API (FPS + quant distribution) ✅
 - `export/triposg.rs:TripoSgExportStage` — ASCII OBJ ✅
-- CLI `run triposg` (steps / guidance / seed / num-tokens / depths / flash options); server `triposg` mesh jobs (`triposg.obj`) ✅
+- CLI `run triposg` (steps / `timesteps` schedule override / guidance / seed / num-tokens / depths / flash options / `bounds` window override / `faces` face-count target / `dtype` f32|f16|bf16 load dtype); server `triposg` mesh jobs (`triposg.obj`) ✅
 
 **Tests:** `runtime_triposg` (CUDA parity against the 50-step Python golden, dense depth-8 SDF,
 8→9 refinement, CPU 5→6 refinement, smoke), `preprocess_triposg` (bit-exact resize +
@@ -593,7 +651,9 @@ normalization), `rmbg_triposg` (sigmoid and mask-preprocess parity), `flash_trip
 reference-SDF DMC/final-trimesh parity, synthetic exact DMC cases, trimesh-style compaction),
 `vae_encode_triposg` (FPS, quant parameters, distribution/sample), `geometry_triposg`
 (golden depth-9 mesh bbox/volume/face count), `pipeline_triposg` (end-to-end seeded +
-baseline-latents parity), plus `model_spec` / `contracts` / `weights` cases ✅
+baseline-latents parity, run-option validation incl. timesteps/bounds/faces, bounds-
+override + `--faces` smoke, F16 load/decode smoke), plus `model_spec` / `contracts` /
+`weights` cases ✅
 
 The 50-step CFG ODE is numerically chaotic: steps 1 / 10 / 25 match within 1e-2 / 5e-2 / 5e-2,
 while final latents are accepted statistically (mean ≤ 2e-2, relative L2 ≤ 1.2e-1, max ≤ 4.0). A
@@ -609,6 +669,368 @@ checkerboard cells may resolve differently. The full VAE encoder + `vae.quant` e
 (FPS, quant parameters, `TripoSgLatentDistribution`) is implemented for parity/tooling even
 though the image-to-3D pipeline itself calls only `vae.decode`. The contract has no
 exclusions.
+
+---
+
+## 15. TRELLIS.2 Pipeline — Textured-GLB Export
+
+### US-15.1: TRELLIS.2 UV unwrap + PBR bake + textured GLB
+As a user, I can run `lux3d run trellis2` with `--texture` on (the default) and get an
+upstream-parity textured `.glb` (embedded baked textures, UVs, normals) plus the lossless
+PBR voxel sidecar pair.
+
+**Functions:**
+- `runtime/trellis2.rs:Trellis2TextureExportOptions` — `enabled` / `texture_size` (default 2048, multiple of 8 in 8..=8192) / `uv_unwrap`; skips cleanly when disabled, unwrap off, or the mesh carries no 6-channel PBR payload ✅
+- `runtime/trellis2.rs:build_trellis2_textured_mesh()` — xatlas UV unwrap over the post-processed mesh, area-weighted vertex normals, sparse-trilinear PBR bake at `texture_size` into `Trellis2Stages::textured`; `geometry/uv_atlas.rs:uv_unwrap()` welds duplicate-position vertices (relative epsilon 1e-6 of the bbox diagonal) before charting so `repair_non_manifold_edges` vertex splits do not turn every split sheet into its own chart, while `vmapping` still points at the original input indices ✅
+- `export/trellis2.rs:Trellis2ExportStage::write_textured_glb()` — glTF 2.0 binary with POSITION/NORMAL/TEXCOORD_0 + u32 indices, embedded PNG base-color (RGBA) + metallic-roughness textures, reference material (`metallicFactor = 1`, `roughnessFactor = 1`, `alphaMode = "OPAQUE"`, `doubleSided = true`), upstream glTF axis conversion `(x, y, z) -> (x, z, -y)` and UV V flip ✅
+- `export/trellis2.rs:write_pbr_vox()` / `write_pbr_json()` — `<stem>.pbrvox.bin` + `<stem>.pbr.json` sidecar pair (sparse PBR voxel grid, 6 channels per voxel) ✅
+- `cli.rs:RunArgs` `--texture-size` (CLI range 64..=8192; upstream reference allows 1024..4096 step 1024) / `--no-texture-export` / `--no-uv-unwrap`, wired through `trellis2_run_options_from_args` -> `Trellis2RunOptions.texture_export`; `reject_trellis2_only_options` rejects the flags for every other family ✅
+- `cli.rs:run_trellis2` export selection — textured atlas + `.glb` output -> `write_textured_glb` (sidecar written next to it, the plain mesh writer does not overwrite it); `.obj`/`.ply`/`.stl` keep the vertex-color/positions-only mesh; geometry-only or disabled runs keep the pre-textured behavior ✅
+
+**Tests:** `export::trellis2` (`textured_cube_runs_atlas_bake_glb_pipeline` full atlas -> bake ->
+GLB parse-back incl. embedded PNG decode, `textured_export_skips_cleanly`,
+`texture_export_options_validate_size`), CLI `run_args`/`cli` parse + mapping + foreign-family
+rejection cases ✅
+
+**Cost/notes:** the xatlas UV unwrap and the PBR bake run on the CPU after the GPU pipeline —
+budget extra wall time that scales with `texture_size` squared (~42 s unwrap + ~9 s bake for
+an 80k-triangle sphere at 2048 in this tree).
+Uncovered atlas texels are filled with a TELEA-approximation inpaint (iterative nearest-valid
+onion-peel with `1/distance^2` weighting), an approximation of the reference
+`cv2.inpaint(..., INPAINT_TELEA)`; bake statistics (`charts`/`atlases`/`atlas_size`/
+`texture_size`, valid/inpainted texels) are printed per run.
+
+---
+
+## 16. TRELLIS.2 Pipeline Variants, Samplers & Latent Export
+
+### US-16.1: Pipeline variant dispatch
+As a user, I can select the reference `512`, `1024`, `1024_cascade` or `1536_cascade` pipeline.
+
+**Functions:**
+- `contracts/trellis2.rs:Trellis2PipelineType` — all four reference variants ✅
+- `runtime/trellis2.rs:Trellis2Pipeline::resolutions()` — `(ss_resolution, decode_resolution)`: `512` -> `(32, 512)`, `1024` -> `(64, 1024)`, `1024_cascade` -> `(32, 1024)`, `1536_cascade` -> `(32, 1536 target)` ✅
+- `runtime/trellis2.rs:quantize_hr_coords()` — HR quantization `((coord + 0.5) / 512 * (hr // 16)).int()`, row-major dedup, token-budget loop (`< max_num_tokens` or `hr == 1024`, else `hr -= 128`); both cascades stop at 1024, so the 1536 run decodes at 1536 only when the budget allows it ✅
+- `runtime/trellis2.rs:Trellis2SlatConfig::shape_1536()` / `tex_1536()` — elastic DiT configs for the 96-cell HR grid ✅
+- `cli.rs:Trellis2PipelineKind` -> `Trellis2PipelineType`; server `jobs.rs` maps all four names ✅
+
+**Tests:** `trellis2_variants` (`resolutions_map_all_four_variants`,
+`quantize_1536_target_maps_and_stops_at_1024`,
+`run_with_latents_accepts_all_variants_up_to_weight_load`) and the CLI/server parse tests ✅
+
+**Gap:** no real-weight end-to-end `1536_cascade` parity run in this tree — the gated
+variant test only resolves options before weight load.
+
+### US-16.2: Per-stage sampler overrides
+As a user, I can override steps, guidance, rescale and guidance interval per stage.
+
+**Functions:**
+- `runtime/trellis2.rs:Trellis2SamplerOverrides` — `steps`, `guidance_strength`, `guidance_rescale`, `guidance_interval` (`lo,hi`), `rescale_t` ✅
+- `runtime/trellis2.rs:resolve_stage_params()` — pipeline-config defaults <- legacy `--steps` base <- per-stage overrides (override `steps` wins) ✅
+- Config defaults: SS 12 steps / 7.5 guidance / 0.7 rescale / `[0.6, 1.0]` / `rescale_t` 5.0; shape 12 / 7.5 / 0.5 / `[0.6, 1.0]` / 3.0; texture 12 / 1.0 / 0.0 / `[0.6, 0.9]` / 3.0 ✅
+- CLI `--ss-*` / `--shape-*` / `--tex-*` flags (`steps`, `guidance`, `rescale`, `interval`; `rescale_t` is API-only) wired through `trellis2_run_options_from_args` ✅
+
+**Tests:** `trellis2_variants::resolve_stage_params_merge_precedence`, CLI
+`run_trellis2_parses_1536_cascade_and_per_stage_flags` ✅
+
+### US-16.3: Sequential multi-sample runs
+As a user, I can generate N samples with distinct seeds.
+
+**Functions:**
+- `runtime/trellis2.rs:Trellis2Pipeline::run_many_from_path()` /
+  `run_many_with_latents()` — sequential per-sample passes (seed `seed + i`, shared
+  conditioning); NOT batched DiT inference ✅
+- `Trellis2RunOptions::num_samples`; `num_samples = 0` rejected; single-run entry points
+  reject `num_samples != 1` and point at `run_many_*` ✅
+- `cli.rs:sample_output_path()` — `_0`, `_1`, ... suffixes on both the mesh output and
+  `--return-latent` path ✅
+
+**Tests:** `pipeline_trellis2` (`num_samples > 1` rejection and `num_samples = 0`),
+CLI option-mapping tests ✅
+
+### US-16.4: Latent NPZ export
+As a user, I can export the final SLAT latents for parity/tooling.
+
+**Functions:**
+- `runtime/trellis2.rs:Trellis2Stages::write_latent_npz()` — `shape_latent [N,32]` F32,
+  `tex_latent [N,32]` F32 (empty `[0,32]` when texture is off), `coords [N,3]` I32,
+  `resolution` scalar, cascade `lr_shape_latent [N_lr,32]` (empty `[0,32]` otherwise),
+  UTF-8 JSON `meta` (`pipeline_type`, `resolution`, `num_coords`, `cascade`, `hr_resolution`) ✅
+- CLI `--return-latent <path>`; per-sample suffix with `--num-samples > 1` ✅
+
+**Tests:** `trellis2_variants::write_latent_npz_round_trip` (cascade-1536 and 512
+variants) ✅
+
+### US-16.5: Mesh post-processing
+As a user, I get the upstream `to_glb` mesh cleanup before export.
+
+**Functions:**
+- `runtime/trellis2.rs:Trellis2MeshPostprocessOptions` — `enabled` (true),
+  `fill_hole_perimeter` (3e-2), `decimation_target` (1,000,000 triangles),
+  `min_component_area` (1e-5) ✅
+- `geometry/mesh_ops.rs:postprocess_mesh()` — fill holes -> simplify -> duplicate-face /
+  non-manifold repair -> small-component removal -> fill holes -> simplify -> cleanup ->
+  fill holes -> orientation unification -> vertex compaction ✅
+- `geometry/mesh_ops.rs:simplify_mesh()` — deterministic meshopt quadric
+  simplifier with `Permissive` collapses (required for the non-manifold
+  O-Voxel dual-grid topology; without it meshopt stalls above the target);
+  `decimation_target = 0` skips both simplify passes (cleanup only) ✅
+- CLI `--no-postprocess`, `--decimation-target`, `--fill-hole-perimeter`,
+  `--min-component-area`; applied BEFORE `attach_texture` so PBR sampling sees the final
+  vertices ✅
+
+**Tests:** `mesh_ops` unit suite (26 tests), `pipeline_trellis2`
+(`pipeline_golden_mesh_postprocess_options`), `run_args` postprocess flag tests ✅
+
+**Caveat:** cleanup/decimation are clean-room ports driven by the meshopt simplifier, not
+cumesh; topology changes can differ from the reference.
+
+---
+
+## 17. TRELLIS.2 Texturing Pipeline (Existing Meshes)
+
+### US-17.1: `--texture-mesh` end-to-end
+As a user, I can texture an existing mesh from one condition image and write a textured GLB.
+
+**Functions:**
+- `runtime/trellis2_texture.rs:Trellis2TexturingOptions` — `seed` (42), `resolution`
+  (512|1024, default 1024), `tex_sampler` overrides, `texture_size` (2048),
+  `preprocess_image` / `preprocess_mesh` ✅
+- `runtime/trellis2_texture.rs:preprocess_mesh_for_texturing()` — center, scale by
+  `0.99999 / max_extent`, y/z swap `(x, y, z) -> (x, -z, y)`; rejects empty, non-finite,
+  degenerate and out-of-range meshes ✅
+- `runtime/trellis2_texture.rs:Trellis2Pipeline::texture_mesh()` /
+  `texture_mesh_from_path()` — preprocess mesh + image, voxelize, encode shape SLAT,
+  sample texture SLAT, guided texture VAE decode, UV unwrap + bake ✅
+- `geometry/dual_grid.rs:mesh_to_flexible_dual_grid()` — O-Voxel CPU voxelization
+  (`MeshToDualGridOptions::for_shape_slat_encoder`: explicit `[-0.5, 0.5]^3` aabb,
+  `boundary_weight = 0.2`, `regularization_weight = 1e-2`) ✅
+- `runtime/trellis2_shape_enc.rs:Trellis2ShapeEncoder` — `FlexiDualGridVaeEncoder`
+  (`shape_enc_next_dc_f16c32_fp16`, 284 tensors; 6-channel input, four S2C downsamples,
+  latent on the `resolution / 16` grid); `concat_dual_grid_input()` builds the
+  3 offset + 3 intersection channels ✅
+- `runtime/trellis2_texture.rs:synthesize_tex_guide_subs()` — rebuilds the upstream
+  `SparseSpatial2Channel` cache as occupancy guide logits from the voxelization chain,
+  then validates the guided decode reconstructs the voxel set ✅
+- `runtime/trellis2_texture.rs:Trellis2Pipeline::load_shape_encoder()` /
+  `load_trellis2_shape_encoder_from_model_assets()` — raw stage file,
+  `external/shape_enc/model.safetensors` beside a canonical/GGUF package, or
+  `shape_enc.*` keys in a merged canonical package ✅
+- `runtime/trellis2.rs:build_trellis2_textured_mesh()` — xatlas unwrap + area-weighted
+  normals + PBR bake into `Trellis2Stages::textured` ✅
+- `export/trellis2.rs:Trellis2ExportStage::write_textured_glb()` — embedded PNGs, UVs,
+  normals, glTF axis conversion + V flip ✅
+
+**Tests:** `trellis2_texture` (12 tests: preprocess goldens, option validation, guide
+replay, shape-encoder load/missing-checkpoint errors, gated coord chain, env-gated
+`texture_mesh_run_e2e`), `trellis2_shape_enc` (5: 284 tensor names, tiny forward,
+determinism, Python-oracle golden), `dual_grid` (9 unit tests) ✅
+
+**Gap:** the production-resolution `texture_mesh_run_e2e` is opt-in
+(`LUX3D_TRELLIS2_RUN_TEXTURE_E2E=1`, CPU by default) and no GPU end-to-end run is recorded
+in this tree.
+
+### US-17.2: Mesh input formats
+As a user, I can texture `.glb`, `.obj`, `.ply` or `.stl` inputs.
+
+**Functions:**
+- `export/import.rs:load_mesh()` — extension dispatch ✅
+- `read_obj()` — ASCII `v`/`f`, fan-triangulation, `v`, `v/vt`, `v//vn`, `v/vt/vn`,
+  1-based positive and negative relative indices; `vt`/`vn`/groups/materials ignored ✅
+- `read_ply()` — ASCII and binary little-endian; arbitrary vertex property order;
+  `vertex_indices`/`vertex_index` face lists, fan-triangulated; big-endian/compressed
+  variants rejected ✅
+- `read_glb()` — glTF 2.0 JSON+BIN, active scene or all meshes, static node matrix/TRS
+  (unit quaternion), u8/u16/u32 indices, f32 positions; Draco/meshopt/sparse accessors
+  rejected; skins ignored (bind pose) ✅
+- `read_stl()` — ASCII and binary; exact-bit vertex dedup (no epsilon welding) ✅
+- All readers reject empty meshes, non-finite coordinates, out-of-range faces, and drop
+  index-degenerate triangles without reordering ✅
+
+**Tests:** `export::import` (19 unit tests: OBJ/PLY/GLB/STL round trips and rejections) ✅
+
+### US-17.3: Texturing CLI surface and limits
+As a user, I know exactly which flags apply and what the output contains.
+
+**Functions:**
+- CLI `--texture-mesh <file>`, `--texture-resolution 512|1024`,
+  `--no-preprocess-mesh`, `--no-preprocess-image`, shared `--seed` / `--texture-size` /
+  `--tex-*` overrides; `validate_trellis2_texturing_mode()` rejects `.glb`-incompatible
+  output extensions and image-to-3D-only flags ✅
+- Output: one textured `.glb`; no `<stem>.pbrvox.bin` / `<stem>.pbr.json` sidecar ✅
+
+**Limits/approximations:**
+- Existing input UVs are not preserved; the atlas is always re-unwrapped. Duplicate-position
+  vertices (including `repair_non_manifold_edges` splits) are welded before charting, UV seams
+  duplicate vertices, and xatlas' non-parameterizable (zero-area) faces are dropped from the
+  atlas index buffer ✅
+- No cleanup, decimation, component removal or remeshing in texturing mode; input topology
+  is kept except for the UV split ✅
+- The shape encoder runs F32; upstream `use_fp16 = true` casts the block torso. The
+  fixture manifest records ~1.3e-2 max mean-latent delta from the F16 reference ✅
+- Guide logits are occupancy constants (`+1`/`-1`), not learned `to_subdiv` outputs; the
+  decoder's child row order differs from the upstream cache but downstream sampling is
+  order-insensitive ✅
+- xatlas approximates the cumesh unwrap: no normal-cone threshold or `smooth_strength`
+  mapping, `max_iterations = 1`, two-pass packing for an exact `texture_size` atlas;
+  extra atlases are merged vertically into one UV frame ✅
+- xatlas + bake are CPU-bound: ~42 s unwrap + ~9 s bake for an 80k-triangle sphere at
+  2048 (release build, this tree); cost scales with `texture_size^2` ✅
+- Uncovered texels use a TELEA approximation (onion-peel, `1/d^2`), not `cv2.inpaint` ✅
+
+**Weight requirement:** the merged canonical/GGUF file has no `shape_enc` stage. The
+encoder loads `<model-dir>/ckpts/shape_enc_next_dc_f16c32_fp16.safetensors` (raw
+checkpoint layout) or `<model-dir>/external/shape_enc/model.safetensors` (sidecar next
+to a canonical `model.gguf`); `shape_enc.*` keys in a merged safetensors package are
+also honored. A q8\_0 GGUF + external fp16 encoder + `external/dinov3` package completed
+the CUDA texturing smoke (`--texture-resolution 512 --texture-size 512`) on the q8 512
+shape output (507,540 vertices / 1,000,200 faces): 3,241 charts, 2 atlases, 110,789 valid
+texels, 30 MB PBR GLB with base-color and metallic-roughness PNGs. A geometry-only q8 1024
+run (`--no-postprocess`, 12,679,988 faces) unwraps to 164 charts / 2 atlases at 512 in
+647 s, confirming chart count tracks connected components (plus normal-based splitting),
+not raw face count. Geometry-only q8\_0 512 smoke on the same package also passed on
+Vulkan (484 s) and WGPU (2-step run, 736 s; a 12-step WGPU run was still going after
+~40 min and was stopped) with `cpu_fallback=0` and valid `[-0.5, 0.5]` GLBs — WGPU is
+functional for TRELLIS.2 but impractically slow for q8 today (debug CLI timings).
+
+**Tests:** CLI `run_args` texture-mesh mapping/rejection cases; `trellis2_texture`
+missing-checkpoint test ✅
+
+---
+
+## 18. TripoSG Reference Run Options
+
+### US-18.1: `--faces` post-process
+As a user, I can cap the extracted triangle count.
+
+**Functions:**
+- `runtime/triposg.rs:extract_mesh()` — runs the postprocess only when
+  `faces > 0` and the mesh has more faces than the target; no-op at/above target ✅
+- `geometry/mesh_ops.rs:merge_close_vertices()` — pymeshlab
+  `meshing_merge_close_vertices` equivalent (spatial hash, first-index representative,
+  threshold 1/10000 of the bbox diagonal) ✅
+- `geometry/mesh_ops.rs:simplify_mesh()` — meshopt quadric-style simplifier to the target
+  face count ✅
+
+**Tests:** `pipeline_triposg` (`--faces` smoke), `runtime_triposg` option validation,
+`run_args` (`--faces 0` accepted, `-1` rejected) ✅
+
+**Caveat:** decimation is meshopt, not pymeshlab's quadric edge collapse; face counts are
+honored, but vertex placement/topology can differ from the upstream script.
+
+### US-18.2: `--dtype` load precision
+As a user, I can load DINOv2/DiT/VAE in F32 or F16.
+
+**Functions:**
+- `runtime/triposg.rs:TripoSgPipeline::load_with_dtype()` /
+  `load_with_rmbg_and_dtype()` — pipeline-wide load/compute dtype; public outputs are F32 ✅
+- CLI `--dtype f32|f16|bf16` -> `DTypeKind` -> `candle_core::DType` ✅
+
+**Tests:** `pipeline_triposg::pipeline_f16_smoke` (F16 load, DINOv2 forward, VAE decode;
+public outputs F32), CLI dtype mapping/unknown-value tests ✅
+
+**Caveats:** F16 DiT forward is not exercised by the CPU smoke (load + DINO + VAE decode
+only); BF16 is accepted by the CLI but has no runtime test and is unverified.
+
+### US-18.3: `--bounds` and `--timesteps`
+As a user, I can override the SDF query window and the denoise schedule.
+
+**Functions:**
+- `runtime/triposg.rs:TripoSgRunOptions::effective_bounds()` — canonical
+  `[-1.005, 1.005]^3` default; override is `[min_x, min_y, min_z, max_x, max_y, max_z]`,
+  finite with `min < max` per axis; both flash and hierarchical decode paths use it and
+  keep the absolute world frame ✅
+- `runtime/triposg_dit.rs:RectifiedFlowSchedule::from_timesteps()` — sigmas =
+  `t / 1000` with the shift, terminal 0, step count = list length; `--steps` ignored when
+  set ✅
+- Validation: non-empty finite timesteps; no monotonicity requirement (upstream behavior) ✅
+
+**Tests:** `runtime_triposg` (`rectified_flow_from_timesteps_*` 3 tests),
+`pipeline_triposg` (far-window bounds in both decode paths, explicit canonical-bounds
+equality), `flash_triposg::flash_dmc_honors_bounds_override`, `run_args` parse/validation ✅
+
+---
+
+## 19. Working-Tree Test Inventory
+
+Counts are `#[test]` declarations; gated suites skip without their weights/fixtures.
+
+| Suite / file | Tests | Scope |
+|---|---:|---|
+| `crates/lux3d-core/tests/trellis2_texture.rs` | 12 | mesh preprocess goldens, option validation, guide synthesis, shape-encoder load/missing errors, gated coord chain, env-gated e2e |
+| `crates/lux3d-core/tests/trellis2_variants.rs` | 5 | four-variant dispatch, sampler precedence, 1536 token budget, latent npz, gated variant smoke |
+| `crates/lux3d-core/tests/trellis2_shape_enc.rs` | 5 | 284-tensor name coverage, tiny forward/determinism, Python-oracle golden |
+| `crates/lux3d-core/tests/vggt_track.rs` | 5 | track tensor-name coverage, bilinear sampler, CPU structural forward, query validation |
+| `crates/lux3d-core/src/export/colmap.rs` (unit) | 2 | COLMAP binary write + parse-back, confidence gate + point cap |
+| `crates/lux3d-core/src/geometry/mesh_ops.rs` (unit) | 26 | hole fill, simplify, cleanup, orientation, merge-close, postprocess order |
+| `crates/lux3d-core/src/geometry/dual_grid.rs` (unit) | 9 | voxelization invariants, encoder frame, roundtrip extraction, malformed input |
+| `crates/lux3d-core/src/geometry/uv_atlas.rs` (unit) | 7 | atlas validity/determinism/seam map, duplicate-position weld (soup + vmapping), area-weighted normals |
+| `crates/lux3d-core/src/geometry/pbr_bake.rs` (unit) | 8 | constant/gradient bake, MR packing, inpaint, boundary clamp, determinism |
+| `crates/lux3d-core/src/export/glb_textured.rs` (unit) | 3 | embedded PNG/material, alpha modes, axis/V conversion, rejections |
+| `crates/lux3d-core/src/export/import.rs` (unit) | 19 | OBJ/PLY/GLB/STL readers, transforms, dispatch, malformed input |
+| `crates/lux3d-core/src/export/trellis2.rs` (unit) | 3 | textured cube atlas -> bake -> GLB parse-back, clean skips, size validation |
+| `crates/lux3d-core/tests/trellis2_export.rs` | 9 | PBR sidecars, vertex colors, glTF axis conversion |
+| `crates/lux3d-core/tests/pipeline_trellis2.rs` | 8 | golden mesh postprocess, num-samples validation, run options |
+| `crates/lux3d-core/tests/trellis2_cascade.rs` | 12 | cascade parity/gating |
+| `crates/lux3d-core/tests/runtime_triposg.rs` | 14 | TripoSG golden/runtime; 3 new timestep-schedule tests |
+| `crates/lux3d-core/tests/pipeline_triposg.rs` | 5 | seeded/golden runs, bounds/faces smoke, F16 smoke |
+| `crates/lux3d-core/tests/flash_triposg.rs` | 12 | flash SDF/DMC parity; bounds-override test |
+| `crates/lux3d-core/tests/vggt_preprocess.rs` | 8 | crop/pad parity, alpha/rounding, single-image source |
+| `crates/lux3d-core/tests/runtime_vggt.rs` | 4 | F32 parity; dtype/default selection, batch-size 0 rejection |
+| `crates/lux3d-cli/tests/run_args.rs` | 22 | CLI parse/mapping/rejection for TRELLIS.2, VGGT, TripoSG flags |
+
+Also touched: `crates/lux3d-core/tests/vggt_export.rs` (fixture gains empty `pose_enc_list`),
+`crates/lux3d-core/tests/trellis2_cascade.rs`,
+`crates/lux3d-core/tests/pipeline_trellis2.rs`,
+`crates/lux3d-core/tests/trellis2_export.rs`,
+`crates/lux3d-core/tests/runtime_triposg.rs`,
+`crates/lux3d-core/tests/pipeline_triposg.rs`,
+`crates/lux3d-core/tests/flash_triposg.rs`,
+`crates/lux3d-core/tests/vggt_preprocess.rs`.
+
+---
+
+## 20. Known Gaps, Exclusions & Approximations
+
+- **Metal:** CI builds `lux3d-core` with `--features metal` and runs the lib/quant-probe
+  checks; no model inference parity is validated in this repository.
+- **Laya:** not used by this workspace.
+- **TRELLIS.2 texturing weights:** the merged canonical/GGUF weight file lacks
+  `shape_enc`; `--texture-mesh` needs the raw stage file or an
+  `external/shape_enc/model.safetensors` sidecar (plus `external/dinov3` for the
+  quantized canonical-GGUF layout). A package with neither fails with a clear error.
+- **TRELLIS.2 `1536_cascade`:** variant dispatch and token-budget math are tested; no
+  real-weight end-to-end run is recorded.
+- **TRELLIS.2 remesh branch:** the cumesh narrow-band dual-contouring remesh path is not
+  implemented. The mesh stays the extracted O-Voxel dual-grid surface plus the cleanup
+  postprocess.
+- **TRELLIS.2 approximations:** meshopt simplification/cleanup vs cumesh; xatlas vs cumesh
+  unwrap; TELEA-approximation inpaint vs `cv2.inpaint`; synthesized occupancy guides vs
+  upstream sparse caches.
+- **TRELLIS.2 WGPU throughput:** q8 WGPU inference is functionally correct but very slow
+  (2 steps in 736 s with the debug CLI; a 12-step run was stopped after ~40 min), versus
+  CUDA 177 s / Vulkan 484 s for 12 steps. Treat WGPU as experimental for TRELLIS.2.
+- **VGGT tracking:** explicit query points only. Automatic query selection (ALIKED/SP
+  keypoints, DINO query-frame ranking), multi-query-frame reordering and non-visible track
+  completion are not implemented.
+- **VGGT contract drift:** the static contract has no `track_head` entry (the
+  `NeuralSpec::track_head` field deserializes to `None`) and still lists the
+  `vggt_track_head` exclusion while `runtime/vggt_track.rs` implements the head;
+  `tests/contracts.rs`/`tests/model_spec.rs` assert the old metadata and need
+  regeneration/update.
+- **VGGT COLMAP export:** 3D points come from the point-head `world_points` (upstream
+  `demo_colmap.py` unprojects depth), and point limiting is a deterministic evenly-spaced
+  subsample instead of upstream's seeded random choice.
+- **VGGT dtypes:** F32 is the parity mode. F16/BF16 are wired but the automated numeric
+  suite is F32/CUDA-only; BF16 is unverified.
+- **TripoSG scribble:** not implemented (weights unavailable).
+- **TripoSG `--faces`:** meshopt quadric simplification approximates pymeshlab quadric
+  edge collapse.
+- **Server surfaces:** the HTTP mesh API keeps one sample, default postprocess/texture
+  export, and has no `--texture-mesh`/per-stage/`--return-latent` knobs; TRELLIS.2 jobs
+  write the vertex-color mesh + PBR sidecars, not an embedded-texture GLB.
+- **Quantization:** TRELLIS.2 DiT-only GGUF policy is unchanged; the texturing-only
+  `shape_enc` checkpoint is outside the canonical package and is never quantized.
 
 ---
 
@@ -636,4 +1058,7 @@ exclusions.
 | Error Types | 2 | N/A |
 | Vision Preproc | 1 | None |
 | **Total** | **~206** | **~10%** |
+
+*This table predates sections 15-20. The working-tree additions and their suites are
+inventoried in section 19; the older counts above are not recomputed.*
 

@@ -44,17 +44,19 @@ Supported model families:
 - `pi3`
 - `pi3x`
 - `triposr`
-- `vggt` — VGGT-1B multi-view point/depth/camera inference. Original weights are
-  CC-BY-NC-4.0 (non-commercial); the commercial checkpoint is distributed separately.
+- `vggt` — VGGT-1B multi-view point/depth/camera inference with optional COLMAP export,
+  depth unprojection and explicit-query tracking. Original weights are CC-BY-NC-4.0
+  (non-commercial); the commercial checkpoint is distributed separately.
 - `triposg` — TripoSG image-to-mesh inference (DINOv2-large encoder, 21-block rectified-flow
   DiT, SDF VAE decoder/encoder, reference-default flash decoder + clean-room DiffDMC). MIT
   licensed; the BriaRMBG 1.4 fallback for RGB input ships as the separate `rmbg-1.4` package
   under the BRIA license.
 - `trellis2` — TRELLIS.2-4B image-to-3D inference (DINOv3 ViT-L/16 encoder, SS flow DiT,
   shape/texture SLAT flow transformers, FlexiDualGrid VAE, O-Voxel dual-grid mesh with PBR
-  vertex attributes). Reference-default `1024_cascade` pipeline at 12 steps per stage,
-  guidance 7.5, seed 42. Code and model card are MIT; the bundled DINOv3 encoder is a
-  separately licensed gated Meta model. RGB inputs run the reference RMBG-2.0/BiRefNet
+  vertex attributes) plus a texturing pipeline for existing meshes (`--texture-mesh`).
+  Reference-default `1024_cascade` pipeline at 12 steps per stage, SS/shape guidance 7.5
+  (texture guidance 1.0), seed 42. Code and model card are MIT; the bundled DINOv3 encoder
+  is a separately licensed gated Meta model. RGB inputs run the reference RMBG-2.0/BiRefNet
   background remover, shipped as the separate `rmbg-2.0` package under CC-BY-NC-4.0;
   inputs with a usable alpha channel skip background removal.
 
@@ -118,8 +120,13 @@ python -I tools/python_baseline/normalize_weights.py --family rmbg2 `
 ```
 
 TRELLIS.2 normalization packs the flat `microsoft/TRELLIS.2-4B` layout (seven
-`ckpts/*.json` + `*.safetensors` checkpoint pairs plus the DINOv3 config/model files)
-into the canonical package layout that `Trellis2Pipeline::load` and the server expect.
+`ckpts/*.json` + `*.safetensors` checkpoint pairs, the external `ss_dec` sparse
+structure decoder, and the DINOv3 config/model files) into the canonical package
+layout that `Trellis2Pipeline::load` and the server expect. The texturing-only shape encoder is not packed into
+the merged canonical weight file. `--texture-mesh` loads it from the raw
+`ckpts/shape_enc_next_dc_f16c32_fp16.safetensors`, or from
+`external/shape_enc/model.safetensors` beside a canonical `model.gguf`
+(see the TRELLIS.2 notes under Run Inference).
 
 ### Quantize Weights to GGUF
 
@@ -478,6 +485,16 @@ cargo run -p lux3d-cli -- run vggt --model-path <canonical-vggt-dir> --source <i
 # VGGT canonical package auto-download (oxide-lab/VGGT-1B)
 cargo run -p lux3d-cli -- run vggt --source <input-sequence> --output <output-file.ply>
 
+# VGGT pad preprocessing, f16 weights, sequential 2-frame chunks, COLMAP feedforward
+# export + depth-unprojected point cloud next to the default confidence-filtered PLY
+cargo run -p lux3d-cli -- run vggt --model-path <canonical-vggt-dir> --source <input-sequence> --preprocess-mode pad --vggt-dtype f16 --batch-size 2 --colmap-dir <sparse-dir> --depth-points <depth.ply> --output <output-file.ply>
+
+# VGGT from a single image file (one-frame scene)
+cargo run -p lux3d-cli -- run vggt --source <image.png> --output <output-file.ply>
+
+# VGGT explicit track queries -> tracks JSON (automatic query selection is NOT included)
+cargo run -p lux3d-cli -- run vggt --source <input-sequence> --track-queries '[{"frame":0,"x":259,"y":259}]' --track-output tracks.json --output <output-file.ply>
+
 # TripoSG -> GLB (defaults: 50 rectified-flow steps, CFG 7.0, seed 42, flash decoder depth 9)
 cargo run -p lux3d-cli --features cuda -- run triposg --rmbg-model-path <canonical-rmbg-dir> --model-path <canonical-triposg-dir> --source <input-image> --output <output-file.glb>
 # Flash decoder is the reference default; disable it for dense/hierarchical marching cubes:
@@ -488,11 +505,24 @@ cargo run -p lux3d-cli --features cuda -- run triposg --model-path <canonical-tr
 # TripoSG canonical package auto-download (oxide-lab/TripoSG); RMBG 1.4 is a separate package
 cargo run -p lux3d-cli --features cuda -- run triposg --source <input-image> --output <output-file.glb>
 
+# Reference post-process/load knobs: `--faces <n>` (target face count after merge-close +
+# meshopt quadric simplification — a clean-room approximation of upstream pymeshlab; 0 = off,
+# the upstream `-1` equivalent; no-op at/above the current face count), `--timesteps` (explicit
+# schedule override, replaces `--steps`), `--bounds` (SDF query window `min_x,...,max_z` in the
+# normalized model frame; a single scalar `b` means the symmetric cube `[-b, b]`), `--dtype` (`f32`
+# reference; `f16` has load/DINO/VAE smoke coverage;
+# `bf16` is accepted but unverified)
+cargo run -p lux3d-cli --features cuda -- run triposg --model-path <canonical-triposg-dir> --source <input-image> --faces 50000 --timesteps 999,777,500,250,0 --bounds "-1.1,-1.1,-1.1,1.1,1.1,1.1" --dtype f16 --output <output.glb>
+
 # TRELLIS.2 -> textured GLB + PBR sidecar from a canonical package
-# (defaults: 1024_cascade pipeline, 12 steps per sampler, guidance 7.5, seed 42, texture on).
+# (defaults: 1024_cascade pipeline, 12 steps per sampler, SS/shape guidance 7.5,
+# texture guidance 1.0, seed 42, texture on).
 # RGB inputs need the separate RMBG-2.0 package; a sibling `rmbg-2.0`/`RMBG-2.0`
 # directory next to --model-path is discovered automatically.
 cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <canonical-trellis2-dir> --rmbg-model-path <canonical-rmbg2-dir> --source <input-image> --output <output-file.glb>
+# Textured-GLB bake edge length override (default 2048; the CLI accepts 64..=8192, multiples of 8;
+# `--no-texture-export` skips the UV unwrap + bake entirely, `--no-uv-unwrap` skips just the unwrap):
+cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <canonical-trellis2-dir> --rmbg-model-path <canonical-rmbg2-dir> --source <input-image> --texture-size 2048 --output <output-file.glb>
 # Geometry-only run (no texture SLAT / tex VAE / PBR sidecar):
 cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <canonical-trellis2-dir> --rmbg-model-path <canonical-rmbg2-dir> --source <input-image> --texture false --output <output-file.glb>
 # Faster 512-preview pipeline with overrides:
@@ -500,13 +530,24 @@ cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <canonical-t
 # The raw microsoft/TRELLIS.2-4B checkpoint directory (pipeline.json + ckpts/) is accepted as-is:
 cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <raw-TRELLIS.2-4B-dir> --rmbg-model-path <raw-RMBG-2.0-dir> --source <input-image> --output <output-file.glb>
 
+# TRELLIS.2 texturing of an existing mesh (upstream Trellis2TexturingPipeline):
+# --source is the condition image, --texture-mesh accepts .glb/.obj/.ply/.stl, output must be .glb.
+# The shape encoder comes from the raw `ckpts/shape_enc_next_dc_f16c32_fp16.safetensors`
+# or from `external/shape_enc/model.safetensors` in a canonical/GGUF package dir.
+# `--texture-resolution` 512|1024 (default 1024).
+cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <raw-TRELLIS.2-4B-dir> --rmbg-model-path <raw-RMBG-2.0-dir> --source <condition-image> --texture-mesh <input-mesh.glb> --texture-resolution 1024 --output textured.glb
+
 # Auto-download canonical packages from Hugging Face into the user cache
 cargo run -p lux3d-cli --features cuda -- run pi3 --source <input-sequence> --output <output-file.ply>
 ```
 
-**Output formats:** mesh commands (`triposr`, `triposg`, `trellis2`) select the writer from the output extension: `.glb` (primary/default), `.obj`, `.ply` (`.stl` is not available for `trellis2`). Point-cloud commands (`pi3`, `pi3x`, `vggt`) use `.ply` (primary) or `.xyz`. The HTTP mesh API defaults to GLB and accepts `options.output_format`; the point-cloud API defaults to PLY and accepts `options.output_format` (`ply`/`xyz`). A textured `trellis2` run additionally writes a `<stem>.pbrvox.bin` + `<stem>.pbr.json` sidecar pair next to the output: the sparse-voxel PBR vertex attributes (6 channels) live outside the GLB/OBJ/PLY mesh formats, so the sidecar preserves them losslessly.
+**Output formats:** mesh commands (`triposr`, `triposg`, `trellis2`) select the writer from the output extension: `.glb` (primary/default), `.obj`, `.ply` (`.stl` is not available for `trellis2`). Point-cloud commands (`pi3`, `pi3x`, `vggt`) use `.ply` (primary) or `.xyz`. The HTTP mesh API defaults to GLB and accepts `options.output_format`; the point-cloud API defaults to PLY and accepts `options.output_format` (`ply`/`xyz`). A textured `trellis2` `.glb` CLI run embeds the baked base-color + metallic-roughness PNG textures with UV coordinates and converted normals (upstream `to_glb` textured-GLB parity) and additionally writes a `<stem>.pbrvox.bin` + `<stem>.pbr.json` sidecar pair next to the output: the sparse-voxel PBR vertex attributes (6 channels) live outside the GLB/OBJ/PLY mesh formats, so the sidecar preserves them losslessly. `.obj`/`.ply`/`.stl` `trellis2` outputs never embed textures — they keep the per-vertex-color PLY/GLB or positions-only OBJ mesh (the textured GLB writer requires a `.glb` output). The HTTP server does not expose the textured-GLB or postprocess knobs: `trellis2` mesh jobs write the vertex-color mesh plus the PBR sidecars in the job workspace (the sidecars are not served through `/content`), not an embedded-texture GLB. `--texture-mesh` always writes a textured `.glb` and no PBR sidecar.
 
-> **TRELLIS.2 notes:** `--pipeline-type` accepts `512`, `1024`, or `1024_cascade` (reference default). The single-resolution `1024` path and the 1536-token cascade are not implemented yet and fail at run time. The reference preprocessing is reproduced exactly: LANCZOS max-side downscale, alpha path when RGBA carries non-opaque alpha, otherwise RMBG-2.0/BiRefNet produces the mask (missing RMBG weights is an error — never an opaque fallback), then the alpha>0.8 bbox, Pillow-rounded square crop, premultiply and resize. Mesh post-processing (`fill_holes`, decimation) and texture-atlas UV unwrapping are excluded; the mesh is the O-Voxel dual-grid surface with per-vertex PBR colors in the sidecar. Weight stages load sequentially (~7.8 GiB measured peak on `1024_cascade` with the texture stages resident); CPU inference works but is slow. Auto-download from `oxide-lab/TRELLIS.2-4B` is reserved but not yet published, so pass an explicit `--model-path` (canonical package or raw checkpoint directory).
+> **VGGT notes:** `--source` accepts a frame directory (`.png`/`.jpg`/`.jpeg`), a video file (`.mp4`/`.mov`/`.avi`/`.mkv`) or a single image file (`.png`/`.jpg`/`.jpeg`/`.webp`/`.bmp`/`.tif`/`.tiff`, a one-frame scene). `--preprocess-mode` selects `crop` (upstream default: resize to width 518, center-crop rows taller than 518, then white-pad to the batch maximum) or `pad` (largest side 518, center-padded white 518x518 square, no pixels discarded — use it when the framing matters). `--vggt-dtype f32|f16|bf16` selects the network load dtype (`f32` is the reference mode; public outputs stay f32; separate from the TripoSG `--dtype` flag) — F16/BF16 are wired, but the automated parity suite is F32/CUDA-only and BF16 is unverified. `--batch-size N` splits the frame list into sequential chunks of N frames run as independent B=1 passes: it bounds peak VRAM but is NOT one attention pass over all frames — cross-frame attention only sees frames inside their chunk, so chunked results differ from a single full-scene pass whenever the scene spans multiple chunks (default 1; 0 is rejected; a value >= the frame count is a plain single pass). `--colmap-dir` writes a COLMAP binary sparse model (`cameras.bin`/`images.bin`/`points3D.bin`) in the upstream `demo_colmap.py` feedforward mode: one PINHOLE camera per image, point-head `world_points` gated by `depth_conf >= --colmap-conf-threshold` (default 5.0) and capped at `--colmap-max-points` (default 100000, deterministic evenly-spaced subsample — upstream uses seeded `np.random.choice`), intrinsics rescaled to the original resolution; directory sources keep their frame file names and video/single-image sources write `image_N`; the run prints the export stats. `--depth-points <path>` unprojects the depth maps to a world-space PLY/XYZ point cloud (`depth_conf > --depth-conf-threshold`, default 1.0). `--track-queries '<json>'` tracks explicit query points (`{"frame":0,"x":F,"y":F}` objects or `[0,x,y]` arrays; pixel coordinates in the model input resolution with x/y in [0, 518); the query frame must be 0 — rotate the clip so the desired query frame comes first) and writes `{"coords": [[[x,y],...],...], "visibility": [[...],...], "confidence": [[...],...]|null}` to `--track-output` (default `<source-stem>_tracks.json`) using `--track-iters` refinement iterations (default 4; 0 is rejected). Automatic query selection (ALIKED/SP keypoints, DINO query-frame ranking) is NOT included: explicit queries are required, and `--batch-size` chunking > 1 is rejected together with tracking (the track pass runs over all frames at once). `--track-points-ply <path>` writes one colored vertex per query (frame-0 world point at the query pixel). `--dump-npz` keeps the raw inference tensors (including the stacked `pose_enc_list`, `[K, S, 9]`, one entry per camera refinement iteration) and works with the track/COLMAP/depth flags.
+
+> **TRELLIS.2 notes:** `--pipeline-type` accepts `512`, `1024`, `1024_cascade` (reference default), or `1536_cascade` (cascade targeting the 1536 grid with the hardcoded 1024 token-budget stop; the 1024 cascade always decodes at 1024). Variant dispatch and the 1536→…→1024 token-budget loop are covered by tests, but no real-weight end-to-end `1536_cascade` parity run is recorded in this tree. The `--steps` flag feeds all three samplers; per-stage overrides (`--ss-steps/--shape-steps/--tex-steps`, `--ss-guidance/--shape-guidance/--tex-guidance`, `--ss-rescale/--shape-rescale/--tex-rescale`, `--ss-interval/--shape-interval/--tex-interval` as `lo,hi`) replace the per-stage defaults when set (`resolve_stage_params`: a stage `steps` override wins over `--steps`). `--num-samples N` runs N sequential passes seeded `seed + i` with shared conditioning — not batched inference — and suffixes outputs and latent files `_0`, `_1`, ... (`N = 1` is the single-run path); `--return-latent <path>` writes `shape_latent`/`tex_latent`/`coords`/`resolution`/`lr_shape_latent`/`meta` as `.npz` (upstream `return_latent` surface). The reference preprocessing is reproduced exactly: LANCZOS max-side downscale, alpha path when RGBA carries non-opaque alpha, otherwise RMBG-2.0/BiRefNet produces the mask (missing RMBG weights is an error — never an opaque fallback), then the alpha>0.8 bbox, Pillow-rounded square crop, premultiply and resize. Mesh post-processing (upstream `to_glb` order: fill holes, two simplify passes, duplicate-face/non-manifold repair, small-component removal, orientation unification) runs by default; `--no-postprocess` disables it and `--decimation-target` (default 1000000; 0 = cleanup only)/`--fill-hole-perimeter` (3e-2; 0 = off)/`--min-component-area` (1e-5; 0 = keep all) override its parameters. Cleanup and decimation are clean-room ports on the meshopt simplifier, not cumesh, so topology changes can differ from the reference. When `--texture` is on (the default), the textured-GLB export stage reproduces the upstream `to_glb` UV unwrap + PBR bake: `--texture-size <n>` sets the bake edge length (default 2048; the CLI accepts any value in 64..=8192 — the upstream reference only allows 1024..4096 in steps of 1024, and the core adds an nvdiffrast-parity multiple-of-8 rule) and the `.glb` output embeds the baked base-color + metallic-roughness PNGs with TEXCOORD UVs, area-weighted normals and the upstream glTF axis conversion `(x, y, z) -> (x, z, -y)`. `--no-texture-export` skips the whole stage and `--no-uv-unwrap` skips just the xatlas unwrap (both fall back to the vertex-color mesh; `.obj`/`.ply`/`.stl` outputs never embed textures). The xatlas unwrap + bake run on the CPU — measured ~42 s unwrap + ~9 s bake for an 80k-triangle sphere at 2048 (release build, this tree), scaling with `--texture-size` squared. Uncovered atlas texels are filled with a TELEA-approximation inpaint (iterative nearest-valid onion-peel), not the reference `cv2.inpaint`; the run prints `[bake]` stats (charts, atlases, atlas size, texture size, valid/inpainted texel counts). The mesh stays the O-Voxel dual-grid surface and the `<stem>.pbrvox.bin` + `<stem>.pbr.json` sidecar pair remains the lossless per-voxel PBR record. Weight stages load sequentially (~7.8 GiB measured peak on `1024_cascade` with the texture stages resident); CPU inference works but is slow. Auto-download from `oxide-lab/TRELLIS.2-4B` is reserved but not yet published, so pass an explicit `--model-path` (canonical package or raw checkpoint directory).
+
+> **TRELLIS.2 texturing mode:** `--texture-mesh <file>` textures an existing `.glb`/`.obj`/`.ply`/`.stl` mesh from the `--source` condition image (upstream `Trellis2TexturingPipeline`) instead of running image-to-3D. It preprocesses the mesh into `[-0.5, 0.5]^3` (center/scale to 0.99999 + y/z swap; `--no-preprocess-mesh` requires the input already in that frame), voxelizes to the flexible dual grid at `--texture-resolution` (512 or 1024, default 1024), encodes a raw shape SLAT with `shape_enc_next_dc_f16c32_fp16`, samples `tex_dit_512`/`tex_dit_1024` with the `--tex-*` overrides, decodes with synthesized occupancy guides, and bakes the UV atlas. Input UVs are not preserved (the atlas is always re-unwrapped); cleanup/decimation/remeshing are not run (UV seams duplicate vertices and zero-area faces are dropped). `--texture-mesh` requires a `.glb` output, rejects `--pipeline-type`/`--max-num-tokens`/`--num-samples`/`--return-latent`/`--no-postprocess`/`--decimation-target`/`--no-texture-export`/`--no-uv-unwrap`/`--texture false`, and writes only the textured GLB (no PBR sidecar). Only `--tex-*`, `--seed`, `--texture-size`, `--texture-resolution` and `--no-preprocess-image`/`--no-preprocess-mesh` apply; `--steps`/`--ss-*`/`--shape-*` are not rejected but have no effect in this mode. The shape encoder is resolved from `<model-dir>/ckpts/shape_enc_next_dc_f16c32_fp16.safetensors` (raw checkpoint layout), `<model-dir>/external/shape_enc/model.safetensors` (sidecar next to a merged canonical/GGUF package), or `shape_enc.*` keys in a merged safetensors package; the raw `TRELLIS.2-4B` directory and a canonical `model.gguf` + external encoder/`external/dinov3` layout both work. Quantized q8\_0 texturing was smoke-tested on CUDA with `--texture-resolution 512 --texture-size 512` on the q8 512 shape output (507,540 vertices / 1,000,200 faces): 3,241 charts, 2 atlases, 110,789 valid texels, 30 MB PBR GLB with base-color + metallic-roughness PNGs. UV charting welds duplicate-position vertices first, so topology-repair vertex splits do not multiply chart count; chart count tracks connected surface components. `--no-preprocess-image` skips RMBG/crop and feeds the square source image directly (it no longer requires an RMBG model).
 
 > **Experimental backends (Vulkan / WGPU):** select a non-CUDA device with `--device`:
 >
@@ -549,7 +590,7 @@ Common fields:
 - `model` — required for point clouds (`pi3`, `pi3x`, or `vggt`), optional for meshes (`triposr` default; set `triposg` for TripoSG or `trellis2` for TRELLIS.2)
 - `source` — required upload (`.zip` frame archive, `.mp4` video, or image)
 - `conditions` — optional Pi3X conditions file
-- `options` — optional JSON string with family-specific parameters (TripoSG: `steps`, `guidance_scale`, `seed`, `num_tokens`, `use_flash_decoder`, `flash_octree_depth`, `dense_octree_depth`, `hierarchical_octree_depth`, `query_chunk_size`, `output_format` (`glb` default, `obj`, `ply`, `stl`); TRELLIS.2: `steps` (all three Euler samplers), `seed`, `pipeline_type` (`512`/`1024`/`1024_cascade`), `max_num_tokens`, `texture`, `output_format` (`glb` default, `obj`, `ply`); point clouds: `output_format` (`ply` default, `xyz`), plus `interval`, `vo`, `chunk_size`, `overlap`, `conf_threshold`, `inject_condition`)
+- `options` — optional JSON string with family-specific parameters (TripoSG: `steps`, `guidance_scale`, `seed`, `num_tokens`, `use_flash_decoder`, `flash_octree_depth`, `dense_octree_depth`, `hierarchical_octree_depth`, `query_chunk_size`, `output_format` (`glb` default, `obj`, `ply`, `stl`); `timesteps`/`bounds`/`faces`/`dtype` remain CLI-only and keep their defaults. TRELLIS.2: `steps` (all three Euler samplers), `seed`, `pipeline_type` (`512`/`1024`/`1024_cascade`/`1536_cascade`), `max_num_tokens`, `texture`, `output_format` (`glb` default, `obj`, `ply`); per-stage overrides, `--num-samples`, `--return-latent`, `--texture-mesh` and the postprocess/texture-export knobs remain CLI-only, so jobs use the default postprocess + texture export and write the vertex-color mesh plus PBR sidecars (not an embedded-texture GLB). Point clouds: `output_format` (`ply` default, `xyz`), plus `interval`, `vo`, `chunk_size`, `overlap`, `conf_threshold`, `inject_condition`; the VGGT `--preprocess-mode`/`--batch-size`/`--colmap-dir`/`--depth-points`/`--track-queries` surface is CLI-only)
 
 Workflow:
 
@@ -649,10 +690,10 @@ Known gaps: the remaining Vulkan/CUDA warm gap (1.16–1.20×) is the structural
 - Python 3.x for baseline tooling and normalization
 - CUDA-capable NVIDIA hardware for verified runtime inference
 - **Vulkan and WGPU backends** (via [FerrisMind/candle](https://github.com/FerrisMind/candle) `wgpu/vulkan` fork): verified for correctness and memory stability on RTX 3060 (see [Performance](#performance)); slower than CUDA, WGPU substantially so. TripoSG peaks within ~0.4 GiB of CUDA on both backends, so the 7.9 GB weight set leaves ~3 GiB of headroom on a 12 GiB card.
-- Metal backend on macOS is not tested in this repository, but may be supported theoretically.
+- Metal backend on macOS is build-checked in CI (`.github/workflows/metal.yml` builds and runs the lib/quant-probe checks); no model inference parity is validated in this repository.
 - Canonical model package directories supplied with `--model-path`, or downloadable from Hugging Face into the user cache
 - TripoSG needs roughly 8.3–8.7 GiB at the 1024-token preview (9.1 GiB at 2048 tokens) on all three backends; 16 GiB+ is recommended for the 50-step reference run.
-- TRELLIS.2 loads its stage checkpoints sequentially and peaks at ~7.8 GiB with the texture stages resident on the `1024_cascade` run (geometry-only runs are lighter); a 12 GiB GPU fits with ~4 GiB headroom, and CPU inference works but is slow. The server loads the canonical package only; the raw `microsoft/TRELLIS.2-4B` checkpoint directory is a CLI-only loader.
+- TRELLIS.2 loads its stage checkpoints sequentially and peaks at ~7.8 GiB with the texture stages resident on the `1024_cascade` run (geometry-only runs are lighter); a 12 GiB GPU fits with ~4 GiB headroom, and CPU inference works but is slow. The server loads the canonical package only; the raw `microsoft/TRELLIS.2-4B` checkpoint directory is a CLI-only loader. `--texture-mesh` loads the shape encoder from the raw checkpoint or from `external/shape_enc/model.safetensors` beside a canonical/GGUF package, and runs the xatlas unwrap + PBR bake on the CPU (cost scales with face count, chart count and `texture_size²`; duplicate-position vertices are welded before charting so topology-repair splits do not turn every split sheet into its own chart).
 
 ## License
 
@@ -660,7 +701,7 @@ The code and documentation in this repository are licensed under Apache 2.0. See
 
 Upstream model assets and canonicalized model artifacts keep their original licenses and usage restrictions. Review model-family-specific terms before redistribution.
 
-**VGGT-1B:** the original code and `facebook/VGGT-1B` checkpoint are CC-BY-NC-4.0 (non-commercial). Commercial use requires the separately distributed `facebook/VGGT-1B-Commercial` checkpoint. The canonical package used by `--model-path`/auto-download is published as `oxide-lab/VGGT-1B`; the raw upstream checkpoint stays at `facebook/VGGT-1B`. The native track head is intentionally not implemented in this inference slice; the contract records that exclusion.
+**VGGT-1B:** the original code and `facebook/VGGT-1B` checkpoint are CC-BY-NC-4.0 (non-commercial). Commercial use requires the separately distributed `facebook/VGGT-1B-Commercial` checkpoint. The canonical package used by `--model-path`/auto-download is published as `oxide-lab/VGGT-1B`; the raw upstream checkpoint stays at `facebook/VGGT-1B`. The native track head supports explicit query points only; automatic query selection (ALIKED/SP keypoints, DINO query-frame ranking) is not included (see the VGGT notes under Run Inference).
 
 **TripoSG:** the upstream code and weights are MIT licensed. The raw checkpoint lives at `VAST-AI/TripoSG`; the canonical package used by `--model-path`/auto-download is published as `oxide-lab/TripoSG`. Upstream `load_image` uses BriaRMBG 1.4 when a valid alpha channel is missing; Lux3D implements that fallback fully. The RMBG weights do not join the MIT TripoSG package: they are normalized into the separate `rmbg-1.4` canonical package under the BRIA source-available/non-commercial license (commercial use requires a BRIA license), resolved via `--rmbg-model-path` or a sibling `rmbg-1.4` directory. Upstream's pipeline defaults to the flash decoder (`use_flash_decoder=True`, `flash_octree_depth=9`); Lux3D implements the same flash SDF schedule plus a clean-room Rust DiffDMC. Diso (CC BY-NC 4.0) source and tables are not copied, so ambiguous checkerboard cells may resolve differently; the non-flash dense/hierarchical path remains available via `--flash-decoder false`. The full VAE encode API (FPS sampling, `vae.quant`, mean/logvar/std distribution) is also implemented even though the image-to-3D pipeline only calls `vae.decode`.
 
