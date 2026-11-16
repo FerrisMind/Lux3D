@@ -129,9 +129,8 @@ pub struct MeshGenerationOptions {
     pub query_chunk_size: Option<usize>,
     // TRELLIS.2-only options. `steps` and `seed` are shared with TripoSG and
     // feed every TRELLIS.2 Euler sampler.
-    /// TRELLIS.2 pipeline variant: `512`, `1024`, or `1024_cascade`
-    /// (reference default). The single-resolution `1024` path is not
-    /// implemented yet and fails at run time.
+    /// TRELLIS.2 pipeline variant: `512`, `1024`, `1024_cascade` (reference
+    /// default), or `1536_cascade` (HR cascade targeting the 1536 grid).
     #[serde(default)]
     pub pipeline_type: Option<String>,
     /// TRELLIS.2 cascade token budget (default 49152).

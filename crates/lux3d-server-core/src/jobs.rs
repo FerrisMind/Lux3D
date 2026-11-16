@@ -471,6 +471,11 @@ fn triposg_options_from_mesh_options(options: &MeshGenerationOptions) -> Result<
         query_chunk_size: options
             .query_chunk_size
             .unwrap_or(defaults.query_chunk_size),
+        // New TripoSgRunOptions fields with no mesh-API surface yet: keep the
+        // defaults (`None`) so the API behavior is unchanged.
+        timesteps: None,
+        bounds: None,
+        faces: None,
     };
     run_options.validate().map_err(anyhow::Error::from)?;
     Ok(run_options)
@@ -486,12 +491,12 @@ fn trellis2_options_from_mesh_options(
     let pipeline_type = match options.pipeline_type.as_deref() {
         None => defaults.pipeline_type,
         Some("512") => Trellis2PipelineType::R512,
-        // Accepted as a known reference value; the runtime rejects the
-        // not-yet-implemented single-resolution path with a clear job error.
         Some("1024") => Trellis2PipelineType::R1024,
         Some("1024_cascade") => Trellis2PipelineType::Cascade1024,
+        Some("1536_cascade") => Trellis2PipelineType::Cascade1536,
         Some(other) => bail!(
-            "unknown trellis2 `pipeline_type` `{other}`; expected `512`, `1024` or `1024_cascade`"
+            "unknown trellis2 `pipeline_type` `{other}`; expected `512`, `1024`, \
+             `1024_cascade` or `1536_cascade`"
         ),
     };
     let steps = options.steps.unwrap_or(defaults.ss_steps);
@@ -501,9 +506,21 @@ fn trellis2_options_from_mesh_options(
         ss_steps: steps,
         shape_steps: options.steps.unwrap_or(defaults.shape_steps),
         tex_steps: options.steps.unwrap_or(defaults.tex_steps),
+        // Per-stage sampler overrides and multi-sample runs are CLI/runtime
+        // surfaces; the mesh API keeps the pipeline defaults and one sample.
+        ss_sampler: None,
+        shape_sampler: None,
+        tex_sampler: None,
         with_texture: options.texture.unwrap_or(defaults.with_texture),
         max_num_tokens: options.max_num_tokens.unwrap_or(defaults.max_num_tokens),
         preprocess: defaults.preprocess,
+        num_samples: 1,
+        // Geometry post-process keeps the upstream `to_glb` defaults (the
+        // mesh API exposes no knobs for it yet).
+        postprocess: defaults.postprocess,
+        // Textured-GLB export keeps the upstream defaults (UV unwrap + bake
+        // at 2048 when the texture stage ran).
+        texture_export: defaults.texture_export,
     })
 }
 
@@ -1009,17 +1026,31 @@ mod tests {
 
     #[test]
     fn trellis2_rejects_unknown_pipeline_type() {
+        // `1536_cascade` is a valid variant now; use a genuinely unknown name.
         let options = MeshGenerationOptions {
-            pipeline_type: Some("1536_cascade".to_string()),
+            pipeline_type: Some("768_cascade".to_string()),
             ..default_mesh_options()
         };
         let error = trellis2_options_from_mesh_options(&options)
             .expect_err("unknown pipeline_type must be rejected");
         let message = error.to_string();
         assert!(
-            message.contains("unknown trellis2 `pipeline_type` `1536_cascade`"),
+            message.contains("unknown trellis2 `pipeline_type` `768_cascade`"),
             "unexpected message: `{message}`"
         );
+        // All four reference variants (including `1536_cascade`) map cleanly.
+        for name in ["512", "1024", "1024_cascade", "1536_cascade"] {
+            let options = MeshGenerationOptions {
+                pipeline_type: Some(name.to_string()),
+                ..default_mesh_options()
+            };
+            let run = trellis2_options_from_mesh_options(&options)
+                .unwrap_or_else(|error| panic!("`{name}` must map: {error}"));
+            assert_eq!(1, run.num_samples, "`{name}` single-sample default");
+            assert_eq!(None, run.ss_sampler);
+            assert_eq!(None, run.shape_sampler);
+            assert_eq!(None, run.tex_sampler);
+        }
     }
 
     #[test]
