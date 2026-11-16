@@ -468,12 +468,17 @@ runtime splits those gathers into limit-sized chunks, after which Vulkan
 matches CPU/CUDA geometry and is run-to-run deterministic.
 
 Measured q8_0 512 geometry-only wall time (RTX 3060 12 GiB, release CLI, one
-sampler step): CUDA 97 s, Vulkan 129 s (`CANDLE_VULKAN_INFLIGHT_MAX_BYTES=1073741824`
-brings it to 111 s), WGPU 303 s (`CANDLE_WGPU_INFLIGHT_MAX_BYTES=268435456`;
-the default WGPU budgets OOM the shape sampler on this card). At 12 steps:
-CUDA 167 s, Vulkan 376 s. The Vulkan SS 3D decoder itself is 0.6–1.8 s after
-the layout/kernel fixes; the remaining Vulkan gap is candle-side submission and
-drain overhead in the DiT samplers (see `FEATURES.md` known gaps).
+sampler step): CUDA 22.0 s, Vulkan 55.9 s, WGPU 97.6 s (down from 97 / 129 /
+303 s). WGPU now routes ragged F16 sparse-VAE GEMMs through the register-tiled
+kernel and keeps its GEMM accumulators in registers (Naga had lowered the
+dynamically indexed arrays to local memory), and its 256 MiB large-allocation
+flush threshold lets normal intermediates batch. The remaining WGPU cost is
+~7 ms of WDDM latency per compute pass plus the exact-F32 DiT path (CUDA runs
+q8 GEMMs on int8 kernels). The remaining Vulkan gap is candle-side
+submission/drain latency: sparse VAE and DiT issue tens of thousands of small
+dispatches and blocking drains account for ~32 s while GPU kernels sum to a few
+seconds; larger batches/budgets and disabled drains all regressed. The Vulkan
+SS 3D decoder itself is 0.6–1.8 s after the layout/kernel fixes.
 
 ### Run Inference
 

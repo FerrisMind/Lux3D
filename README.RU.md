@@ -456,12 +456,16 @@ Lux3D-workaround для неограниченного `index_select` в candle 
 по геометрии и детерминирован от запуска к запуску.
 
 Замеры q8_0 512 geometry-only (RTX 3060 12 GiB, release CLI, один шаг
-сэмплера): CUDA 97 с, Vulkan 129 с (`CANDLE_VULKAN_INFLIGHT_MAX_BYTES=1073741824`
-даёт 111 с), WGPU 303 с (`CANDLE_WGPU_INFLIGHT_MAX_BYTES=268435456`; дефолтные
-бюджеты WGPU ловят OOM на shape-сэмплере этой карты). На 12 шагах: CUDA 167 с,
-Vulkan 376 с. Сам Vulkan-декодер SS после правок layout/ядер занимает 0.6–1.8 с;
-оставшийся разрыв Vulkan — накладные расходы сабмита/drain в candle на
-DiT-сэмплерах (см. известные пробелы в `FEATURES.md`).
+сэмплера): CUDA 22.0 с, Vulkan 55.9 с, WGPU 97.6 с (было 97 / 129 / 303 с).
+На WGPU основной выигрыш дали ragged-F16 GEMM'ы разреженного VAE, ушедшие в
+register-tiled ядро, и разворачивание аккумуляторов WGPU-GEMM в именованные
+скаляры (динамически индексированные массивы Naga клала в local memory).
+Оставшийся разрыв Vulkan — задержка submission/fence в WDDM: разреженный VAE
+и DiT выдают десятки тысяч мелких dispatch'ей, блокирующие drain'ы занимают
+~32 с при сумме GPU-ядер в несколько секунд. WGPU дополнительно платит ~7 мс
+на compute pass и считает DiT в точном F32, тогда как CUDA исполняет q8 на
+int8-ядрах; reduced-precision coop-matrix для TRELLIS.2 не включается, потому
+что дискретная O-Voxel occupancy меняет топологию меша.
 
 ### Запуск Инференса
 

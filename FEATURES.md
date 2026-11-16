@@ -890,11 +890,12 @@ run (`--no-postprocess`, 12,679,988 faces) unwraps to 164 charts / 2 atlases at 
 647 s, confirming chart count tracks connected components (plus normal-based splitting),
 not raw face count. Geometry-only q8\_0 512 smoke on the same package also passed on
 Vulkan and WGPU with `cpu_fallback=0` and valid `[-0.5, 0.5]` GLBs. Release-CLI wall time
-for one sampler step is 97 s (CUDA), 129 s (Vulkan; 111 s with
-`CANDLE_VULKAN_INFLIGHT_MAX_BYTES=1073741824`) and 303 s (WGPU with
-`CANDLE_WGPU_INFLIGHT_MAX_BYTES=268435456`; the default WGPU budgets OOM the shape
-sampler on the 12 GiB test card). At 12 steps the same run takes 167 s (CUDA) and 376 s
-(Vulkan); the isolated SS 3D decoder is 0.6–1.8 s after the layout/kernel fixes.
+for one sampler step (q8\_0, 512, `--no-postprocess`) is 22.0 s (CUDA), 55.9 s (Vulkan)
+and 97.6 s (WGPU), down from 97 / 129 / 303 s. The WGPU gain comes from routing ragged
+F16 sparse-conv GEMMs to the register-tiled kernel and unrolling the WGPU GEMM register
+tiles (their dynamically indexed accumulator arrays were lowered to local memory); the
+Vulkan residual is WDDM submission/drain latency, not GEMM math. The isolated SS 3D
+decoder is 0.6–1.8 s after the layout/kernel fixes.
 
 **Tests:** CLI `run_args` texture-mesh mapping/rejection cases; `trellis2_texture`
 missing-checkpoint test ✅
@@ -1010,19 +1011,26 @@ Also touched: `crates/lux3d-core/tests/vggt_export.rs` (fixture gains empty `pos
 - **TRELLIS.2 approximations:** meshopt simplification/cleanup vs cumesh; xatlas vs cumesh
   unwrap; TELEA-approximation inpaint vs `cv2.inpaint`; synthesized occupancy guides vs
   upstream sparse caches.
-- **TRELLIS.2 backend throughput:** on q8\_0 the 12-step 512 geometry pipeline takes
-  167 s on CUDA and 376 s on Vulkan; the gap is concentrated in the DiT samplers
-  (Vulkan SS sample 147 s vs 52 s, shape spatial 164 s vs 58 s), while the SS 3D
-  decoder (0.6–1.8 s), shape VAE and postprocess are at CUDA parity. Candle's Vulkan
-  profile attributes the residual gap to submission/drain overhead (5,473 `flush_drain`
-  calls, 71 s of a 122 s run; ~69.6k dispatches dominate the rest), not GEMM math: q8
-  and dense f32 GEMMs both measure ~18 ms for the sampler's 4096x1536x1536 shape. WGPU's
-  packed q8 matmul shader is ~10x slower than its dense f32 GEMM (192 ms vs 18 ms for
-  4096x1024x1024), so Lux3D dequantizes all packed GGML weights once at load on WGPU
-  (stages load and drop sequentially; `LUX3D_WGPU_DEQUANT_WEIGHTS=0` restores packed
-  weights, including the K-quant path with its Q8K dispatch limit) and a 1-step geometry
-  run takes 303 s with reduced allocation budgets, versus 97 s on CUDA. Treat WGPU as
-  experimental for TRELLIS.2.
+- **TRELLIS.2 backend throughput:** one sampler step on q8\_0 (512, geometry only) takes
+  22.0 s on CUDA, 55.9 s on Vulkan and 97.6 s on WGPU. Vulkan's residual gap is WDDM
+  submission/fence latency: the shape VAE and DiTs issue tens of thousands of small
+  dispatches and the backend spends ~32 s in blocking drains while GPU kernels sum to a
+  few seconds. Candle now counts only reclaimable retained buffers per submission,
+  retires the oldest submission incrementally when the allocator is under pressure, and
+  keeps the measured-optimal 512 MiB in-flight budget; larger budgets, larger dispatch
+  batches, a buffer pool and disabled drains all regressed.
+  WGPU no longer runs the sparse VAE through the naive one-thread-per-output GEMM:
+  F16 matmuls with ragged M/N/K use the register-tiled kernel, whose accumulators (and
+  the F32 warptile accumulators) are now named scalars instead of dynamically indexed
+  arrays that Naga placed in local memory. Together with the 256 MiB large-allocation
+  flush threshold and deduplicated retained-byte accounting this cut the 1-step run from
+  348 s to 98 s. Remaining WGPU cost is split between the WDDM per-pass latency (~7 ms
+  per compute pass) and the exact-F32 DiT path: CUDA runs q8 GEMMs on int8 kernels while
+  WGPU dequantizes packed weights once at load and multiplies dense F32 (stages are
+  loaded/dropped sequentially; `LUX3D_WGPU_DEQUANT_WEIGHTS=0` restores packed weights,
+  including the K-quant Q8K dispatch limit). Reduced-precision coop-matrix is not used
+  for TRELLIS.2 because its O-Voxel occupancy is discrete and f16/TF32 drift changes the
+  exported topology.
 - **VGGT tracking:** explicit query points only. Automatic query selection (ALIKED/SP
   keypoints, DINO query-frame ranking), multi-query-frame reordering and non-visible track
   completion are not implemented.
