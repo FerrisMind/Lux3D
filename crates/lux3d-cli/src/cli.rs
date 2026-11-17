@@ -262,6 +262,13 @@ pub struct RunArgs {
 
     #[arg(
         long,
+        default_value_t = false,
+        help = "TRELLIS.2 keep every loaded stage resident on the device for the whole run instead of the default per-stage load/drop (upstream `low_vram=False`, trellis2_image_to_3d.py:55, 107, 119-125). Speed-only: the outputs are identical to the default for the same seed. Fails with an actionable error naming this flag and the device memory limit when the resident stage set does not fit; never falls back silently."
+    )]
+    pub no_low_vram: bool,
+
+    #[arg(
+        long,
         help = "TRELLIS.2 cascade token budget; the reference loop stops at 1024 (default 49152). The 1536 cascade can reduce 1536 -> ... -> 1024."
     )]
     pub max_num_tokens: Option<usize>,
@@ -1662,8 +1669,9 @@ fn reject_unsupported_trellis2_options(args: &RunArgs) -> anyhow::Result<()> {
 /// silently ignoring them (same fail-fast pattern as the TripoSG-only and
 /// VGGT-only flags).
 fn reject_trellis2_only_options(args: &RunArgs, family: Family) -> anyhow::Result<()> {
-    let set: [(&str, bool); 31] = [
+    let set: [(&str, bool); 32] = [
         ("--pipeline-type", args.pipeline_type.is_some()),
+        ("--no-low-vram", args.no_low_vram),
         ("--max-num-tokens", args.max_num_tokens.is_some()),
         ("--texture", args.texture.is_some()),
         ("--texture-size", args.texture_size.is_some()),
@@ -1844,6 +1852,7 @@ fn trellis2_run_options_from_args(args: &RunArgs) -> anyhow::Result<Trellis2RunO
             args.tex_interval.as_ref(),
         )?,
         with_texture: args.texture.unwrap_or(defaults.with_texture),
+        low_vram: !args.no_low_vram,
         max_num_tokens: args.max_num_tokens.unwrap_or(defaults.max_num_tokens),
         preprocess: defaults.preprocess,
         num_samples,
@@ -1909,8 +1918,9 @@ fn validate_trellis2_texturing_mode(args: &RunArgs) -> anyhow::Result<()> {
             args.output.display()
         );
     }
-    let incompatible: [(&str, bool); 12] = [
+    let incompatible: [(&str, bool); 13] = [
         ("--pipeline-type", args.pipeline_type.is_some()),
+        ("--no-low-vram", args.no_low_vram),
         ("--max-num-tokens", args.max_num_tokens.is_some()),
         ("--return-latent", args.return_latent.is_some()),
         ("--num-samples", args.num_samples.is_some()),
@@ -4451,6 +4461,65 @@ mod tests {
         assert_eq!(None, defaults.ss_sampler);
         assert_eq!(None, defaults.shape_sampler);
         assert_eq!(None, defaults.tex_sampler);
+        assert!(defaults.low_vram, "reference low_vram default is true");
+    }
+
+    /// `--no-low-vram` flips the core `low_vram` switch (the `false` value
+    /// keeps every loaded stage resident for the run); the flag is
+    /// TRELLIS.2-only and rejected with `--texture-mesh`.
+    #[test]
+    fn trellis2_no_low_vram_maps_to_the_core_option() {
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "trellis2",
+            "--source",
+            "image.png",
+            "--output",
+            "out.glb",
+            "--no-low-vram",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(args.no_low_vram);
+        let options = super::trellis2_run_options_from_args(&args).expect("run options");
+        assert!(!options.low_vram);
+
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "trellis2",
+            "--source",
+            "image.png",
+            "--output",
+            "out.glb",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(!args.no_low_vram);
+        let options = super::trellis2_run_options_from_args(&args).expect("run options");
+        assert!(options.low_vram);
+
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "trellis2",
+            "--source",
+            "image.png",
+            "--texture-mesh",
+            "input.glb",
+            "--output",
+            "out.glb",
+            "--no-low-vram",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        let error = super::validate_trellis2_texturing_mode(&args)
+            .expect_err("--no-low-vram has no texturing-pipeline meaning");
+        assert!(error.to_string().contains("--no-low-vram"));
     }
 
     #[test]
@@ -5068,8 +5137,9 @@ mod tests {
     /// every other family instead of being silently ignored.
     #[test]
     fn trellis2_only_flags_rejected_for_other_families() {
-        let flag_options: [(&str, &[&str]); 27] = [
+        let flag_options: [(&str, &[&str]); 28] = [
             ("--pipeline-type", &["--pipeline-type", "512"]),
+            ("--no-low-vram", &["--no-low-vram"]),
             ("--max-num-tokens", &["--max-num-tokens", "8192"]),
             ("--texture", &["--texture", "false"]),
             ("--texture-size", &["--texture-size", "1024"]),
@@ -5935,6 +6005,7 @@ mod tests {
             dump_npz: None,
             vggt: Default::default(),
             pipeline_type: None,
+            no_low_vram: false,
             max_num_tokens: None,
             texture: None,
             ss_steps: None,
@@ -6020,6 +6091,7 @@ mod tests {
             dump_npz: None,
             vggt: Default::default(),
             pipeline_type: None,
+            no_low_vram: false,
             max_num_tokens: None,
             texture: None,
             ss_steps: None,
@@ -6107,6 +6179,7 @@ mod tests {
             dump_npz: None,
             vggt: Default::default(),
             pipeline_type: None,
+            no_low_vram: false,
             max_num_tokens: None,
             texture: None,
             ss_steps: None,
@@ -6199,6 +6272,7 @@ mod tests {
             dump_npz: None,
             vggt: Default::default(),
             pipeline_type: None,
+            no_low_vram: false,
             max_num_tokens: None,
             texture: None,
             ss_steps: None,
@@ -6288,6 +6362,7 @@ mod tests {
             dump_npz: None,
             vggt: Default::default(),
             pipeline_type: None,
+            no_low_vram: false,
             max_num_tokens: None,
             texture: None,
             ss_steps: None,

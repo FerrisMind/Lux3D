@@ -107,11 +107,20 @@
 //!    [`build_trellis2_textured_mesh`].
 //!
 //! Stage weights load sequentially from the mmap-ed canonical package and
-//! drop after their stage; no more than one DiT is resident (the cascade
-//! also reloads the shape VAE between its upsample and decode passes). The
-//! RNG is an internal CPU-seeded normal generator (locked decision 4):
-//! reproducible across Lux3D runs, NOT bit-identical to `torch.randn` —
-//! parity tests inject oracle latents instead of comparing RNG streams.
+//! drop after their stage in the default `low_vram = true` mode (reference
+//! `trellis2_image_to_3d.py:55, 107, 119-125`); no more than one DiT is
+//! resident (the cascade also reloads the shape VAE between its upsample
+//! and decode passes). With [`Trellis2RunOptions::low_vram`] = false (CLI
+//! `--no-low-vram`) every stage the run loads is kept resident on the
+//! device until the run ends — the reference `to(device)` pinning branch
+//! (`trellis2_image_to_3d.py:119-125`). This is a speed-only switch: the
+//! sampler math and RNG streams are unchanged, so the outputs are identical
+//! for the same seed. A stage load that does not fit in device memory fails
+//! with an actionable error naming the flag and the device memory limit; it
+//! never silently falls back to per-stage loading. The RNG is an internal
+//! CPU-seeded normal generator (locked decision 4): reproducible across
+//! Lux3D runs, NOT bit-identical to `torch.randn` — parity tests inject
+//! oracle latents instead of comparing RNG streams.
 //!
 //! Denormalization vectors and sampler defaults are hard-coded from
 //! `pipeline.json` (mirrored in the canonical package's
@@ -148,7 +157,9 @@
 //! `lr_shape_latent [N_lr, 32]` F32 (empty for non-cascade runs) and a
 //! UTF-8 JSON `meta` blob.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use candle_core::{DType, Device, Tensor};
 use ndarray::Array2;
@@ -905,6 +916,17 @@ pub struct Trellis2RunOptions {
     /// `false` the pipeline stays geometry-only (the mesh buffers carry the
     /// 7-channel shape attributes and no PBR payload).
     pub with_texture: bool,
+    /// Per-stage load/drop mode (the reference `low_vram` switch,
+    /// `trellis2_image_to_3d.py:55, 107, 119-125`): `true` (default) loads a
+    /// stage, runs it and drops it, exactly the historical Lux3D behavior;
+    /// `false` keeps every stage the run loads resident on the device until
+    /// the run ends (the reference `to(device)` pinning branch,
+    /// `:119-125`). Speed-only: the sampler math and RNG streams are
+    /// unchanged, so the outputs are identical for the same seed. When the
+    /// resident stage set does not fit in device memory the run fails with
+    /// an actionable error naming this flag and the device memory limit —
+    /// there is no silent fallback to per-stage loading.
+    pub low_vram: bool,
     /// Cascade token budget (49152). The reference loop breaks when the
     /// quantized HR coord count drops below this value — but also whenever
     /// `hr_resolution == 1024`, so the 1024 cascade decodes at 1024 even
@@ -947,6 +969,7 @@ impl Default for Trellis2RunOptions {
             shape_sampler: None,
             tex_sampler: None,
             with_texture: true,
+            low_vram: true,
             max_num_tokens: 49152,
             preprocess: true,
             num_samples: 1,
@@ -1349,6 +1372,111 @@ const RAW_STAGE_FILES: [(&str, &str); 9] = [
     ("tex_dec", "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors"),
 ];
 
+/// Stage models pinned on the device by a `low_vram = false` run (the
+/// reference `Trellis2ImageTo3DPipeline.to(device)` pinning branch,
+/// `trellis2_image_to_3d.py:119-125`).
+///
+/// One cache serves a whole run: the first load of each stage prefix is kept
+/// as an `Arc` and every later load for the same prefix (the cascade loads
+/// the shape VAE twice, the 1024-conditioned variants run DINOv3 twice)
+/// reuses it. The cache is stage-agnostic (`dyn Any`); each lookup downcasts
+/// back to the concrete model type the stage loader produced.
+#[derive(Default)]
+struct ResidentStages {
+    /// Nesting depth of active `low_vram = false` runs; only the outermost
+    /// [`ResidentStagesGuard`] drop clears the cache, so nested entry points
+    /// (`run_from_path` -> `run_from_path_with_stages` -> `run_prepared`)
+    /// share one residency window.
+    active_runs: usize,
+    /// Loaded stage models keyed by their stage prefix (`ss_flow`, ...); the
+    /// elastic 1024/1536 DiTs append their config resolution so a batched
+    /// run can pin one instance per target grid.
+    models: HashMap<String, Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+impl std::fmt::Debug for ResidentStages {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResidentStages")
+            .field("active_runs", &self.active_runs)
+            .field("models", &self.models.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl ResidentStages {
+    /// Downcast the pinned model for `stage`, if any. Returns an owned `Arc`
+    /// so callers can run the stage without holding the cache lock.
+    fn cached<T: std::any::Any + Send + Sync>(&self, stage: &str) -> Option<Arc<T>> {
+        self.models
+            .get(stage)
+            .and_then(|model| Arc::clone(model).downcast::<T>().ok())
+    }
+}
+
+/// Run-scoped guard for [`Trellis2RunOptions::low_vram`] = false. The cache
+/// nesting depth is bumped on entry and decremented on drop; the outermost
+/// drop (success or error path alike) releases every pinned stage, so a
+/// failed run never leaves weights resident.
+struct ResidentStagesGuard<'a> {
+    resident: &'a Mutex<ResidentStages>,
+    armed: bool,
+}
+
+impl Drop for ResidentStagesGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut resident = lock_resident(self.resident);
+        resident.active_runs = resident.active_runs.saturating_sub(1);
+        if resident.active_runs == 0 {
+            resident.models.clear();
+        }
+    }
+}
+
+fn lock_resident(resident: &Mutex<ResidentStages>) -> MutexGuard<'_, ResidentStages> {
+    resident
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Total device memory in bytes when the backend exposes it (CUDA:
+/// `cudarc::driver::CudaContext::total_mem`). `None` on CPU and on backends
+/// without the query; only used to make a resident-mode load failure
+/// actionable.
+fn device_memory_limit(device: &Device) -> Option<u64> {
+    #[cfg(feature = "cuda")]
+    {
+        if let Ok(cuda) = device.as_cuda_device() {
+            if let Ok(bytes) = cuda.cuda_stream().context().total_mem() {
+                return Some(bytes as u64);
+            }
+        }
+    }
+    let _ = device;
+    None
+}
+
+/// Actionable failure for a stage load inside a `low_vram = false` run:
+/// names the option/CLI flag and the device memory limit instead of
+/// silently falling back to per-stage loading.
+fn resident_stage_load_error(stage: &str, device: &Device, source: Lux3dError) -> Lux3dError {
+    let limit = match device_memory_limit(device) {
+        Some(bytes) => format!("{:.2} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0)),
+        None => "unknown (the backend does not expose a memory limit)".to_string(),
+    };
+    Lux3dError::CanonicalWeightsValidation {
+        message: format!(
+            "TRELLIS.2 stage `{stage}` failed to load while `low_vram = false` keeps every \
+             stage resident on the device (CLI `--no-low-vram`; device memory limit: {limit}). \
+             The resident stage set must fit in device memory at load time; refusing to fall \
+             back to per-stage loading. Re-run without `--no-low-vram`, or use a device with \
+             enough memory. Underlying error: {source}"
+        ),
+    }
+}
+
 /// TRELLIS.2 image-to-3D pipeline (geometry slice).
 #[derive(Debug)]
 pub struct Trellis2Pipeline {
@@ -1368,6 +1496,9 @@ pub struct Trellis2Pipeline {
     /// (`runtime::trellis2_texture`) resolves the shape-encoder stage file
     /// through it.
     pub(super) raw_dir: Option<(PathBuf, Device)>,
+    /// Stages pinned by a `low_vram = false` run; empty and unused in the
+    /// default per-stage load/drop mode.
+    resident: Mutex<ResidentStages>,
 }
 
 impl Trellis2Pipeline {
@@ -1400,6 +1531,7 @@ impl Trellis2Pipeline {
             config,
             rmbg,
             raw_dir: None,
+            resident: Mutex::new(ResidentStages::default()),
         })
     }
 
@@ -1453,6 +1585,7 @@ impl Trellis2Pipeline {
             config,
             rmbg,
             raw_dir: Some((path.to_path_buf(), device.clone())),
+            resident: Mutex::new(ResidentStages::default()),
         })
     }
 
@@ -1514,6 +1647,195 @@ impl Trellis2Pipeline {
         }
     }
 
+    /// Open the run-scoped residency window when
+    /// [`Trellis2RunOptions::low_vram`] is false (reference
+    /// `Trellis2ImageTo3DPipeline.to(device)` with `low_vram = False`,
+    /// `trellis2_image_to_3d.py:119-125`). The guard bumps a nesting depth so
+    /// nested public entry points share one window; the outermost drop
+    /// releases the pinned stages on both the success and the error path.
+    /// `low_vram = true` returns a disarmed guard and keeps the exact
+    /// historical per-stage load/drop behavior.
+    fn enter_run_mode(&self, options: &Trellis2RunOptions) -> ResidentStagesGuard<'_> {
+        if options.low_vram {
+            return ResidentStagesGuard {
+                resident: &self.resident,
+                armed: false,
+            };
+        }
+        let mut resident = lock_resident(&self.resident);
+        if resident.active_runs == 0 {
+            // Defensive: a previous window must have released its stages.
+            resident.models.clear();
+        }
+        resident.active_runs += 1;
+        drop(resident);
+        ResidentStagesGuard {
+            resident: &self.resident,
+            armed: true,
+        }
+    }
+
+    /// Load or reuse one stage model.
+    ///
+    /// With no active residency window (`low_vram = true`, the default) this
+    /// loads a private `Arc` that the existing `drop` sites release exactly
+    /// like before. Inside a `low_vram = false` window the first load is
+    /// pinned in [`Self::resident`] and later acquisitions of the same stage
+    /// prefix reuse it, so the weights stay on the device for the whole run
+    /// (the reference pinning branch). A load failure inside the window
+    /// returns [`resident_stage_load_error`] instead of silently falling
+    /// back to per-stage loading.
+    fn acquire_stage_model<T>(
+        &self,
+        stage: &str,
+        cache_key: &str,
+        device: &Device,
+        load: impl FnOnce() -> Result<T>,
+    ) -> Result<Arc<T>>
+    where
+        T: std::any::Any + Send + Sync,
+    {
+        let resident = lock_resident(&self.resident).active_runs > 0;
+        if resident {
+            if let Some(model) = lock_resident(&self.resident).cached::<T>(cache_key) {
+                return Ok(model);
+            }
+        }
+        let model = match load() {
+            Ok(model) => model,
+            Err(source) => {
+                return Err(if resident {
+                    resident_stage_load_error(stage, device, source)
+                } else {
+                    source
+                });
+            }
+        };
+        let model = Arc::new(model);
+        if !resident {
+            return Ok(model);
+        }
+        let mut cache = lock_resident(&self.resident);
+        if cache.active_runs == 0 {
+            // The run window closed while the stage loaded; hand the caller
+            // its private copy (the cache is already released).
+            return Ok(model);
+        }
+        if let Some(existing) = cache.cached::<T>(cache_key) {
+            return Ok(existing);
+        }
+        cache.models.insert(cache_key.to_string(), model.clone());
+        Ok(model)
+    }
+
+    /// DINOv3 image-conditioning stage (`image_cond`). The reference moves
+    /// `image_cond_model` to the device once when `low_vram = False`
+    /// (`trellis2_image_to_3d.py:119-125`); the 1024-conditioned variants
+    /// call it twice (`cond_512` + `cond_1024`), so the resident window
+    /// makes the second pass a cache hit.
+    fn acquire_image_cond(&self, device: &Device) -> Result<Arc<Trellis2Dino>> {
+        self.acquire_stage_model("image_cond", "image_cond", device, || {
+            let vb = self.stage_var_builder("image_cond", device)?;
+            Trellis2Dino::load(vb, &super::trellis2_dino::Trellis2DinoConfig::vitl16()).map_err(
+                |source| Lux3dError::CanonicalWeightsValidation {
+                    message: format!("failed to load TRELLIS.2 DINOv3: {source}"),
+                },
+            )
+        })
+    }
+
+    /// Sparse-structure flow DiT (`ss_flow`).
+    fn acquire_ss_flow(&self, device: &Device) -> Result<Arc<Trellis2SsDit>> {
+        self.acquire_stage_model("ss_flow", "ss_flow", device, || {
+            let vb = self.stage_var_builder("ss_flow", device)?;
+            Trellis2SsDit::load(vb, &Trellis2SsConfig::trellis_2_4b()).map_err(|source| {
+                Lux3dError::CanonicalWeightsValidation {
+                    message: format!("failed to load TRELLIS.2 ss_flow: {source}"),
+                }
+            })
+        })
+    }
+
+    /// Sparse-structure decoder (`ss_dec`).
+    fn acquire_ss_dec(&self, device: &Device) -> Result<Arc<Trellis2SsDecoder>> {
+        self.acquire_stage_model("ss_dec", "ss_dec", device, || {
+            let vb = self.stage_var_builder("ss_dec", device)?;
+            Trellis2SsDecoder::load(vb, &Trellis2SsDecoderConfig::ss_dec_16l8()).map_err(|source| {
+                Lux3dError::CanonicalWeightsValidation {
+                    message: format!("failed to load TRELLIS.2 ss_dec: {source}"),
+                }
+            })
+        })
+    }
+
+    /// Shape or texture SLAT flow DiT (`shape_dit_512` / `shape_dit_1024` /
+    /// `tex_dit_512` / `tex_dit_1024`). The elastic 1024/1536 checkpoints
+    /// take a different coordinate bound per target grid, so the cache key
+    /// carries the config resolution; a batched 1536 cascade can legitimately
+    /// run different samples at 1536 and at the 1024 stop resolution.
+    fn acquire_slat_dit(
+        &self,
+        stage: &str,
+        config: Trellis2SlatConfig,
+        device: &Device,
+    ) -> Result<Arc<Trellis2SlatDit>> {
+        let config_resolution = config.resolution;
+        let cache_key = format!("{stage}@{}", config_resolution);
+        self.acquire_stage_model(stage, &cache_key, device, || {
+            let vb = self.stage_var_builder(stage, device)?;
+            Trellis2SlatDit::load(vb, &config).map_err(|source| {
+                Lux3dError::CanonicalWeightsValidation {
+                    message: format!("failed to load TRELLIS.2 {stage}: {source}"),
+                }
+            })
+        })
+    }
+
+    /// Texture SLAT flow DiT (`tex_dit_512` / `tex_dit_1024`); the cache key
+    /// carries the elastic config resolution (see [`Self::acquire_slat_dit`]).
+    fn acquire_tex_dit(
+        &self,
+        stage: &str,
+        config: Trellis2SlatConfig,
+        device: &Device,
+    ) -> Result<Arc<Trellis2TexDit>> {
+        let config_resolution = config.resolution;
+        let cache_key = format!("{stage}@{}", config_resolution);
+        self.acquire_stage_model(stage, &cache_key, device, || {
+            let vb = self.stage_var_builder(stage, device)?;
+            Trellis2TexDit::load(vb, &config).map_err(|source| {
+                Lux3dError::CanonicalWeightsValidation {
+                    message: format!("failed to load TRELLIS.2 {stage}: {source}"),
+                }
+            })
+        })
+    }
+
+    /// Shape VAE decoder (`shape_dec`), used for the cascade upsample and the
+    /// mesh decode.
+    fn acquire_shape_vae(&self, device: &Device) -> Result<Arc<Trellis2ShapeVaeDecoder>> {
+        self.acquire_stage_model("shape_dec", "shape_dec", device, || {
+            let vb = self.stage_var_builder("shape_dec", device)?;
+            Trellis2ShapeVaeDecoder::load(vb, &Trellis2ShapeVaeConfig::flexi_dual_shape()).map_err(
+                |source| Lux3dError::CanonicalWeightsValidation {
+                    message: format!("failed to load TRELLIS.2 shape_dec: {source}"),
+                },
+            )
+        })
+    }
+
+    /// Guided texture VAE decoder (`tex_dec`).
+    fn acquire_tex_dec(&self, device: &Device) -> Result<Arc<Trellis2TexDecoder>> {
+        self.acquire_stage_model("tex_dec", "tex_dec", device, || {
+            let vb = self.stage_var_builder("tex_dec", device)?;
+            Trellis2TexDecoder::load(vb, &Trellis2ShapeVaeConfig::tex_decoder()).map_err(|source| {
+                Lux3dError::CanonicalWeightsValidation {
+                    message: format!("failed to load TRELLIS.2 tex_dec: {source}"),
+                }
+            })
+        })
+    }
+
     /// `(ss_resolution, decode_resolution)` for the selected variant (the
     /// upstream `ss_res` map and the `res` decode resolution): `512` ->
     /// `(32, 512)` (package config), `1024` -> `(64, 1024)`, `1024_cascade`
@@ -1564,11 +1886,7 @@ impl Trellis2Pipeline {
         pixel_values: &Tensor,
         device: &Device,
     ) -> Result<(Tensor, Tensor)> {
-        let vb = self.stage_var_builder("image_cond", device)?;
-        let dino = Trellis2Dino::load(vb, &super::trellis2_dino::Trellis2DinoConfig::vitl16())
-            .map_err(|source| Lux3dError::CanonicalWeightsValidation {
-                message: format!("failed to load TRELLIS.2 DINOv3: {source}"),
-            })?;
+        let dino = self.acquire_image_cond(device)?;
         let cond = dino.forward(pixel_values).map_err(|source| {
             Lux3dError::CanonicalWeightsValidation {
                 message: format!("Trellis2 DINOv3 forward failed: {source}"),
@@ -1725,13 +2043,7 @@ impl Trellis2Pipeline {
         let neg_cond_batch = repeat_cond_to_batch(neg_cond, samples)?;
         let stage_time = std::env::var_os("LUX3D_STAGE_TIME").is_some();
         let mut stage_start = std::time::Instant::now();
-        let vb = self.stage_var_builder("ss_flow", device)?;
-        let ss_dit =
-            Trellis2SsDit::load(vb, &Trellis2SsConfig::trellis_2_4b()).map_err(|source| {
-                Lux3dError::CanonicalWeightsValidation {
-                    message: format!("failed to load TRELLIS.2 ss_flow: {source}"),
-                }
-            })?;
+        let ss_dit = self.acquire_ss_flow(device)?;
         if stage_time {
             eprintln!(
                 "[stage] trellis2 ss dit load: {:.2}s",
@@ -1758,11 +2070,7 @@ impl Trellis2Pipeline {
             stage_start = std::time::Instant::now();
         }
 
-        let vb = self.stage_var_builder("ss_dec", device)?;
-        let decoder = Trellis2SsDecoder::load(vb, &Trellis2SsDecoderConfig::ss_dec_16l8())
-            .map_err(|source| Lux3dError::CanonicalWeightsValidation {
-                message: format!("failed to load TRELLIS.2 ss_dec: {source}"),
-            })?;
+        let decoder = self.acquire_ss_dec(device)?;
         if stage_time {
             eprintln!(
                 "[stage] trellis2 ss dec load: {:.2}s",
@@ -1881,7 +2189,9 @@ impl Trellis2Pipeline {
     /// One shape SLAT sampling pass over a stage DiT: seeded (or injected)
     /// noise `[N, 32]` on `coords` -> Euler/CFG -> de-normalize. The DiT is
     /// dropped before the de-normalization so only one flow model is ever
-    /// resident (12 GiB budget).
+    /// resident in the default `low_vram = true` mode (12 GiB budget); with
+    /// `low_vram = false` the explicit drop releases only this call's `Arc`
+    /// clone and the run cache keeps the model pinned.
     #[allow(clippy::too_many_arguments)]
     fn sample_shape_slat_stage(
         &self,
@@ -1900,12 +2210,7 @@ impl Trellis2Pipeline {
             Some(noise) => noise.clone(),
             None => draw_slat_noise(coords.len(), seed, noise_salt, device)?,
         };
-        let vb = self.stage_var_builder(stage, device)?;
-        let dit = Trellis2SlatDit::load(vb, &config).map_err(|source| {
-            Lux3dError::CanonicalWeightsValidation {
-                message: format!("failed to load TRELLIS.2 {stage}: {source}"),
-            }
-        })?;
+        let dit = self.acquire_slat_dit(stage, config, device)?;
         let (slat_norm, _trace) = sample_sparse(
             &|x: &Tensor, t_model: f32, c: &Tensor, cs: &[[i32; 3]]| dit.forward(x, cs, t_model, c),
             coords,
@@ -1967,12 +2272,7 @@ impl Trellis2Pipeline {
     ) -> Result<(Vec<[i32; 3]>, Vec<[i32; 3]>, u32)> {
         let profile = std::env::var_os("LUX3D_STAGE_TIME").is_some();
         let load_mark = std::time::Instant::now();
-        let vb = self.stage_var_builder("shape_dec", device)?;
-        let decoder =
-            Trellis2ShapeVaeDecoder::load(vb, &Trellis2ShapeVaeConfig::flexi_dual_shape())
-                .map_err(|source| Lux3dError::CanonicalWeightsValidation {
-                    message: format!("failed to load TRELLIS.2 shape_dec: {source}"),
-                })?;
+        let decoder = self.acquire_shape_vae(device)?;
         if profile {
             eprintln!(
                 "[stage] trellis2 shape vae load: {:.2}s",
@@ -2106,12 +2406,7 @@ impl Trellis2Pipeline {
     ) -> Result<(super::trellis2_vae::ShapeVaeDecodeOutput, DualGridMesh)> {
         let profile = std::env::var_os("LUX3D_STAGE_TIME").is_some();
         let load_mark = std::time::Instant::now();
-        let vb = self.stage_var_builder("shape_dec", device)?;
-        let decoder =
-            Trellis2ShapeVaeDecoder::load(vb, &Trellis2ShapeVaeConfig::flexi_dual_shape())
-                .map_err(|source| Lux3dError::CanonicalWeightsValidation {
-                    message: format!("failed to load TRELLIS.2 shape_dec: {source}"),
-                })?;
+        let decoder = self.acquire_shape_vae(device)?;
         if profile {
             eprintln!(
                 "[stage] trellis2 shape vae load: {:.2}s",
@@ -2252,12 +2547,7 @@ impl Trellis2Pipeline {
             None => draw_slat_noise(coords.len(), seed, TRELLIS2_TEX_NOISE_SALT, device)?,
         };
         let shape_slat_norm = self.normalize_shape_slat(shape_slat_denorm)?;
-        let vb = self.stage_var_builder(stage, device)?;
-        let dit = Trellis2TexDit::load(vb, &config).map_err(|source| {
-            Lux3dError::CanonicalWeightsValidation {
-                message: format!("failed to load TRELLIS.2 {stage}: {source}"),
-            }
-        })?;
+        let dit = self.acquire_tex_dit(stage, config, device)?;
         let (slat_norm, _trace) = sample_sparse(
             &|x: &Tensor, t_model: f32, c: &Tensor, cs: &[[i32; 3]]| {
                 dit.forward(x, &shape_slat_norm, cs, t_model, c)
@@ -2309,11 +2599,7 @@ impl Trellis2Pipeline {
         guide_subs: &[Tensor],
         device: &Device,
     ) -> Result<(Vec<[i32; 3]>, Vec<f32>)> {
-        let vb = self.stage_var_builder("tex_dec", device)?;
-        let decoder = Trellis2TexDecoder::load(vb, &Trellis2ShapeVaeConfig::tex_decoder())
-            .map_err(|source| Lux3dError::CanonicalWeightsValidation {
-                message: format!("failed to load TRELLIS.2 tex_dec: {source}"),
-            })?;
+        let decoder = self.acquire_tex_dec(device)?;
         let decoded = decoder
             .decode(coords, tex_latent_denorm, guide_subs)
             .map_err(|source| Lux3dError::CanonicalWeightsValidation {
@@ -3333,9 +3619,10 @@ impl Trellis2Pipeline {
     /// loop's stop resolution stays 1024), HR shape SLAT on `cond_hr` with
     /// `shape_dit_1024`, texture SLAT on `cond_hr` with `tex_dit_1024` on
     /// the HR quantized coords, decode at the returned `hr_resolution` +
-    /// mesh. Model residency stays sequential: LR DiT -> drop, shape VAE ->
-    /// drop, HR DiT -> drop, tex DiT -> drop, shape VAE (decode) -> drop,
-    /// tex VAE.
+    /// mesh. Model residency stays sequential in the default mode: LR DiT ->
+    /// drop, shape VAE -> drop, HR DiT -> drop, tex DiT -> drop, shape VAE
+    /// (decode) -> drop, tex VAE. With `low_vram = false` those stages are
+    /// pinned on the device for the whole run instead.
     #[allow(clippy::too_many_arguments)]
     fn run_core_cascade(
         &self,
@@ -3593,6 +3880,10 @@ impl Trellis2Pipeline {
         options: &Trellis2RunOptions,
     ) -> Result<Trellis2Stages> {
         Self::check_single_sample(options)?;
+        // Residency window covers preprocessing + conditioning + all stages
+        // (`low_vram = false` keeps the DINOv3 conditioning model resident
+        // across the 512/1024 cond passes too).
+        let _resident = self.enter_run_mode(options);
         if !options.preprocess {
             return Err(Lux3dError::InvalidInput(
                 "run_from_path requires options.preprocess = true; use run_prepared for \
@@ -3659,6 +3950,7 @@ impl Trellis2Pipeline {
         options: &Trellis2RunOptions,
     ) -> Result<Trellis2Stages> {
         Self::check_single_sample(options)?;
+        let _resident = self.enter_run_mode(options);
         let (cond, neg_cond) = self.image_conditioning(prepared, device)?;
         let cond_hr = match Self::needs_cond_1024(options.pipeline_type) {
             true => {
@@ -3709,6 +4001,7 @@ impl Trellis2Pipeline {
         options: &Trellis2RunOptions,
     ) -> Result<crate::contracts::Trellis2Mesh> {
         Self::check_single_sample(options)?;
+        let _resident = self.enter_run_mode(options);
         self.run_with_latents_many_inner(
             cond,
             ss_init,
@@ -3748,6 +4041,7 @@ impl Trellis2Pipeline {
         device: &Device,
         options: &Trellis2RunOptions,
     ) -> Result<Vec<Trellis2Stages>> {
+        let _resident = self.enter_run_mode(options);
         if tex_init.is_some() && !options.with_texture {
             return Err(Lux3dError::InvalidInput(
                 "tex_init requires options.with_texture = true (texture is disabled)",
@@ -3823,6 +4117,7 @@ impl Trellis2Pipeline {
                 "Trellis2 num_samples must be >= 1",
             ));
         }
+        let _resident = self.enter_run_mode(options);
         if !options.preprocess {
             return Err(Lux3dError::InvalidInput(
                 "run_many_from_path requires options.preprocess = true; use \
@@ -3901,6 +4196,124 @@ mod tests {
             .expect("flatten")
             .to_vec1::<f32>()
             .expect("to_vec1")
+    }
+
+    /// Weightless pipeline shell for the residency-window tests (same shape
+    /// as the real loaders, no stage files).
+    fn residency_test_pipeline() -> Trellis2Pipeline {
+        let config = Trellis2PipelineConfig::default();
+        Trellis2Pipeline {
+            weights: None,
+            preprocess: Trellis2Preprocess::new(config.shape_resolution).expect("preprocess"),
+            geometry: Trellis2GeometryStage,
+            export: Trellis2ExportStage,
+            config,
+            rmbg: None,
+            raw_dir: None,
+            resident: Mutex::new(ResidentStages::default()),
+        }
+    }
+
+    fn counting_load<'a>(
+        loads: &'a std::sync::atomic::AtomicUsize,
+    ) -> impl Fn() -> Result<String> + 'a {
+        move || {
+            loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("stage".to_string())
+        }
+    }
+
+    /// `low_vram` defaults to true (the reference per-stage load/drop mode).
+    #[test]
+    fn low_vram_defaults_to_per_stage_load_drop() {
+        assert!(Trellis2RunOptions::default().low_vram);
+    }
+
+    /// `low_vram = false` opens one run-scoped residency window: the first
+    /// load of a stage is pinned and later acquisitions reuse it, nested
+    /// entry points share the window, and the outermost drop releases
+    /// everything. The default `low_vram = true` never pins a stage.
+    #[test]
+    fn low_vram_false_pins_stages_for_the_whole_run() {
+        let pipeline = residency_test_pipeline();
+        let default_options = Trellis2RunOptions::default();
+        assert!(default_options.low_vram);
+
+        // Default mode: every acquisition is a private load, nothing pinned.
+        let loads = std::sync::atomic::AtomicUsize::new(0);
+        let first = pipeline
+            .acquire_stage_model("dummy", "dummy", &Device::Cpu, counting_load(&loads))
+            .expect("default load");
+        let second = pipeline
+            .acquire_stage_model("dummy", "dummy", &Device::Cpu, counting_load(&loads))
+            .expect("default load");
+        assert_eq!(2, loads.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(lock_resident(&pipeline.resident).models.is_empty());
+        drop(first);
+        drop(second);
+
+        // Resident mode: nested guards share the window; the outer drop
+        // releases the pinned stage.
+        let options = Trellis2RunOptions {
+            low_vram: false,
+            ..Trellis2RunOptions::default()
+        };
+        let loads = std::sync::atomic::AtomicUsize::new(0);
+        {
+            let outer = pipeline.enter_run_mode(&options);
+            {
+                let inner = pipeline.enter_run_mode(&options);
+                let first = pipeline
+                    .acquire_stage_model("dummy", "dummy", &Device::Cpu, counting_load(&loads))
+                    .expect("resident load");
+                let second = pipeline
+                    .acquire_stage_model("dummy", "dummy", &Device::Cpu, counting_load(&loads))
+                    .expect("resident reuse");
+                assert_eq!(1, loads.load(std::sync::atomic::Ordering::SeqCst));
+                assert!(Arc::ptr_eq(&first, &second));
+                assert_eq!(
+                    2,
+                    lock_resident(&pipeline.resident).active_runs,
+                    "nested guards share one window"
+                );
+                drop(inner);
+                assert_eq!(
+                    1,
+                    lock_resident(&pipeline.resident).active_runs,
+                    "the inner drop keeps the outer window alive"
+                );
+                assert!(lock_resident(&pipeline.resident)
+                    .cached::<String>("dummy")
+                    .is_some());
+            }
+            drop(outer);
+            assert!(lock_resident(&pipeline.resident).models.is_empty());
+        }
+        assert_eq!(0, lock_resident(&pipeline.resident).active_runs);
+        assert!(lock_resident(&pipeline.resident).models.is_empty());
+    }
+
+    /// A stage load failure inside the resident window names the CLI flag
+    /// and the device memory limit instead of falling back.
+    #[test]
+    fn resident_load_failure_names_flag_and_device_memory_limit() {
+        let error = resident_stage_load_error(
+            "shape_dit_512",
+            &Device::Cpu,
+            Lux3dError::InvalidInput("simulated out of memory"),
+        );
+        let message = error.to_string();
+        assert!(message.contains("--no-low-vram"), "message: {message}");
+        assert!(message.contains("shape_dit_512"), "message: {message}");
+        assert!(
+            message.contains("device memory limit"),
+            "message: {message}"
+        );
+        assert!(
+            message.contains("simulated out of memory"),
+            "underlying cause must be kept: {message}"
+        );
     }
 
     /// `num_samples > 1` draws ONE joint sparse-structure noise tensor

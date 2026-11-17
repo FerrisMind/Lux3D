@@ -593,6 +593,8 @@ fn trellis2_options_from_mesh_options(
             options.tex_rescale_t,
         ),
         with_texture: options.texture.unwrap_or(defaults.with_texture),
+        // CLI-only switch (TR6): the server keeps the reference default.
+        low_vram: defaults.low_vram,
         max_num_tokens: options.max_num_tokens.unwrap_or(defaults.max_num_tokens),
         preprocess: defaults.preprocess,
         num_samples,
