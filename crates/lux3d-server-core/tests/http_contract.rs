@@ -44,6 +44,9 @@ impl TestServer {
             .with_upload_dir(upload_dir.clone())
             .with_model_path(root_dir.join("missing-model"))
             .with_device_backend(DeviceBackend::Cpu)
+            // The contract server and every URL it fetches live on loopback;
+            // the production default keeps non-public addresses rejected.
+            .with_allow_private_urls(true)
             .with_observability(observability)
             .build()
             .expect("build lux3d state");

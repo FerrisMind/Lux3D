@@ -12,10 +12,11 @@ use lux3d_core::ModelAssetOptions;
 use reqwest::Client;
 
 use crate::{
-    config::{GenerationDefaults, ObservabilityConfig},
+    config::{GenerationDefaults, MediaFetchConfig, ObservabilityConfig},
     files::FileStore,
     jobs::JobStore,
     models::ModelRegistry,
+    url_policy::{MediaUrlResolver, media_redirect_policy},
 };
 
 /// Compute backend used to drive inference.
@@ -64,6 +65,12 @@ pub struct Lux3dState {
     pub files: FileStore,
     pub models: ModelRegistry,
     pub http_client: Client,
+    /// Limits and opt-ins for `source_url` / `mesh_url` fetches.
+    pub media_fetch: MediaFetchConfig,
+    /// HTTP client for user-supplied media URLs. Separate from
+    /// [`Self::http_client`] so the SSRF/timeout/size policy applies only to
+    /// media fetches and webhook delivery keeps its historical behavior.
+    pub(crate) media_http_client: Client,
     inference_lock: Arc<Mutex<()>>,
 }
 
@@ -80,11 +87,28 @@ impl Lux3dState {
         upload_dir: PathBuf,
         generation_defaults: GenerationDefaults,
         observability: ObservabilityConfig,
+        media_fetch: MediaFetchConfig,
     ) -> Self {
         let creation_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs())
             .unwrap_or(0);
+
+        let user_agent = format!("lux3d-server/{}", env!("CARGO_PKG_VERSION"));
+        let media_http_client = Client::builder()
+            .user_agent(&user_agent)
+            .connect_timeout(media_fetch.connect_timeout)
+            .timeout(media_fetch.request_timeout)
+            .redirect(media_redirect_policy(media_fetch.allow_private_urls))
+            .dns_resolver(Arc::new(MediaUrlResolver::new(
+                media_fetch.allow_private_urls,
+            )))
+            // Proxy environment variables would route the request through an
+            // intermediary we do not resolve/validate, bypassing the address
+            // policy; media fetches connect directly.
+            .no_proxy()
+            .build()
+            .expect("reqwest media client should build");
 
         Self {
             model_assets,
@@ -100,9 +124,11 @@ impl Lux3dState {
             files: FileStore::default(),
             models: ModelRegistry::default(),
             http_client: Client::builder()
-                .user_agent(format!("lux3d-server/{}", env!("CARGO_PKG_VERSION")))
+                .user_agent(&user_agent)
                 .build()
                 .expect("reqwest client should build"),
+            media_fetch,
+            media_http_client,
             inference_lock: Arc::new(Mutex::new(())),
         }
     }

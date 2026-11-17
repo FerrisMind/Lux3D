@@ -327,6 +327,8 @@ pub struct PointCloudGenerationRequest {
     pub options: PointCloudGenerationOptions,
     #[serde(default)]
     pub webhook_url: Option<String>,
+    /// Input URL (`http`/`https` only). Non-public addresses are rejected
+    /// unless the server enables `--allow-private-urls`.
     pub source_url: Option<String>,
     pub source_file_id: Option<String>,
     pub source_base64: Option<String>,
@@ -342,6 +344,8 @@ pub struct MeshGenerationRequest {
     pub options: MeshGenerationOptions,
     #[serde(default)]
     pub webhook_url: Option<String>,
+    /// Input URL (`http`/`https` only). Non-public addresses are rejected
+    /// unless the server enables `--allow-private-urls`.
     pub source_url: Option<String>,
     pub source_file_id: Option<String>,
     pub source_base64: Option<String>,
@@ -401,7 +405,8 @@ pub struct MeshTexturingRequest {
     pub options: MeshTexturingOptions,
     #[serde(default)]
     pub webhook_url: Option<String>,
-    /// Condition image (`source`) URL.
+    /// Condition image (`source`) URL (`http`/`https` only; non-public
+    /// addresses require `--allow-private-urls`).
     pub source_url: Option<String>,
     /// Condition image uploaded through the Files API.
     pub source_file_id: Option<String>,
@@ -409,7 +414,8 @@ pub struct MeshTexturingRequest {
     pub source_base64: Option<String>,
     /// Condition image filename override.
     pub source_filename: Option<String>,
-    /// Mesh to texture (.glb/.obj/.ply/.stl) URL.
+    /// Mesh to texture (.glb/.obj/.ply/.stl) URL (`http`/`https` only;
+    /// non-public addresses require `--allow-private-urls`).
     pub mesh_url: Option<String>,
     /// Mesh to texture uploaded through the Files API.
     pub mesh_file_id: Option<String>,

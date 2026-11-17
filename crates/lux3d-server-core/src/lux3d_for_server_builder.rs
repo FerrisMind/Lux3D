@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use lux3d_core::ModelAssetOptions;
 
 use crate::{
-    config::{GenerationDefaults, ObservabilityConfig},
+    config::{GenerationDefaults, MediaFetchConfig, ObservabilityConfig},
     types::{DeviceBackend, Lux3dState, SharedLux3dState},
 };
 
@@ -30,6 +30,7 @@ pub struct Lux3dForServerBuilder {
     upload_dir: Option<PathBuf>,
     generation_defaults: GenerationDefaults,
     observability: ObservabilityConfig,
+    media_fetch: MediaFetchConfig,
 }
 
 impl Default for Lux3dForServerBuilder {
@@ -44,6 +45,7 @@ impl Default for Lux3dForServerBuilder {
             upload_dir: defaults::UPLOAD_DIR,
             generation_defaults: GenerationDefaults::default(),
             observability: ObservabilityConfig::default(),
+            media_fetch: MediaFetchConfig::default(),
         }
     }
 }
@@ -154,6 +156,21 @@ impl Lux3dForServerBuilder {
         self
     }
 
+    /// Set the outbound media fetch limits (URL scheme/address policy,
+    /// timeouts and the streaming byte cap).
+    pub fn with_media_fetch_config(mut self, media_fetch: MediaFetchConfig) -> Self {
+        self.media_fetch = media_fetch;
+        self
+    }
+
+    /// Disable only the non-public address filter for `source_url` /
+    /// `mesh_url` fetches (LAN deployments). Scheme, credential, redirect,
+    /// timeout and size rules keep applying.
+    pub fn with_allow_private_urls(mut self, allow_private_urls: bool) -> Self {
+        self.media_fetch.allow_private_urls = allow_private_urls;
+        self
+    }
+
     pub fn build(self) -> Result<SharedLux3dState> {
         let upload_dir = match self.upload_dir {
             Some(path) => {
@@ -201,6 +218,7 @@ impl Lux3dForServerBuilder {
             upload_dir,
             self.generation_defaults,
             self.observability,
+            self.media_fetch,
         )))
     }
 }

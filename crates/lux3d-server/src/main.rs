@@ -38,6 +38,22 @@ struct Args {
     #[arg(long)]
     upload_dir: Option<PathBuf>,
 
+    /// Allow `source_url` / `mesh_url` fetches to non-public addresses
+    /// (loopback, RFC1918, link-local, ULA, ...) for LAN deployments. Only the
+    /// address filter is disabled: http/https, credential, redirect and
+    /// timeout/size rules still apply. Equivalent to
+    /// `LUX3D_ALLOW_PRIVATE_URLS=1`.
+    #[arg(
+        long,
+        env = "LUX3D_ALLOW_PRIVATE_URLS",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new(),
+        num_args = 0..=1,
+        default_missing_value = "true",
+        default_value_t = false
+    )]
+    allow_private_urls: bool,
+
     #[arg(long)]
     cors_origin: Vec<String>,
 
@@ -114,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
         .with_trellis2_rmbg_model_path_optional(args.trellis2_rmbg_model_path)
         .with_cuda_device(args.cuda_device)
         .with_upload_dir_optional(args.upload_dir)
+        .with_allow_private_urls(args.allow_private_urls)
         .with_job_ttl_secs(args.job_ttl_secs)
         .with_cleanup_interval_secs(args.cleanup_interval_secs)
         .with_observability(observability)

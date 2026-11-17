@@ -28,7 +28,8 @@ pub mod stream;
 pub mod system;
 pub mod types;
 mod upload;
+pub mod url_policy;
 pub mod webhooks;
 
-pub use config::{GenerationDefaults, ObservabilityConfig};
+pub use config::{GenerationDefaults, MediaFetchConfig, ObservabilityConfig};
 pub use types::{DeviceBackend, ExtractedLux3dState, Lux3dState, SharedLux3dState};

@@ -17,6 +17,48 @@ pub const DEFAULT_LIST_LIMIT: usize = 20;
 /// Default maximum upload size for the Files API (64 MiB).
 pub const DEFAULT_MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Default connect timeout for outbound media URL fetches (10 s).
+pub const DEFAULT_MEDIA_FETCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default total timeout for an outbound media URL fetch (30 s), including
+/// reading the response body.
+pub const DEFAULT_MEDIA_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default streaming byte cap for an outbound media URL fetch (64 MiB).
+pub const DEFAULT_MEDIA_FETCH_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum number of redirects followed for an outbound media URL fetch.
+pub const MEDIA_FETCH_MAX_REDIRECTS: usize = 5;
+
+/// Limits and opt-ins for outbound `source_url` / `mesh_url` fetches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaFetchConfig {
+    /// Disable only the non-public address filter (server
+    /// `--allow-private-urls` / `LUX3D_ALLOW_PRIVATE_URLS=1`) so LAN hosts can
+    /// be fetched. Scheme, credential, redirect, timeout and size rules keep
+    /// applying.
+    pub allow_private_urls: bool,
+    /// Timeout for establishing the TCP/TLS connection.
+    pub connect_timeout: Duration,
+    /// Total request timeout, including body reads.
+    pub request_timeout: Duration,
+    /// Hard cap enforced while streaming the response body. `Content-Length`
+    /// is only used as an early check; the cap is always enforced on bytes
+    /// actually read.
+    pub max_download_bytes: usize,
+}
+
+impl Default for MediaFetchConfig {
+    fn default() -> Self {
+        Self {
+            allow_private_urls: false,
+            connect_timeout: DEFAULT_MEDIA_FETCH_CONNECT_TIMEOUT,
+            request_timeout: DEFAULT_MEDIA_FETCH_TIMEOUT,
+            max_download_bytes: DEFAULT_MEDIA_FETCH_MAX_BYTES,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GenerationDefaults {
     pub job_ttl_secs: u64,

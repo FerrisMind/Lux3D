@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use url::Url;
 
-use crate::{files::resolve_file_path, types::Lux3dState};
+use crate::{files::resolve_file_path, types::Lux3dState, url_policy::validate_media_url};
 
 #[derive(Debug, Clone, Default)]
 pub struct MediaSourceInput {
@@ -167,21 +167,45 @@ async fn fetch_url_to_workspace(
     url: &str,
     filename: Option<&str>,
 ) -> Result<PathBuf> {
-    ensure!(is_allowed_url(url)?, "source URL is not allowed");
+    let parsed_url = validate_media_url(url, state.media_fetch.allow_private_urls)?;
+    let max_bytes = state.media_fetch.max_download_bytes;
 
-    let response = state
-        .http_client
-        .get(url)
+    let mut response = state
+        .media_http_client
+        .get(parsed_url.clone())
         .send()
         .await
         .with_context(|| format!("failed to fetch source URL `{url}`"))?
         .error_for_status()
         .with_context(|| format!("source URL `{url}` returned an error status"))?;
+    if response.status().is_redirection() {
+        bail!(
+            "source URL `{url}` returned {} without a usable redirect location",
+            response.status()
+        );
+    }
 
-    let bytes = response
-        .bytes()
+    // `Content-Length` is only an early rejection; the cap is enforced on the
+    // bytes actually streamed below, so chunked or lying responses cannot
+    // exceed it.
+    if let Some(content_length) = response.content_length() {
+        if content_length > max_bytes as u64 {
+            bail!(
+                "source URL `{url}` declares {content_length} bytes, above the {max_bytes} byte download cap"
+            );
+        }
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .with_context(|| format!("failed to read response body from `{url}`"))?;
+        .with_context(|| format!("failed to read response body from `{url}`"))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            bail!("source URL `{url}` exceeds the {max_bytes} byte download cap");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
 
     fs::create_dir_all(workspace).with_context(|| {
         format!(
@@ -192,7 +216,7 @@ async fn fetch_url_to_workspace(
 
     let filename = filename
         .map(ToString::to_string)
-        .or_else(|| infer_filename_from_url(url))
+        .or_else(|| infer_filename_from_url(parsed_url.as_str()))
         .unwrap_or_else(|| "source.bin".to_string());
     let path = workspace.join(sanitize_filename(&filename));
     fs::write(&path, &bytes)
@@ -253,14 +277,6 @@ fn infer_filename_from_url(url: &str) -> Option<String> {
                 .and_then(|mut segments| segments.next_back().map(str::to_string))
         })
         .filter(|name| !name.is_empty())
-}
-
-fn is_allowed_url(url: &str) -> Result<bool> {
-    let parsed = Url::parse(url).context("invalid source URL")?;
-    match parsed.scheme() {
-        "http" | "https" => Ok(true),
-        _ => Ok(false),
-    }
 }
 
 fn sanitize_filename(name: &str) -> String {
