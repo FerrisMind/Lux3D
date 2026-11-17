@@ -301,7 +301,7 @@ pub struct RunArgs {
 
     #[arg(
         long,
-        help = "TRELLIS.2 texturing voxelization/encode resolution (512 or 1024; default 1024). Selects tex_dit_512 vs tex_dit_1024 and the matching DINOv3 conditioning resolution."
+        help = "TRELLIS.2 texturing voxelization/encode resolution: 512, 1024, or 1536 (default 1024). 512 selects tex_dit_512 and 512 DINOv3 conditioning; 1024 and 1536 use tex_dit_1024 with 1024 conditioning (1536 voxelizes/encodes the mesh at 1536)."
     )]
     pub texture_resolution: Option<u32>,
 
@@ -1670,8 +1670,11 @@ fn trellis2_texturing_options_from_args(
     args: &RunArgs,
 ) -> anyhow::Result<Trellis2TexturingOptions> {
     let resolution = args.texture_resolution.unwrap_or(1024);
-    if resolution != 512 && resolution != 1024 {
-        anyhow::bail!("`--texture-resolution` must be 512 or 1024 (got {resolution})");
+    if !matches!(resolution, 512 | 1024 | 1536) {
+        anyhow::bail!(
+            "`--texture-resolution` must be 512, 1024 or 1536 (got {resolution}); 1024 and \
+             1536 share the 1024 conditioning/tex-dit configuration"
+        );
     }
     let texture_size = args.texture_size.unwrap_or(2048);
     if !(64..=8192).contains(&texture_size) {
@@ -5533,6 +5536,28 @@ mod tests {
         assert_eq!(Some(1.5), options.tex_sampler.guidance_strength);
         assert_eq!(Some(0.25), options.tex_sampler.guidance_rescale);
         assert_eq!(Some((0.5, 0.8)), options.tex_sampler.guidance_interval);
+
+        // 1536 is an upstream app choice (`app_texturing.py:101`): accepted,
+        // voxelizes/encodes at 1536, keeps the 1024 conditioning config.
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "trellis2",
+            "--source",
+            "image.png",
+            "--texture-mesh",
+            "input.glb",
+            "--texture-resolution",
+            "1536",
+            "--output",
+            "out.glb",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        let options = super::trellis2_texturing_options_from_args(&args).expect("options");
+        assert_eq!(1536, options.resolution);
+        assert_eq!(1024, options.cond_resolution());
 
         let cli = Cli::parse_from([
             "lux3d",

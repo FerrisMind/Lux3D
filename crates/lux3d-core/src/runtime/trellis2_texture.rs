@@ -14,8 +14,9 @@
 //!    (x, z, -y)` restores the original orientation at export.
 //! 2. `preprocess_image` + `get_cond`: the reference foreground square crop
 //!    (premultiplied RGB, RMBG-2.0 for opaque inputs) at `512` when
-//!    `resolution == 512`, else at `1024`, then DINOv3 ViT-L/16
-//!    conditioning (`cond` + `neg_cond = zeros_like(cond)`).
+//!    `resolution == 512`, else at `1024` (so `1024` and `1536` share the
+//!    `cond_1024` configuration), then DINOv3 ViT-L/16 conditioning
+//!    (`cond` + `neg_cond = zeros_like(cond)`).
 //! 3. `encode_shape_slat`: `mesh_to_flexible_dual_grid` at `resolution`
 //!    ([`MeshToDualGridOptions::for_shape_slat_encoder`]: explicit
 //!    `[-0.5, 0.5]^3` aabb, `boundary_weight = 0.2`,
@@ -27,7 +28,11 @@
 //!    `shape_slat_normalization` inside the stage; noise `[N, 32]` is
 //!    concatenated with it (noise first) into the 64-channel
 //!    `tex_dit_512` / `tex_dit_1024` input; the sampled latent is
-//!    de-normalized with `tex_slat_normalization`. Sampler params:
+//!    de-normalized with `tex_slat_normalization`. The reference selects
+//!    `tex_slat_flow_model_512` only for `resolution == 512` and the 1024
+//!    model otherwise (`trellis2_texturing.py:401`), so `1536` rides the
+//!    same 1024 checkpoint through the elastic RoPE path on its 96-cell
+//!    latent grid. Sampler params:
 //!    `resolve_stage_params(&config.tex_sampler, Some(&options.tex_sampler),
 //!    12)`.
 //! 5. `decode_tex_slat`: guided texture VAE decode (`tex_dec`,
@@ -97,19 +102,19 @@ use std::path::Path;
 use candle_core::{DType, Device, Tensor};
 
 use super::trellis2::{
-    Trellis2Pipeline, Trellis2SamplerOverrides, Trellis2TextureExportOptions, Trellis2TexturedMesh,
-    build_trellis2_textured_mesh, resolve_stage_params,
+    build_trellis2_textured_mesh, resolve_stage_params, Trellis2Pipeline, Trellis2SamplerOverrides,
+    Trellis2TextureExportOptions, Trellis2TexturedMesh,
 };
 use super::trellis2_shape_enc::{
-    Trellis2ShapeEncoder, Trellis2ShapeEncoderConfig, load_trellis2_shape_encoder_from_stage_file,
+    load_trellis2_shape_encoder_from_stage_file, Trellis2ShapeEncoder, Trellis2ShapeEncoderConfig,
 };
-use super::trellis2_tex::{Trellis2PbrLayout, query_vertex_colors};
+use super::trellis2_tex::{query_vertex_colors, Trellis2PbrLayout};
 use super::trellis2_vae::Trellis2ShapeVaeConfig;
 use crate::contracts::{SpatialSize, TensorContract, Trellis2PreparedImage, Trellis2RawInput};
 use crate::error::Lux3dError;
-use crate::geometry::{MeshToDualGridOptions, Trellis2MeshBuffers, mesh_to_flexible_dual_grid};
-use crate::preprocess::{Trellis2Preprocess, resize_lanczos_u8};
-use crate::weights::{ModelAssetOptions, VarBuilder, is_gguf_path, load_canonical_weights};
+use crate::geometry::{mesh_to_flexible_dual_grid, MeshToDualGridOptions, Trellis2MeshBuffers};
+use crate::preprocess::{resize_lanczos_u8, Trellis2Preprocess};
+use crate::weights::{is_gguf_path, load_canonical_weights, ModelAssetOptions, VarBuilder};
 use crate::{ModelFamily, Result};
 
 /// Raw shape-SLAT encoder checkpoint path relative to the TRELLIS.2 model
@@ -127,9 +132,13 @@ pub const TRELLIS2_SHAPE_ENC_EXTERNAL_REL: &str = "external/shape_enc/model.safe
 pub struct Trellis2TexturingOptions {
     /// RNG seed for the texture SLAT noise (42).
     pub seed: u64,
-    /// Voxelization / shape-encode / texture-sampling resolution (1024;
-    /// `512` selects the `tex_dit_512` stage and 512 conditioning). Upstream
-    /// supports these two values only.
+    /// Voxelization / shape-encode / texture-sampling resolution (1024).
+    /// `512` selects the `tex_dit_512` stage and 512 conditioning; `1024`
+    /// and `1536` share the `tex_dit_1024` stage and the 1024 conditioning
+    /// configuration — the reference app radio offers 512/1024/1536
+    /// (`app_texturing.py:101`) and `run(...)` picks the 512 model only for
+    /// `resolution == 512` while voxelizing/encoding at `resolution`
+    /// (`trellis2_texturing.py:399-407`).
     pub resolution: u32,
     /// Texture sampler overrides merged over the pipeline-config
     /// `tex_slat_sampler` defaults (`resolve_stage_params`; the base step
@@ -162,14 +171,16 @@ impl Default for Trellis2TexturingOptions {
 }
 
 impl Trellis2TexturingOptions {
-    /// Validate the options: `resolution` in `{512, 1024}` (the two upstream
-    /// conditioning/flow configurations) and a `texture_size` matching the
-    /// texture-export contract (multiple of 8 in `8..=8192`).
+    /// Validate the options: `resolution` in `{512, 1024, 1536}` (the three
+    /// upstream app choices; 1024 and 1536 share the 1024 conditioning/flow
+    /// configuration) and a `texture_size` matching the texture-export
+    /// contract (multiple of 8 in `8..=8192`).
     pub fn validate(&self) -> Result<()> {
-        if self.resolution != 512 && self.resolution != 1024 {
+        if !matches!(self.resolution, 512 | 1024 | 1536) {
             return Err(Lux3dError::InvalidInput(
-                "Trellis2 texturing resolution must be 512 or 1024 (the reference \
-                 get_cond / tex flow configurations)",
+                "Trellis2 texturing resolution must be 512, 1024 or 1536 (the reference \
+                 app choices; 1024 and 1536 share the 1024 get_cond / tex flow \
+                 configuration)",
             ));
         }
         let texture = Trellis2TextureExportOptions {
@@ -182,9 +193,14 @@ impl Trellis2TexturingOptions {
     }
 
     /// The DINOv3 conditioning resolution (`get_cond(image, 512 if
-    /// resolution == 512 else 1024)`).
+    /// resolution == 512 else 1024)`); `1536` texturing uses the 1024
+    /// conditioning configuration.
     pub fn cond_resolution(&self) -> u32 {
-        if self.resolution == 512 { 512 } else { 1024 }
+        if self.resolution == 512 {
+            512
+        } else {
+            1024
+        }
     }
 }
 
@@ -679,7 +695,8 @@ impl Trellis2Pipeline {
         };
 
         // 2. conditioning: the reference crops once and feeds the same crop
-        //    to `get_cond` at the texturing resolution.
+        //    to `get_cond` at the conditioning resolution (512 only for
+        //    `resolution == 512`, else 1024; 1536 texturing uses 1024).
         let cond_resolution = options.cond_resolution();
         let cond_preprocess = Trellis2Preprocess::new(cond_resolution)?;
         let prepared = if options.preprocess_image {
@@ -694,7 +711,10 @@ impl Trellis2Pipeline {
             })?;
         let (cond, _neg_cond) = self.dino_conditioning_pixels(&pixel_values, device)?;
 
-        // 3. voxelization + 4. shape SLAT encode (raw mean latent).
+        // 3. voxelization + 4. shape SLAT encode (raw mean latent). The
+        //    shape-encoder grid size is the full `resolution` (the reference
+        //    `encode_shape_slat(mesh, resolution)` voxelizes at 1536 even
+        //    when the 1024 conditioning/flow configuration is selected).
         let vox = mesh_to_flexible_dual_grid(
             &mesh_vertices,
             faces,
@@ -765,6 +785,11 @@ impl Trellis2Pipeline {
                 device,
             )?
         } else {
+            // 1024 and 1536 both use the reference `tex_slat_flow_model_1024`
+            // checkpoint (`run(...)`: `tex_slat_flow_model_512` if resolution
+            // == 512 else `tex_slat_flow_model_1024`); the 1536 shape latent
+            // lives on the 96-cell grid, so `sample_tex_slat_hr` selects the
+            // same checkpoint with the elastic validation bound.
             self.sample_tex_slat_hr(
                 &cond,
                 &shape_latent,
@@ -978,4 +1003,71 @@ fn prepared_without_preprocess(
             vec![1, 3, cond_resolution as usize, cond_resolution as usize],
         ),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reference app radio offers exactly 512/1024/1536
+    /// (`app_texturing.py:101`); `validate` must accept those and reject
+    /// everything else.
+    #[test]
+    fn texturing_resolution_validation_matches_app_choices() {
+        for resolution in [512_u32, 1024, 1536] {
+            let options = Trellis2TexturingOptions {
+                resolution,
+                ..Default::default()
+            };
+            options
+                .validate()
+                .unwrap_or_else(|error| panic!("resolution {resolution} must validate: {error}"));
+        }
+        for resolution in [0_u32, 256, 768, 1024 + 1, 2048, 3072] {
+            let options = Trellis2TexturingOptions {
+                resolution,
+                ..Default::default()
+            };
+            assert!(
+                options.validate().is_err(),
+                "resolution {resolution} must be rejected"
+            );
+        }
+    }
+
+    /// 1536 voxelizes/encodes at 1536 (grid size = resolution, latent grid =
+    /// resolution / 16 = 96) while conditioning stays at the 1024
+    /// configuration (`trellis2_texturing.py:399-407`).
+    #[test]
+    fn texturing_1536_uses_full_grid_with_1024_conditioning() {
+        let options = Trellis2TexturingOptions {
+            resolution: 1536,
+            ..Default::default()
+        };
+        options.validate().expect("1536 must validate");
+        assert_eq!(1024, options.cond_resolution());
+        assert_eq!(96, options.resolution / 16);
+
+        let grid = MeshToDualGridOptions::for_shape_slat_encoder(options.resolution);
+        assert_eq!([1536, 1536, 1536], grid.grid_size);
+        assert_eq!(
+            Some([[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]]),
+            grid.aabb,
+            "the shape encoder keeps the reference [-0.5, 0.5]^3 aabb"
+        );
+    }
+
+    /// Existing 512/1024 paths keep their dispatch: 512 -> 512 conditioning,
+    /// 1024 -> 1024 conditioning.
+    #[test]
+    fn texturing_existing_resolutions_unchanged() {
+        assert_eq!(Trellis2TexturingOptions::default().resolution, 1024);
+        for (resolution, expected_cond) in [(512_u32, 512_u32), (1024, 1024), (1536, 1024)] {
+            let options = Trellis2TexturingOptions {
+                resolution,
+                ..Default::default()
+            };
+            assert_eq!(expected_cond, options.cond_resolution());
+        }
+    }
 }
