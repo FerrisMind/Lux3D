@@ -81,7 +81,7 @@ mod pi3_decoder;
 mod pi3_encoder;
 mod pi3_heads;
 mod pi3x;
-mod point_camera_ops;
+pub(crate) mod point_camera_ops;
 mod resampling;
 mod rmbg;
 mod rmbg2;

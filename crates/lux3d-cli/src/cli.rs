@@ -993,6 +993,7 @@ pub fn run_model(args: RunArgs) -> anyhow::Result<PathBuf> {
 
     match args.family.model_family() {
         ModelFamily::Pi3 => {
+            reject_unsupported_pi3_options(&args)?;
             reject_triposg_only_options(&args, args.family)?;
             reject_vggt_only_options(&args, args.family)?;
             reject_trellis2_only_options(&args, args.family)?;
@@ -1000,6 +1001,7 @@ pub fn run_model(args: RunArgs) -> anyhow::Result<PathBuf> {
                 model_assets,
                 required_source(&args, "pi3")?,
                 args.interval,
+                args.conf_threshold,
                 &args.output,
                 &device,
             )?
@@ -1023,6 +1025,7 @@ pub fn run_model(args: RunArgs) -> anyhow::Result<PathBuf> {
             )?
         }
         ModelFamily::TripoSr => {
+            reject_unsupported_triposr_options(&args)?;
             reject_triposg_only_options(&args, args.family)?;
             reject_vggt_only_options(&args, args.family)?;
             reject_trellis2_only_options(&args, args.family)?;
@@ -1178,6 +1181,7 @@ fn run_pi3(
     model_assets: ModelAssetOptions,
     source: &Path,
     interval: Option<usize>,
+    conf_threshold: Option<f32>,
     output: &Path,
     device: &candle_core::Device,
 ) -> anyhow::Result<()> {
@@ -1188,7 +1192,14 @@ fn run_pi3(
         eprintln!("[stage] load: {:.2}s", t0.elapsed().as_secs_f64());
     }
     let t1 = std::time::Instant::now();
-    let inference = pipeline.infer_from_path_with_interval(source, interval, device)?;
+    let mut inference = pipeline.infer_from_path_with_interval(source, interval, device)?;
+    if let Some(confidence_threshold) = conf_threshold {
+        inference.export_mask = pipeline.export.export_mask_with_threshold(
+            &inference.local_points,
+            &inference.confidence_logits,
+            confidence_threshold,
+        )?;
+    }
     if stage_time {
         eprintln!("[stage] infer: {:.2}s", t1.elapsed().as_secs_f64());
     }
@@ -1196,6 +1207,50 @@ fn run_pi3(
     pipeline.export_point_cloud(&inference, output)?;
     if stage_time {
         eprintln!("[stage] export: {:.2}s", t2.elapsed().as_secs_f64());
+    }
+    Ok(())
+}
+
+/// Pi3 exposes single-pass point-cloud inference only. Reject the Pi3X
+/// VO/conditioning options and the TripoSG/TRELLIS.2 RMBG override instead of
+/// silently ignoring them. `--interval` is genuinely consumed by the Pi3 frame
+/// sampler and `--conf-threshold` gates the export mask, so both stay accepted.
+fn reject_unsupported_pi3_options(args: &RunArgs) -> anyhow::Result<()> {
+    let set: [(&str, bool); 6] = [
+        ("--vo", args.vo),
+        ("--conditions", args.conditions.is_some()),
+        ("--chunk-size", args.chunk_size.is_some()),
+        ("--overlap", args.overlap.is_some()),
+        ("--inject-condition", !args.inject_condition.is_empty()),
+        ("--rmbg-model-path", args.rmbg_model_path.is_some()),
+    ];
+    for (flag, is_set) in set {
+        if is_set {
+            anyhow::bail!("`{flag}` is not supported for `pi3`");
+        }
+    }
+    Ok(())
+}
+
+/// TripoSR exposes image-to-mesh only (`--mc-resolution` / `--mc-threshold` are
+/// consumed). Reject the Pi3/Pi3X/conditioning options, the Pi3 video
+/// `--interval`, the confidence gate and the RMBG override instead of silently
+/// ignoring them.
+fn reject_unsupported_triposr_options(args: &RunArgs) -> anyhow::Result<()> {
+    let set: [(&str, bool); 8] = [
+        ("--vo", args.vo),
+        ("--conditions", args.conditions.is_some()),
+        ("--chunk-size", args.chunk_size.is_some()),
+        ("--overlap", args.overlap.is_some()),
+        ("--inject-condition", !args.inject_condition.is_empty()),
+        ("--interval", args.interval.is_some()),
+        ("--rmbg-model-path", args.rmbg_model_path.is_some()),
+        ("--conf-threshold", args.conf_threshold.is_some()),
+    ];
+    for (flag, is_set) in set {
+        if is_set {
+            anyhow::bail!("`{flag}` is not supported for `triposr`");
+        }
     }
     Ok(())
 }
@@ -4762,6 +4817,125 @@ mod tests {
                 extra[0]
             );
         }
+    }
+
+    /// Pi3 accepts `--interval` (frame sampling) and `--conf-threshold` (export
+    /// gate) but must reject the Pi3X conditioning, TripoSR meshing and RMBG
+    /// options it would otherwise silently ignore.
+    #[test]
+    fn run_pi3_rejects_foreign_family_options() {
+        let flag_options: [(&str, &[&str]); 6] = [
+            ("--vo", &["--vo"]),
+            ("--conditions", &["--conditions", "conditions.npz"]),
+            ("--chunk-size", &["--chunk-size", "8"]),
+            ("--overlap", &["--overlap", "4"]),
+            ("--inject-condition", &["--inject-condition", "pose"]),
+            ("--rmbg-model-path", &["--rmbg-model-path", "rmbg"]),
+        ];
+        for (flag, extra) in flag_options {
+            let mut argv = vec![
+                "lux3d", "run", "pi3", "--source", "frames", "--output", "out.ply",
+            ];
+            argv.extend_from_slice(extra);
+            let cli = Cli::parse_from(argv);
+            let Command::Run(args) = cli.command else {
+                panic!("expected run command");
+            };
+            let error = super::reject_unsupported_pi3_options(&args)
+                .expect_err(&format!("{flag} must be rejected for pi3"));
+            let message = error.to_string();
+            assert!(
+                message.contains("is not supported for `pi3`"),
+                "unexpected message for {flag}: `{message}`"
+            );
+            assert!(message.contains(flag), "`{flag}` missing in `{message}`");
+        }
+    }
+
+    #[test]
+    fn pi3_keeps_interval_and_conf_threshold() {
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "pi3",
+            "--source",
+            "frames",
+            "--interval",
+            "2",
+            "--conf-threshold",
+            "0.5",
+            "--output",
+            "out.ply",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(Some(2), args.interval);
+        assert_eq!(Some(0.5), args.conf_threshold);
+        super::reject_unsupported_pi3_options(&args)
+            .expect("--interval and --conf-threshold are supported for pi3");
+    }
+
+    /// `--mc-resolution` / `--mc-threshold` stay TripoSR inputs; every other
+    /// shared flag the TripoSR runtime never reads must fail fast.
+    #[test]
+    fn run_triposr_rejects_foreign_family_options() {
+        let flag_options: [(&str, &[&str]); 8] = [
+            ("--vo", &["--vo"]),
+            ("--conditions", &["--conditions", "conditions.npz"]),
+            ("--chunk-size", &["--chunk-size", "8"]),
+            ("--overlap", &["--overlap", "4"]),
+            ("--inject-condition", &["--inject-condition", "pose"]),
+            ("--interval", &["--interval", "2"]),
+            ("--rmbg-model-path", &["--rmbg-model-path", "rmbg"]),
+            ("--conf-threshold", &["--conf-threshold", "0.5"]),
+        ];
+        for (flag, extra) in flag_options {
+            let mut argv = vec![
+                "lux3d",
+                "run",
+                "triposr",
+                "--source",
+                "horse.png",
+                "--output",
+                "out.obj",
+            ];
+            argv.extend_from_slice(extra);
+            let cli = Cli::parse_from(argv);
+            let Command::Run(args) = cli.command else {
+                panic!("expected run command");
+            };
+            let error = super::reject_unsupported_triposr_options(&args)
+                .expect_err(&format!("{flag} must be rejected for triposr"));
+            let message = error.to_string();
+            assert!(
+                message.contains("is not supported for `triposr`"),
+                "unexpected message for {flag}: `{message}`"
+            );
+            assert!(message.contains(flag), "`{flag}` missing in `{message}`");
+        }
+    }
+
+    #[test]
+    fn triposr_keeps_marching_cubes_flags() {
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "triposr",
+            "--source",
+            "horse.png",
+            "--mc-resolution",
+            "512",
+            "--mc-threshold",
+            "30",
+            "--output",
+            "out.obj",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        super::reject_unsupported_triposr_options(&args)
+            .expect("--mc-resolution/--mc-threshold are supported for triposr");
     }
 
     /// The new TripoSG-only core flags (`--faces` / `--dtype` / `--bounds` /

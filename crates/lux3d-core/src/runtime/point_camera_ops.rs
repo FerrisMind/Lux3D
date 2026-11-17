@@ -1,5 +1,5 @@
-use candle_core::{D, IndexOp, Result as CandleResult, Tensor};
-use nalgebra::{Matrix3, SVD, Vector3};
+use candle_core::{IndexOp, Result as CandleResult, Tensor, D};
+use nalgebra::{Matrix3, Vector3, SVD};
 
 const ORTHOGONALIZE_EPS: f32 = 1e-6;
 
@@ -119,6 +119,21 @@ pub(crate) fn export_mask_from_local_points_and_confidence(
     local_points: &Tensor,
     confidence_logits: &Tensor,
 ) -> CandleResult<Tensor> {
+    export_mask_from_local_points_and_confidence_with_threshold(
+        local_points,
+        confidence_logits,
+        0.1,
+    )
+}
+
+/// Reference export gate: `sigmoid(confidence_logits) > confidence_threshold`
+/// AND the local-depth edge mask. `0.1` is the upstream default
+/// (`sigmoid(confidence_logits) > 0.1`); the Pi3 CLI can override it.
+pub(crate) fn export_mask_from_local_points_and_confidence_with_threshold(
+    local_points: &Tensor,
+    confidence_logits: &Tensor,
+    confidence_threshold: f32,
+) -> CandleResult<Tensor> {
     let (b, n, h, w, _c) = confidence_logits.dims5()?;
     let confidence = candle_nn::ops::sigmoid(
         &confidence_logits
@@ -126,7 +141,7 @@ pub(crate) fn export_mask_from_local_points_and_confidence(
             .i((.., .., .., 0))?
             .reshape((b, n, h, w))?,
     )?;
-    let confidence_mask = confidence.ge(0.1)?;
+    let confidence_mask = confidence.ge(confidence_threshold)?;
     let non_edge = non_edge_mask_from_local_points(local_points)?;
     let false_mask = Tensor::zeros(
         confidence_mask.shape(),
