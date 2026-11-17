@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use axum::extract::multipart::{Field, Multipart};
 use serde::de::DeserializeOwned;
 use uuid::Uuid;

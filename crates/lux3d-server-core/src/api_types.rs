@@ -84,6 +84,20 @@ pub struct RouteSummary {
     pub methods: String,
 }
 
+/// Maximum accepted TRELLIS.2 `num_samples` value. The joint-noise draw
+/// allocates `num_samples * in_channels * R^3` values per stage, so one
+/// request may request at most 64 samples.
+pub const MAX_TRELLIS2_NUM_SAMPLES: usize = 64;
+
+/// Maximum accepted step count for any single denoising schedule (`steps`,
+/// `ss_steps`, `shape_steps`, `tex_steps`, and the texturing `tex_steps`).
+/// Each step is one full model forward pass.
+pub const MAX_GENERATION_STEPS: usize = 1000;
+
+/// Maximum accepted number of entries in the explicit TripoSG `timesteps`
+/// schedule. Each entry runs one full DiT forward pass.
+pub const MAX_TIMESTEPS: usize = 1000;
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, ToSchema)]
 pub struct PointCloudGenerationOptions {
     /// Point-cloud artifact format: `ply` (default) or `xyz`.
@@ -109,6 +123,9 @@ pub struct MeshGenerationOptions {
     pub mc_threshold: f32,
     // TripoSG-only options (`Option`-typed so omitted fields stay `None` and
     // triposr keeps working unchanged).
+    /// TripoSG rectified-flow denoise steps (default 50) or the TRELLIS.2
+    /// base Euler step count shared by all three stages (default 12).
+    /// At most 1000.
     #[serde(default)]
     pub steps: Option<usize>,
     #[serde(default)]
@@ -129,7 +146,8 @@ pub struct MeshGenerationOptions {
     pub query_chunk_size: Option<usize>,
     /// Explicit rectified-flow timestep schedule (upstream
     /// `TripoSGPipeline.__call__(timesteps=...)`); when set, `steps` is
-    /// ignored and the denoise loop runs exactly these timesteps.
+    /// ignored and the denoise loop runs exactly these timesteps. At most
+    /// 1000 entries; each entry runs one full DiT forward pass.
     #[serde(default)]
     pub timesteps: Option<Vec<f32>>,
     /// SDF query bounds override `[min_x, min_y, min_z, max_x, max_y, max_z]`
@@ -155,7 +173,7 @@ pub struct MeshGenerationOptions {
     /// vertex colors, default true); `false` exports the geometry-only mesh.
     #[serde(default)]
     pub texture: Option<bool>,
-    /// Sparse-structure Euler step count (defaults to `steps`).
+    /// Sparse-structure Euler step count (defaults to `steps`). At most 1000.
     #[serde(default)]
     pub ss_steps: Option<usize>,
     /// Sparse-structure classifier-free guidance strength (`1.0` disables).
@@ -171,7 +189,7 @@ pub struct MeshGenerationOptions {
     #[serde(default)]
     pub ss_rescale_t: Option<f32>,
     /// Shape SLAT Euler step count (defaults to `steps`; applies to both
-    /// cascade shape stages).
+    /// cascade shape stages). At most 1000.
     #[serde(default)]
     pub shape_steps: Option<usize>,
     /// Shape SLAT classifier-free guidance strength (`1.0` disables).
@@ -186,7 +204,7 @@ pub struct MeshGenerationOptions {
     /// Shape SLAT t-schedule rescale factor.
     #[serde(default)]
     pub shape_rescale_t: Option<f32>,
-    /// Texture SLAT Euler step count (defaults to `steps`).
+    /// Texture SLAT Euler step count (defaults to `steps`). At most 1000.
     #[serde(default)]
     pub tex_steps: Option<usize>,
     /// Texture SLAT classifier-free guidance strength (`1.0` disables).
@@ -201,9 +219,12 @@ pub struct MeshGenerationOptions {
     /// Texture SLAT t-schedule rescale factor.
     #[serde(default)]
     pub tex_rescale_t: Option<f32>,
-    /// Sample count (default 1). Values above 1 run the sequential
-    /// seed-offset emulation and export one artifact per sample with an
-    /// `_i` suffix; sample 0 is served through `/content`.
+    /// TRELLIS.2 sample count (default 1). At most 64. Values above 1 use
+    /// the upstream joint-noise batch draw: one joint noise tensor per stage
+    /// from a single RNG stream and one shared conditioning pass, with the
+    /// sample-0 slice identical to the `num_samples = 1` draw. One artifact
+    /// is exported per sample with an `_i` suffix; sample 0 is served
+    /// through `/content`.
     #[serde(default)]
     pub num_samples: Option<usize>,
     /// Baked texture edge length (default 2048; multiple of 8 in `8..=8192`).
@@ -348,6 +369,7 @@ pub struct MeshTexturingOptions {
     #[serde(default)]
     pub texture_size: Option<usize>,
     /// Texture SLAT Euler step count (defaults to the pipeline config, 12).
+    /// At most 1000.
     #[serde(default)]
     pub tex_steps: Option<usize>,
     /// Texture SLAT classifier-free guidance strength (`1.0` disables).

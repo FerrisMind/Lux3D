@@ -5,8 +5,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{bail, ensure, Context, Result};
-use base64::{engine::general_purpose::STANDARD, Engine};
+use anyhow::{Context, Result, bail, ensure};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use url::Url;
 
 use crate::{files::resolve_file_path, types::Lux3dState};
@@ -52,7 +52,8 @@ pub async fn resolve_mesh_path(
     workspace: &Path,
     input: &MeshSourceInput,
 ) -> Result<PathBuf> {
-    resolve_media_path(
+    validate_mesh_source_input(input)?;
+    let path = resolve_media_path(
         state,
         workspace,
         input.mesh_url.as_deref(),
@@ -61,7 +62,70 @@ pub async fn resolve_mesh_path(
         input.mesh_filename.as_deref(),
         "one of `mesh`, `mesh_url`, `mesh_file_id`, or `mesh_base64` is required",
     )
-    .await
+    .await?;
+    ensure_supported_mesh_path(&path)?;
+    Ok(path)
+}
+
+/// Mesh readers dispatch on the file extension (`load_mesh`), so reject an
+/// input that cannot be read before any job is created. Accepts the readers
+/// currently implemented by `lux3d-core`: `.glb`, `.obj`, `.ply` and `.stl`.
+pub(crate) fn ensure_supported_mesh_path(path: &Path) -> Result<()> {
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    require_supported_mesh_filename(filename, "mesh input filename")
+}
+
+/// Validate the effective mesh filename before downloading or writing
+/// anything. Mirrors the `resolve_media_path` precedence (`url`, then
+/// `file_id`, then `base64`); a resolved file-id path is checked by
+/// [`ensure_supported_mesh_path`] after the lookup.
+fn validate_mesh_source_input(input: &MeshSourceInput) -> Result<()> {
+    if let Some(url) = input.mesh_url.as_deref() {
+        match input.mesh_filename.as_deref() {
+            Some(filename) => {
+                require_supported_mesh_filename(filename, "`mesh_filename`")?;
+            }
+            None => {
+                let filename = infer_filename_from_url(url).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "`mesh_url` `{url}` has no filename; pass `mesh_filename` with a \
+                         supported mesh extension (.glb, .obj, .ply or .stl)"
+                    )
+                })?;
+                require_supported_mesh_filename(&filename, "`mesh_url` path")?;
+            }
+        }
+    } else if input.mesh_file_id.is_none() {
+        if input.mesh_base64.is_some() {
+            let filename = input.mesh_filename.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "`mesh_base64` requires `mesh_filename` with a supported mesh extension \
+                     (.glb, .obj, .ply or .stl)"
+                )
+            })?;
+            require_supported_mesh_filename(filename, "`mesh_filename`")?;
+        }
+    }
+    Ok(())
+}
+
+fn require_supported_mesh_filename(filename: &str, context: &str) -> Result<()> {
+    ensure!(
+        is_supported_mesh_filename(filename),
+        "{context} `{filename}` has no supported mesh extension; use .glb, .obj, .ply or .stl"
+    );
+    Ok(())
+}
+
+fn is_supported_mesh_filename(filename: &str) -> bool {
+    let extension = Path::new(filename)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.trim_start_matches('.').to_ascii_lowercase());
+    matches!(extension.as_deref(), Some("glb" | "obj" | "ply" | "stl"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -214,5 +278,112 @@ fn sanitize_filename(name: &str) -> String {
         "source.bin".to_string()
     } else {
         sanitized
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MeshSourceInput, ensure_supported_mesh_path, is_supported_mesh_filename,
+        validate_mesh_source_input,
+    };
+    use std::path::Path;
+
+    fn mesh_input(
+        url: Option<&str>,
+        file_id: Option<&str>,
+        base64: Option<&str>,
+        filename: Option<&str>,
+    ) -> MeshSourceInput {
+        MeshSourceInput {
+            mesh_url: url.map(str::to_string),
+            mesh_file_id: file_id.map(str::to_string),
+            mesh_base64: base64.map(str::to_string),
+            mesh_filename: filename.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn supported_mesh_extensions_are_case_insensitive() {
+        for filename in ["mesh.glb", "mesh.OBJ", "mesh.Ply", "mesh.stl"] {
+            assert!(
+                is_supported_mesh_filename(filename),
+                "`{filename}` must be accepted"
+            );
+        }
+        for filename in ["mesh", "mesh.bin", "mesh.gltf", "mesh.png"] {
+            assert!(
+                !is_supported_mesh_filename(filename),
+                "`{filename}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn mesh_url_requires_a_supported_path_extension() {
+        validate_mesh_source_input(&mesh_input(
+            Some("https://example.test/mesh.glb?token=abc"),
+            None,
+            None,
+            None,
+        ))
+        .expect("URL with a supported mesh path extension");
+
+        let error = validate_mesh_source_input(&mesh_input(
+            Some("https://example.test/mesh"),
+            None,
+            None,
+            None,
+        ))
+        .expect_err("extensionless mesh URL must be rejected");
+        assert!(
+            error.to_string().contains("`mesh_url` path"),
+            "unexpected message: `{error}`"
+        );
+
+        validate_mesh_source_input(&mesh_input(
+            Some("https://example.test/download"),
+            None,
+            None,
+            Some("mesh.stl"),
+        ))
+        .expect("mesh_filename can supply the reader extension");
+    }
+
+    #[test]
+    fn mesh_base64_requires_a_supported_mesh_filename() {
+        let error = validate_mesh_source_input(&mesh_input(None, None, Some("aGVsbG8="), None))
+            .expect_err("base64 mesh without a filename must be rejected");
+        assert!(
+            error.to_string().contains("requires `mesh_filename`"),
+            "unexpected message: `{error}`"
+        );
+
+        let error =
+            validate_mesh_source_input(&mesh_input(None, None, Some("aGVsbG8="), Some("mesh.bin")))
+                .expect_err("base64 mesh with an unknown extension must be rejected");
+        assert!(
+            error.to_string().contains("`mesh_filename` `mesh.bin`"),
+            "unexpected message: `{error}`"
+        );
+
+        validate_mesh_source_input(&mesh_input(None, None, Some("aGVsbG8="), Some("mesh.glb")))
+            .expect("base64 mesh with a supported filename");
+    }
+
+    #[test]
+    fn file_id_mesh_inputs_are_checked_after_resolution() {
+        // The stored upload filename is only known after the file lookup, so
+        // the pre-download validation deliberately skips `mesh_file_id`.
+        validate_mesh_source_input(&mesh_input(None, Some("file_123"), None, None))
+            .expect("file-id input is validated from the resolved path");
+
+        ensure_supported_mesh_path(Path::new("mesh.glb")).expect("supported resolved path");
+        let error = ensure_supported_mesh_path(Path::new("upload-123.bin"))
+            .expect_err("resolved path without a supported extension must be rejected");
+        assert!(
+            error.to_string().contains("mesh input filename"),
+            "unexpected message: `{error}`"
+        );
     }
 }

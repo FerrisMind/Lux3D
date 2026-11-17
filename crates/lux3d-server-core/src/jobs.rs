@@ -8,20 +8,21 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{bail, ensure, Context, Result};
-use lux3d_core::export::{load_mesh, MeshFormat, PointCloudFormat};
+use anyhow::{Context, Result, bail, ensure};
+use lux3d_core::export::{MeshFormat, PointCloudFormat, load_mesh};
 use lux3d_core::runtime::{
     Pi3xInjectConditions, Trellis2RunOptions, Trellis2SamplerOverrides, Trellis2TexturingOptions,
     TripoSgRunOptions,
 };
-use lux3d_core::{export::pbrvox, Trellis2PipelineType};
+use lux3d_core::{Trellis2PipelineType, export::pbrvox};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
     api_types::{
-        GenerationError, GenerationObject, GenerationStatus, MeshGenerationOptions,
-        MeshTexturingOptions, PointCloudGenerationOptions,
+        GenerationError, GenerationObject, GenerationStatus, MAX_GENERATION_STEPS, MAX_TIMESTEPS,
+        MAX_TRELLIS2_NUM_SAMPLES, MeshGenerationOptions, MeshTexturingOptions,
+        PointCloudGenerationOptions,
     },
     metrics::{record_generation_finished, record_generation_started},
     types::Lux3dState,
@@ -478,6 +479,18 @@ fn triposg_options_from_mesh_options(options: &MeshGenerationOptions) -> Result<
         bounds: options.bounds,
         faces: options.faces,
     };
+    ensure!(
+        run_options.steps <= MAX_GENERATION_STEPS,
+        "`steps` must be at most {MAX_GENERATION_STEPS} (got {})",
+        run_options.steps
+    );
+    if let Some(timesteps) = &run_options.timesteps {
+        ensure!(
+            timesteps.len() <= MAX_TIMESTEPS,
+            "`timesteps` must contain at most {MAX_TIMESTEPS} entries (got {})",
+            timesteps.len()
+        );
+    }
     run_options.validate().map_err(anyhow::Error::from)?;
     Ok(run_options)
 }
@@ -528,6 +541,22 @@ fn trellis2_options_from_mesh_options(
         ),
     };
     let steps = options.steps.unwrap_or(defaults.ss_steps);
+    ensure!(
+        steps <= MAX_GENERATION_STEPS,
+        "`steps` must be at most {MAX_GENERATION_STEPS} (got {steps})"
+    );
+    for (name, value) in [
+        ("ss_steps", options.ss_steps),
+        ("shape_steps", options.shape_steps),
+        ("tex_steps", options.tex_steps),
+    ] {
+        if let Some(value) = value {
+            ensure!(
+                value <= MAX_GENERATION_STEPS,
+                "`{name}` must be at most {MAX_GENERATION_STEPS} (got {value})"
+            );
+        }
+    }
 
     let mut postprocess = defaults.postprocess.clone();
     if let Some(enabled) = options.postprocess {
@@ -563,6 +592,10 @@ fn trellis2_options_from_mesh_options(
     ensure!(
         num_samples >= 1,
         "Trellis2 `num_samples` must be at least 1"
+    );
+    ensure!(
+        num_samples <= MAX_TRELLIS2_NUM_SAMPLES,
+        "Trellis2 `num_samples` must be at most {MAX_TRELLIS2_NUM_SAMPLES} (got {num_samples})"
     );
 
     Ok(Trellis2RunOptions {
@@ -606,7 +639,10 @@ fn trellis2_options_from_mesh_options(
 /// Pure mesh-request guard shared by [`spawn_mesh_generation`]: the model
 /// allow-list plus per-model option validation, unit-tested without a server
 /// state.
-fn validate_mesh_generation_request(model: &str, options: &MeshGenerationOptions) -> Result<()> {
+pub(crate) fn validate_mesh_generation_request(
+    model: &str,
+    options: &MeshGenerationOptions,
+) -> Result<()> {
     ensure!(
         matches!(model, "triposr" | "triposg" | "trellis2"),
         "unsupported mesh model `{model}`; expected `triposr`, `triposg` or `trellis2`"
@@ -680,6 +716,9 @@ fn validate_mesh_generation_request(model: &str, options: &MeshGenerationOptions
             ("decimation_target", options.decimation_target.is_some()),
             ("fill_hole_perimeter", options.fill_hole_perimeter.is_some()),
             ("min_component_area", options.min_component_area.is_some()),
+            ("remesh", options.remesh.is_some()),
+            ("remesh_band", options.remesh_band.is_some()),
+            ("remesh_project", options.remesh_project.is_some()),
         ] {
             ensure!(!present, "`{name}` is not supported for `triposr`");
         }
@@ -905,7 +944,10 @@ pub async fn spawn_mesh_generation(
                                 // `num_samples = 1` runs the single-sample
                                 // surface (bit-identical to the pre-
                                 // num_samples behavior); above 1 runs the
-                                // sequential seed-offset emulation.
+                                // upstream joint-noise batch draw (one joint
+                                // noise tensor per stage, one shared
+                                // conditioning pass; sample 0 is the same
+                                // draw as `num_samples = 1`).
                                 let stages_list = if run_options.num_samples == 1 {
                                     vec![pipeline.run_from_path_with_stages(
                                         &source,
@@ -1075,13 +1117,22 @@ fn trellis2_texturing_options_from_request(
             .unwrap_or(defaults.preprocess_image),
         preprocess_mesh: options.preprocess_mesh.unwrap_or(defaults.preprocess_mesh),
     };
+    if let Some(steps) = texturing.tex_sampler.steps {
+        ensure!(
+            steps <= MAX_GENERATION_STEPS,
+            "`tex_steps` must be at most {MAX_GENERATION_STEPS} (got {steps})"
+        );
+    }
     texturing.validate().map_err(anyhow::Error::from)?;
     Ok(texturing)
 }
 
 /// Pure texturing-request guard: the family allow-list plus the GLB-only
 /// output contract (the baked PBR atlas is embedded in the GLB).
-fn validate_mesh_texturing_request(model: &str, options: &MeshTexturingOptions) -> Result<()> {
+pub(crate) fn validate_mesh_texturing_request(
+    model: &str,
+    options: &MeshTexturingOptions,
+) -> Result<()> {
     ensure!(
         model == "trellis2",
         "unsupported texturing model `{model}`; expected `trellis2`"
@@ -1263,11 +1314,11 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        sample_output_path, trellis2_options_from_mesh_options,
-        trellis2_texturing_options_from_request, triposg_options_from_mesh_options,
-        validate_mesh_generation_request, validate_mesh_texturing_request, MeshGenerationOptions,
+        MAX_GENERATION_STEPS, MAX_TIMESTEPS, MAX_TRELLIS2_NUM_SAMPLES, MeshGenerationOptions,
         MeshTexturingOptions, Trellis2PipelineType, Trellis2RunOptions, Trellis2TexturingOptions,
-        TripoSgRunOptions,
+        TripoSgRunOptions, sample_output_path, trellis2_options_from_mesh_options,
+        trellis2_texturing_options_from_request, triposg_options_from_mesh_options,
+        validate_mesh_generation_request, validate_mesh_texturing_request,
     };
 
     fn default_mesh_options() -> MeshGenerationOptions {
@@ -1280,7 +1331,9 @@ mod tests {
             .expect("default triposg options");
         assert_eq!(TripoSgRunOptions::default(), run);
         assert_eq!(
-            (50usize, 7.0f32, 42u64, 2048usize, 8u32, 9u32, true, 9u32, 16384usize),
+            (
+                50usize, 7.0f32, 42u64, 2048usize, 8u32, 9u32, true, 9u32, 16384usize
+            ),
             (
                 run.steps,
                 run.guidance_scale,
@@ -1386,6 +1439,32 @@ mod tests {
             let message = error.to_string();
             assert!(
                 message.contains("remesh") && message.contains("is not supported for `triposg`"),
+                "unexpected message: `{message}`"
+            );
+        }
+    }
+
+    #[test]
+    fn triposr_rejects_trellis2_remesh_options() {
+        for options in [
+            MeshGenerationOptions {
+                remesh: Some(false),
+                ..default_mesh_options()
+            },
+            MeshGenerationOptions {
+                remesh_band: Some(2.0),
+                ..default_mesh_options()
+            },
+            MeshGenerationOptions {
+                remesh_project: Some(0.5),
+                ..default_mesh_options()
+            },
+        ] {
+            let error = validate_mesh_generation_request("triposr", &options)
+                .expect_err("trellis2 remesh knobs must be rejected for triposr");
+            let message = error.to_string();
+            assert!(
+                message.contains("remesh") && message.contains("is not supported for `triposr`"),
                 "unexpected message: `{message}`"
             );
         }
@@ -1900,6 +1979,146 @@ mod tests {
                 "unexpected message for {name}: `{message}`"
             );
         }
+    }
+
+    fn trellis2_options_with_stage_steps(name: &str, value: usize) -> MeshGenerationOptions {
+        let mut options = default_mesh_options();
+        match name {
+            "ss_steps" => options.ss_steps = Some(value),
+            "shape_steps" => options.shape_steps = Some(value),
+            "tex_steps" => options.tex_steps = Some(value),
+            other => panic!("unknown stage field `{other}`"),
+        }
+        options
+    }
+
+    #[test]
+    fn triposg_request_caps_accept_boundaries_and_reject_over_limit() {
+        let steps_at_limit = MeshGenerationOptions {
+            steps: Some(MAX_GENERATION_STEPS),
+            ..default_mesh_options()
+        };
+        validate_mesh_generation_request("triposg", &steps_at_limit)
+            .expect("steps at the cap must be accepted");
+
+        let steps_over_limit = MeshGenerationOptions {
+            steps: Some(MAX_GENERATION_STEPS + 1),
+            ..default_mesh_options()
+        };
+        let error = validate_mesh_generation_request("triposg", &steps_over_limit)
+            .expect_err("steps above the cap must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("`steps` must be at most {MAX_GENERATION_STEPS}")),
+            "unexpected message: `{error}`"
+        );
+
+        let timesteps_at_limit = MeshGenerationOptions {
+            timesteps: Some(vec![900.0; MAX_TIMESTEPS]),
+            ..default_mesh_options()
+        };
+        validate_mesh_generation_request("triposg", &timesteps_at_limit)
+            .expect("timesteps at the cap must be accepted");
+
+        let timesteps_over_limit = MeshGenerationOptions {
+            timesteps: Some(vec![900.0; MAX_TIMESTEPS + 1]),
+            ..default_mesh_options()
+        };
+        let error = validate_mesh_generation_request("triposg", &timesteps_over_limit)
+            .expect_err("timesteps above the cap must be rejected");
+        assert!(
+            error.to_string().contains(&format!(
+                "`timesteps` must contain at most {MAX_TIMESTEPS} entries"
+            )),
+            "unexpected message: `{error}`"
+        );
+    }
+
+    #[test]
+    fn trellis2_request_caps_accept_boundaries_and_reject_over_limit() {
+        let samples_at_limit = MeshGenerationOptions {
+            num_samples: Some(MAX_TRELLIS2_NUM_SAMPLES),
+            ..default_mesh_options()
+        };
+        validate_mesh_generation_request("trellis2", &samples_at_limit)
+            .expect("num_samples at the cap must be accepted");
+
+        let samples_over_limit = MeshGenerationOptions {
+            num_samples: Some(MAX_TRELLIS2_NUM_SAMPLES + 1),
+            ..default_mesh_options()
+        };
+        let error = validate_mesh_generation_request("trellis2", &samples_over_limit)
+            .expect_err("num_samples above the cap must be rejected");
+        assert!(
+            error.to_string().contains(&format!(
+                "`num_samples` must be at most {MAX_TRELLIS2_NUM_SAMPLES}"
+            )),
+            "unexpected message: `{error}`"
+        );
+
+        let steps_at_limit = MeshGenerationOptions {
+            steps: Some(MAX_GENERATION_STEPS),
+            ..default_mesh_options()
+        };
+        validate_mesh_generation_request("trellis2", &steps_at_limit)
+            .expect("shared steps at the cap must be accepted");
+
+        let steps_over_limit = MeshGenerationOptions {
+            steps: Some(MAX_GENERATION_STEPS + 1),
+            ..default_mesh_options()
+        };
+        let error = validate_mesh_generation_request("trellis2", &steps_over_limit)
+            .expect_err("shared steps above the cap must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("`steps` must be at most {MAX_GENERATION_STEPS}")),
+            "unexpected message: `{error}`"
+        );
+
+        for name in ["ss_steps", "shape_steps", "tex_steps"] {
+            validate_mesh_generation_request(
+                "trellis2",
+                &trellis2_options_with_stage_steps(name, MAX_GENERATION_STEPS),
+            )
+            .unwrap_or_else(|error| panic!("{name} at the cap must be accepted: {error}"));
+
+            let error = validate_mesh_generation_request(
+                "trellis2",
+                &trellis2_options_with_stage_steps(name, MAX_GENERATION_STEPS + 1),
+            )
+            .expect_err("per-stage steps above the cap must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("`{name}` must be at most {MAX_GENERATION_STEPS}")),
+                "unexpected message for {name}: `{error}`"
+            );
+        }
+    }
+
+    #[test]
+    fn texturing_request_cap_accepts_boundary_and_rejects_over_limit() {
+        let at_limit = MeshTexturingOptions {
+            tex_steps: Some(MAX_GENERATION_STEPS),
+            ..MeshTexturingOptions::default()
+        };
+        validate_mesh_texturing_request("trellis2", &at_limit)
+            .expect("tex_steps at the cap must be accepted");
+
+        let over_limit = MeshTexturingOptions {
+            tex_steps: Some(MAX_GENERATION_STEPS + 1),
+            ..MeshTexturingOptions::default()
+        };
+        let error = validate_mesh_texturing_request("trellis2", &over_limit)
+            .expect_err("tex_steps above the cap must be rejected");
+        assert!(
+            error.to_string().contains(&format!(
+                "`tex_steps` must be at most {MAX_GENERATION_STEPS}"
+            )),
+            "unexpected message: `{error}`"
+        );
     }
 
     #[test]

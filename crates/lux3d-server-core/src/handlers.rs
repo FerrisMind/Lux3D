@@ -4,11 +4,11 @@ use std::path::Path;
 
 use anyhow::Context;
 use axum::{
+    Json,
     body::Body,
     extract::{FromRequest, Path as AxumPath, Query, Request, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
-    Json,
 };
 use serde::Deserialize;
 
@@ -23,12 +23,13 @@ use crate::{
     },
     errors::{conflict, internal_error, invalid_request, not_found},
     jobs::{
-        create_job_record, job_workspace, new_job_id, spawn_mesh_generation, spawn_mesh_texturing,
-        spawn_point_cloud_generation, NewJobRecord,
+        NewJobRecord, create_job_record, job_workspace, new_job_id, spawn_mesh_generation,
+        spawn_mesh_texturing, spawn_point_cloud_generation, validate_mesh_generation_request,
+        validate_mesh_texturing_request,
     },
     media_source::{
-        resolve_conditions_path, resolve_mesh_path, resolve_source_path, MediaSourceInput,
-        MeshSourceInput,
+        MediaSourceInput, MeshSourceInput, ensure_supported_mesh_path, resolve_conditions_path,
+        resolve_mesh_path, resolve_source_path,
     },
     models::{ModelOperationRequest, ModelStatusResponse},
     route_registry::LUX3D_API_ROUTES,
@@ -534,6 +535,10 @@ async fn create_mesh_generation_json(
 ) -> anyhow::Result<GenerationObject> {
     let job_id = new_job_id();
     let workspace = job_workspace(&state.upload_dir, &job_id);
+    // Validate the model/options before touching the source: over-limit or
+    // model-incompatible requests must fail with 400 and no workspace I/O.
+    validate_mesh_generation_request(&request.model, &request.options)?;
+    let format = mesh_output_format(&request.options)?;
     let source = resolve_source_path(
         &state,
         &workspace,
@@ -547,7 +552,6 @@ async fn create_mesh_generation_json(
     )
     .await?;
 
-    let format = mesh_output_format(&request.options)?;
     let download_filename = mesh_download_filename(&request.model, format);
 
     let record = create_job_record(NewJobRecord {
@@ -592,6 +596,9 @@ async fn create_mesh_texturing_multipart(
     let workspace = job_workspace(&state.upload_dir, &job_id);
     let (upload, options): (_, MeshTexturingOptions) =
         parse_texturing_upload(multipart, &workspace).await?;
+    // `load_mesh` dispatches on the extension, so reject unreadable uploads
+    // before a job is created instead of failing asynchronously.
+    ensure_supported_mesh_path(&upload.mesh)?;
     let model = upload.model.unwrap_or_else(|| "trellis2".to_string());
     let format = texturing_output_format(&options)?;
 
@@ -615,6 +622,10 @@ async fn create_mesh_texturing_json(
 ) -> anyhow::Result<GenerationObject> {
     let job_id = new_job_id();
     let workspace = job_workspace(&state.upload_dir, &job_id);
+    // Validate the model/options before resolving media: an invalid model or
+    // output format must return 400 without downloads or workspace writes.
+    validate_mesh_texturing_request(&request.model, &request.options)?;
+    let format = texturing_output_format(&request.options)?;
     let image = resolve_source_path(
         &state,
         &workspace,
@@ -638,7 +649,6 @@ async fn create_mesh_texturing_json(
         },
     )
     .await?;
-    let format = texturing_output_format(&request.options)?;
 
     let record = create_job_record(NewJobRecord {
         job_id,

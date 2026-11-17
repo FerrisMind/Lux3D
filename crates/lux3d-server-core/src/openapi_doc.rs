@@ -131,6 +131,17 @@ mod tests {
     }
 
     #[test]
+    fn mesh_option_schemas_document_request_caps() {
+        let json = serde_json::to_string(&get_openapi_doc(None)).expect("serialize openapi");
+        for cap in ["At most 64", "At most 1000"] {
+            assert!(
+                json.contains(cap),
+                "request cap description `{cap}` missing from the OpenAPI document"
+            );
+        }
+    }
+
+    #[test]
     fn mesh_option_schemas_document_the_new_fields() {
         let json = serde_json::to_string(&get_openapi_doc(None)).expect("serialize openapi");
         for field in [

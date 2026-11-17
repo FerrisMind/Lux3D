@@ -2,11 +2,11 @@
 
 use anyhow::Result;
 use axum::{
+    Router,
     extract::DefaultBodyLimit,
-    http::{header::HeaderName, Method},
+    http::{Method, header::HeaderName},
     middleware::from_fn_with_state,
     routing::{get, post},
-    Router,
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
 #[cfg(feature = "swagger-ui")]
@@ -22,7 +22,7 @@ use crate::{
         create_point_cloud_generation, delete_generation, get_generation, get_generation_content,
         health, list_generations, model_status, models, reload_model, root, unload_model,
     },
-    metrics::{self, install_prometheus_recorder, metrics_handler, ObservabilityState},
+    metrics::{self, ObservabilityState, install_prometheus_recorder, metrics_handler},
     stream::stream_generation,
     system::{system_doctor, system_info},
     types::SharedLux3dState,
