@@ -26,9 +26,10 @@
 //! Scope and locked design notes:
 //!
 //! * The distance is UNSIGNED, exactly like the official
-//!   `unsigned_distance` call. No inside/outside sign is computed here: for
-//!   TR1 the sign is locked to ray-parity even-odd crossing counts, not to
-//!   the side of the closest surface point / normal.
+//!   `unsigned_distance` call. No inside/outside sign is computed here: the
+//!   narrow-band remesher defines its sign as the side of the thickened
+//!   isosurface `unsigned_distance - eps` (`cumesh/remeshing.py:160-165`),
+//!   with no ray parity and no normal-side classification.
 //! * Build is a median split on the largest centroid extent (leaf size 8).
 //!   SAH is not needed: the official tree is opaque and only the
 //!   nearest-triangle semantics are observable, so this is the smallest

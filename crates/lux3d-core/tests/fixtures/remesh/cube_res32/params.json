@@ -1,0 +1,41 @@
+{
+ "generator": "scripts/generate_cumesh_remesh_goldens.py",
+ "official_function": "cumesh.remeshing.remesh_narrow_band_dc",
+ "official_call_semantics": "o_voxel/postprocess.py:165-180",
+ "shape": "cube",
+ "resolution": 32,
+ "band": 1,
+ "project_back": 0,
+ "center": [
+  0.0,
+  0.0,
+  0.0
+ ],
+ "scale": 1.09375,
+ "max_extent": 1.0,
+ "aabb": [
+  [
+   -0.5,
+   -0.5,
+   -0.5
+  ],
+  [
+   0.5,
+   0.5,
+   0.5
+  ]
+ ],
+ "input_vertices": 8,
+ "input_faces": 12,
+ "output_vertices": 10144,
+ "output_faces": 20280,
+ "vertex_dtype": "float32",
+ "face_dtype": "int32",
+ "storage": "gzip(npy)",
+ "torch_version": "2.5.1+cu124",
+ "cumesh_module": "G:\\jobs\\candle-based-projects\\candle_refs\\.build-oracle\\CuMesh-src\\cumesh\\__init__.py",
+ "sha256": {
+  "vertices": "527242e14a09cebb32730ae72344b45aef47324b57f60dec27426547cb0a7ab2",
+  "faces": "106338bff87ac281df0bc0d78d2c2a670716ad8bec795ed325101436831c9c4f"
+ }
+}

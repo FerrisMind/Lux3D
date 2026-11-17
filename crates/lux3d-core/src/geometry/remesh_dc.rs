@@ -1,8 +1,17 @@
 //! Narrow-band dual-contouring remesher (TRELLIS.2 `to_glb` remesh branch).
 //!
-//! Rust port of the observable algorithm of
-//! `cumesh.remeshing.remesh_narrow_band_dc` as called from the official
-//! postprocessor (`o-voxel/o_voxel/postprocess.py:171-180`):
+//! Algorithmic port of the official CuMesh implementation, which is the
+//! authority for this stage:
+//!
+//! * `CuMesh/cumesh/remeshing.py:60-256` — sparse octree grid build, UDF
+//!   sampling, topology construction, adaptive quad split and the optional
+//!   project-back pass.
+//! * `CuMesh/src/remesh/simple_dual_contour.cu:28-156` — the per-voxel dual
+//!   vertex (mean of the 12 edge intersections) and the per-axis
+//!   `intersected` signs.
+//! * `CuMesh/src/remesh/api.h:19-67` — the C++ entry-point contract.
+//!
+//! The official call site is `o-voxel/o_voxel/postprocess.py:171-180`:
 //!
 //! ```text
 //! center = aabb.mean(dim=0)
@@ -17,109 +26,129 @@
 //!     bvh = bvh)
 //! ```
 //!
-//! `cumesh` is a pip dependency and its sources are not part of the reference
-//! tree. This module therefore implements exactly the algorithm fixed by the
-//! TR1 brief — uniform grid, narrow band via [`MeshBvh`] closest-point
-//! distance, ray-parity SDF sign, dual contouring with the shared QEF solve
-//! from the sibling `dual_grid` module, and BVH project-back — and adds no
-//! other cumesh parameters.
-//!
 //! # Algorithm
 //!
-//! 1. **Grid.** A uniform cubic grid with `resolution` cells per axis and
-//!    cell size `h = scale / resolution`, centered on `center` (the grid cube
-//!    spans `center ± scale / 2`). `scale` is the already-expanded value the
-//!    call site passes; [`narrow_band_grid_scale`] applies the official
-//!    `(resolution + 3 * band) / resolution` factor to a mesh extent
-//!    (`postprocess.py:166-180`).
-//! 2. **Narrow band.** Candidate cells come from every triangle's AABB
-//!    expanded by `band * h`. A candidate is kept when the BVH unsigned
-//!    distance from its center to the mesh is at most `band * h`. With the
-//!    shipped `band = 1` (`example.py:44`, `app.py:504`) this includes every
-//!    cell the surface crosses, because a cell's center is at most
-//!    `sqrt(3) / 2 * h` from any point on the cell boundary.
-//! 3. **SDF samples.** The eight corners of every band cell receive a signed
-//!    distance: magnitude from [`MeshBvh::closest_point`], sign from an
-//!    even-odd ray-crossing count. Negative means inside.
-//! 4. **Dual contouring.** Every sign-changing cell edge (SDF linearly
-//!    interpolated along the edge) contributes a plane QEF term. The normal
-//!    is the geometric normal of the BVH-closest triangle at the
-//!    intersection point, oriented toward increasing SDF. Each cell with at
-//!    least one crossing gets exactly one vertex: the clamped QEF minimizer
-//!    (`dual_grid::solve_qef_cell`) or, when no usable normal exists
-//!    (degenerate triangles), the mean of its crossing points.
-//! 5. **Quads.** One quad per sign-changing grid edge joins the vertices of
-//!    the four cells around that edge, wound so the face normal points along
-//!    increasing SDF (outward). Each grid edge is emitted exactly once, by
-//!    the cell that owns it at its max corner.
-//! 6. **Project back.** Each output vertex moves toward its BVH closest point
-//!    by the factor `project_back` when it is positive: `0` disables (the
-//!    shipped demo value, `example.py:45`, `app.py:505`), `1` places every
-//!    vertex on the input surface. Matching the official `if project_back >
-//!    0` guard (`remeshing.py:238`), a negative factor is rejected by the
-//!    option validation instead of extrapolating away from the surface.
+//! 1. **Sparse grid.** `eps = band * scale / resolution` thickens the UDF so
+//!    the extracted isosurface is `unsigned_distance - eps = 0`. The grid
+//!    starts at `base_resolution = resolution`, repeatedly halved while it is
+//!    greater than 32 (`remeshing.py:102-107`). All `base_resolution^3` cell
+//!    centers `((coord + 0.5) / base - 0.5) * scale + center` are sampled
+//!    against the BVH; a cell is kept when `|UDF - eps| < 0.87 * cell_size`
+//!    (`0.87` is the official constant, approximately `sqrt(3)/2`, covering
+//!    the half cell diagonal). While `base_resolution < resolution` the
+//!    survivors are doubled and expanded into their eight children, in the
+//!    official child order, and the filter runs again at the doubled
+//!    resolution (`remeshing.py:118-141`).
+//! 2. **Corner values.** The unique integer corners of the active voxels are
+//!    sampled once: `unsigned_distance(corner) - eps` (`remeshing.py:154-165`)
+//!    with `corner_position = (corner / resolution - 0.5) * scale + center`.
+//!    There is no ray parity, no inside/outside sign and no QEF: the sign is
+//!    purely the side of the thickened isosurface.
+//! 3. **Dual vertices.** For every active voxel the 12 edges are traversed
+//!    exactly like `simple_dual_contour.cu:52-143`. A crossing is
+//!    `(v1 < 0 && v2 >= 0) || (v1 >= 0 && v2 < 0)`, its position is
+//!    `grid_low + t` with `t = -v1 / (v2 - v1)`, and the dual vertex is the
+//!    mean of all crossing positions; a voxel without crossings falls back to
+//!    its center. `intersected[axis]` is `+1` when the `(u = 1, v = 1)` edge
+//!    of that axis goes from negative to non-negative, `-1` for the reverse
+//!    and `0` otherwise.
+//! 4. **Topology.** Every nonzero `intersected[axis]` of every voxel becomes
+//!    one quad joining the dual vertices of the four voxels around that grid
+//!    edge, with the official edge-neighbor offsets
+//!    (`remeshing.py:70-76,186-204`). Quads whose four voxels are not all in
+//!    the active set are dropped (the official `0xffffffff` lookup miss), then
+//!    unreferenced dual vertices are removed in ascending voxel-index order
+//!    (`remeshing.py:205-210`).
+//! 5. **Triangles.** The remesher emits triangles directly: each quad is
+//!    split with the official `quad_split_1_{n,p}` / `quad_split_2_{n,p}`
+//!    tables, the normal-alignment metric picks split 1 only when
+//!    `align0 > align1` (strict, ties choose split 2), and the `p` variants
+//!    are used for `intersected_dir == 1` (`remeshing.py:212-233`). The
+//!    winding points from the negative (inside the thickened band) to the
+//!    positive side, i.e. outward for a closed input; it never depends on the
+//!    input face orientation.
+//! 6. **Project back.** After triangulation each output vertex moves by
+//!    `v -= project_back * (v - closest_point_on_input)` when
+//!    `project_back > 0` (`remeshing.py:238-250`); `0` disables the pass.
 //!
 //! # Degenerate cases and assumptions
 //!
-//! * **Closed input meshes.** The ray-parity sign is only meaningful for a
-//!   closed mesh with a well-defined inside. Open meshes can produce
-//!   arbitrary signs; the official pipeline fills holes
-//!   (`postprocess.py:108-113`) before remeshing, and callers should do the
-//!   same (`geometry::mesh_ops::fill_holes`).
-//! * **Ray direction.** The parity ray is a fixed generic direction with all
-//!   components non-zero, so axis-aligned geometry (the box test) is never
-//!   hit edge-on. Intersection ray parameters are de-duplicated within a
-//!   small tolerance: a ray passing exactly through a shared triangle edge
-//!   or vertex reports the same parameter from each incident triangle and
-//!   counts once. Rays that start exactly on the surface or graze a
-//!   silhouette tangentially are measure-zero inputs without special
-//!   handling; a corner sampled exactly on the surface gets distance `0`,
-//!   is classified as inside (`signed <= 0`), and interpolates to its own
-//!   corner.
-//! * **Sub-cell features.** As with every grid-sampled dual contourer,
-//!   surface detail that does not flip the sign of any cell corner is not
-//!   captured.
-//! * **Band and connectivity.** A quad is emitted only when all four cells
-//!   around its grid edge have a vertex. For `band >= 1` that always holds;
-//!   with a smaller band a surface-crossing cell can fall outside the band
-//!   and the affected quad is dropped (documented, not silently
-//!   reclassified).
+//! * **Band.** `band = 0` removes the thickening: every corner value is an
+//!   unsigned distance (`>= 0`), so the strict crossing tests never fire and
+//!   the official algorithm returns an empty mesh. Callers that need a
+//!   surface must use `band > 0` (the shipped value is `1`).
+//! * **Closedness and shells.** The UDF has no inside/outside classification,
+//!   so open or inconsistently wound inputs are handled geometrically; the
+//!   result can still be open where the thickened shell leaves the grid. For a
+//!   closed input and `band >= 1` the extracted surface is closed: every voxel
+//!   touching a sign-changing edge is within half a cell diagonal of the
+//!   isosurface and therefore inside the `0.87 * cell_size` narrow band.
+//!   Because the zero set is `unsigned_distance - eps`, a closed solid yields
+//!   TWO disjoint closed components — the outer offset surface at distance
+//!   `eps` (outward winding) and the inner offset surface at depth `eps`
+//!   (inward winding). Their signed volumes cancel, leaving the shell volume;
+//!   the official `to_glb` remesh has the same output. Geometry thinner than
+//!   `2 * eps` fills the interior with negative values and produces a single
+//!   shell.
+//! * **Sub-cell features.** Grid sampling cannot capture surface detail that
+//!   does not flip a corner value across the band; the official algorithm has
+//!   the same limitation.
 //! * **Input contract.** `bvh` must have been built over the same
 //!   `(vertices, faces)` buffers; the buffers are validated here, but the
 //!   tree is not re-derived. `resolution` must be in
-//!   `2..=MAX_GRID_SIZE_PER_AXIS`, `center` / `band` / `project_back` must be
-//!   finite, `band >= 0`, `project_back >= 0`, and `scale > 0`.
-//!   `project_back` is a raw lerp factor, so values above 1 extrapolate
-//!   toward (and past) the closest point, matching the official call.
+//!   `2..=MAX_GRID_SIZE_PER_AXIS` and must halve evenly down to 32 (the
+//!   official `assert base_resolution % 2 == 0`), `center` / `band` /
+//!   `project_back` must be finite, `band >= 0`, `project_back >= 0`, and
+//!   `scale > 0` with a finite grid cube. `project_back` is a raw lerp
+//!   factor, so values above 1 extrapolate past the closest point, matching
+//!   the official call.
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use crate::error::{Lux3dError, Result};
 
-use super::dual_grid::{plane_q, q4_from_sym, solve_qef_cell, MAX_GRID_SIZE_PER_AXIS};
+use super::dual_grid::MAX_GRID_SIZE_PER_AXIS;
 use super::mesh_bvh::MeshBvh;
 
-/// Fixed generic ray direction for the even-odd inside/outside test. Every
-/// component is non-zero, so rays never run parallel to axis-aligned triangle
-/// edges (the closed synthetic meshes exercised by the tests).
-const RAY_DIRECTION: [f64; 3] = [1.0, 0.371_390_676_354_103_7, 0.618_033_988_749_894_9];
+/// Official narrow-band refinement factor (`remeshing.py:129`): a cell is
+/// kept when `|UDF - eps| < 0.87 * cell_size`. `0.87` is the reference
+/// constant (approximately `sqrt(3) / 2`, the half cell diagonal).
+const NARROW_BAND_FACTOR: f64 = 0.87;
 
-/// The 12 cube edges as local-corner index pairs. Local corner index bits:
-/// bit 0 = +x, bit 1 = +y, bit 2 = +z.
-const CUBE_EDGES: [(usize, usize); 12] = [
-    (0, 1),
-    (2, 3),
-    (4, 5),
-    (6, 7), // along x
-    (0, 2),
-    (1, 3),
-    (4, 6),
-    (5, 7), // along y
-    (0, 4),
-    (1, 5),
-    (2, 6),
-    (3, 7), // along z
+/// Official child offsets of the octree expansion (`remeshing.py:85-88`),
+/// in order: x fastest, then y, then z.
+const OCTREE_CHILD_OFFSETS: [[i32; 3]; 8] = [
+    [0, 0, 0],
+    [1, 0, 0],
+    [0, 1, 0],
+    [1, 1, 0],
+    [0, 0, 1],
+    [1, 0, 1],
+    [0, 1, 1],
+    [1, 1, 1],
 ];
+
+/// Voxel offsets of the four voxels around a grid edge, per edge axis
+/// (`remeshing.py:71-76`).
+const EDGE_NEIGHBOR_VOXEL_OFFSETS: [[[i32; 3]; 4]; 3] = [
+    // x-axis edge: neighbors at (0,0,0), (0,0,1), (0,1,1), (0,1,0).
+    [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],
+    // y-axis edge: neighbors at (0,0,0), (1,0,0), (1,0,1), (0,0,1).
+    [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],
+    // z-axis edge: neighbors at (0,0,0), (0,1,0), (1,1,0), (1,0,0).
+    [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]],
+];
+
+/// Official quad split patterns (`remeshing.py:80-83`), two triangles each.
+/// `_n` is used for `intersected == -1`, `_p` for `intersected == +1`.
+const QUAD_SPLIT_1_N: [usize; 6] = [0, 1, 2, 0, 2, 3];
+const QUAD_SPLIT_1_P: [usize; 6] = [0, 2, 1, 0, 3, 2];
+const QUAD_SPLIT_2_N: [usize; 6] = [0, 1, 3, 3, 1, 2];
+const QUAD_SPLIT_2_P: [usize; 6] = [0, 3, 1, 3, 2, 1];
+
+/// BVH queries are batched in chunks this large so the temporary closest-point
+/// result vector stays bounded on high-resolution grids.
+const QUERY_CHUNK: usize = 1 << 16;
 
 /// Options for [`remesh_narrow_band_dc`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -171,18 +200,20 @@ pub fn narrow_band_grid_scale(scale: f32, resolution: u32, band: f32) -> f32 {
     (resolution as f32 + 3.0 * band) / resolution as f32 * scale
 }
 
-/// Remeshed mesh: quad topology, world-space vertex positions.
+/// Remeshed mesh: triangle topology, world-space vertex positions.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RemeshDcMesh {
-    /// Flat `[x, y, z, ...]` vertex positions (QEF-placed, clamped to their
-    /// cells, then projected back when requested).
+    /// Flat `[x, y, z, ...]` vertex positions (mean edge intersections,
+    /// converted to world space and projected back when requested). Only
+    /// dual vertices referenced by at least one emitted quad are kept.
     pub vertices: Vec<f32>,
-    /// Flat quad indices, four per face, wound outward (toward increasing
-    /// SDF).
+    /// Flat triangle indices, three per face, wound outward (from the inside
+    /// of the thickened narrow band toward the outside).
     pub faces: Vec<u32>,
 }
 
-/// Remeshes `(vertices, faces)` with narrow-band dual contouring.
+/// Remeshes `(vertices, faces)` with the official narrow-band dual contouring
+/// algorithm.
 ///
 /// * `vertices`: flat `[x, y, z, ...]` f32 positions.
 /// * `faces`: flat `[F, 3]` zero-based triangle indices.
@@ -191,8 +222,8 @@ pub struct RemeshDcMesh {
 ///   `cumesh.cuBVH` the same way (`postprocess.py:122, 179`).
 /// * `options`: grid center/scale/resolution, band and project-back factor.
 ///
-/// Returns quad faces (four indices each). See the module docs for the
-/// algorithm and the documented degenerate-case assumptions.
+/// Returns a triangle mesh. See the module docs for the algorithm and the
+/// documented degenerate-case assumptions.
 pub fn remesh_narrow_band_dc<'mesh>(
     vertices: &'mesh [f32],
     faces: &'mesh [u32],
@@ -201,265 +232,278 @@ pub fn remesh_narrow_band_dc<'mesh>(
 ) -> Result<RemeshDcMesh> {
     validate_options(options)?;
     validate_mesh(vertices, faces)?;
+    validate_grid_bounds(options)?;
 
-    let resolution = options.resolution as i32;
-    let spacing = options.scale / options.resolution as f32;
-    if !spacing.is_finite() || spacing <= 0.0 {
+    let resolution = options.resolution;
+    let resolution_f32 = resolution as f32;
+    let scale = options.scale;
+    let center = options.center;
+
+    // Official `eps = band * scale / resolution` (`remeshing.py:100`). Python
+    // evaluates it in double precision and PyTorch casts the scalar to the
+    // f32 tensor dtype at the subtraction; mirror that.
+    let eps = (options.band as f64 * scale as f64 / resolution as f64) as f32;
+    if !eps.is_finite() {
         return Err(Lux3dError::InvalidInput(
-            "remesh narrow-band dual contouring produced a degenerate cell size",
-        ));
-    }
-    let origin = [
-        options.center[0] - options.scale * 0.5,
-        options.center[1] - options.scale * 0.5,
-        options.center[2] - options.scale * 0.5,
-    ];
-    if origin.iter().any(|value| !value.is_finite()) {
-        return Err(Lux3dError::InvalidInput(
-            "remesh narrow-band dual contouring grid origin is not finite",
-        ));
-    }
-    let band_distance = options.band * spacing;
-    if !band_distance.is_finite() {
-        return Err(Lux3dError::InvalidInput(
-            "remesh narrow-band dual contouring band distance is not finite",
+            "remesh narrow-band dual contouring band epsilon is not finite",
         ));
     }
 
-    // ---- step 1+2: narrow-band cells from triangle-expanded AABB checks ----
-    let mut candidates: FxHashSet<[i32; 3]> = FxHashSet::default();
-    for triangle in faces.chunks_exact(3) {
-        let a = vertex_f32(vertices, triangle[0]);
-        let b = vertex_f32(vertices, triangle[1]);
-        let c = vertex_f32(vertices, triangle[2]);
-        let mut low = [0i32; 3];
-        let mut high = [0i32; 3];
-        for axis in 0..3 {
-            let minimum = a[axis].min(b[axis]).min(c[axis]) - band_distance;
-            let maximum = a[axis].max(b[axis]).max(c[axis]) + band_distance;
-            // Over-inclusive by at most one cell per axis: the distance
-            // filter below removes candidates whose center is too far.
-            low[axis] = clamp_cell_index((minimum - origin[axis]) / spacing, resolution);
-            high[axis] = clamp_cell_index((maximum - origin[axis]) / spacing, resolution);
+    let base_resolution = base_resolution(resolution)?;
+
+    // ---- step 1: narrow-band sparse grid (official octree expansion) -------
+    let mut coords: Vec<[i32; 3]> = Vec::with_capacity((base_resolution as usize).pow(3));
+    for x in 0..base_resolution as i32 {
+        for y in 0..base_resolution as i32 {
+            for z in 0..base_resolution as i32 {
+                coords.push([x, y, z]);
+            }
         }
-        if low[0] > high[0] || low[1] > high[1] || low[2] > high[2] {
-            continue;
+    }
+
+    let mut current_resolution = base_resolution;
+    loop {
+        let divisor = current_resolution as f32;
+        // Python computes `0.87 * (scale / base_resolution)` in double
+        // precision and casts the comparison scalar to f32.
+        let threshold = (NARROW_BAND_FACTOR * (scale as f64 / current_resolution as f64)) as f32;
+        if !threshold.is_finite() {
+            return Err(Lux3dError::InvalidInput(
+                "remesh narrow-band dual contouring band threshold is not finite",
+            ));
         }
-        for z in low[2]..=high[2] {
-            for y in low[1]..=high[1] {
-                for x in low[0]..=high[0] {
-                    candidates.insert([x, y, z]);
+        let mut kept: Vec<[i32; 3]> = Vec::with_capacity(coords.len());
+        for chunk in coords.chunks(QUERY_CHUNK) {
+            let points: Vec<[f32; 3]> = chunk
+                .iter()
+                .map(|&coord| cell_center_point(coord, divisor, scale, center))
+                .collect();
+            let hits = bvh.closest_points(&points);
+            for (&coord, hit) in chunk.iter().zip(hits.iter()) {
+                // `abs(unsigned_distance - eps) < 0.87 * cell_size`.
+                if (hit.unsigned_distance - eps).abs() < threshold {
+                    kept.push(coord);
                 }
             }
         }
-    }
+        coords = kept;
 
-    let mut active_cells: Vec<[i32; 3]> = Vec::new();
-    for cell in candidates {
-        let center = [
-            origin[0] + (cell[0] as f32 + 0.5) * spacing,
-            origin[1] + (cell[1] as f32 + 0.5) * spacing,
-            origin[2] + (cell[2] as f32 + 0.5) * spacing,
-        ];
-        if bvh.closest_point(center).unsigned_distance <= band_distance {
-            active_cells.push(cell);
+        if current_resolution >= resolution {
+            break;
         }
+        // Official `base_resolution *= 2` then 8-child expansion
+        // (`remeshing.py:135-140`).
+        current_resolution *= 2;
+        let mut expanded: Vec<[i32; 3]> = Vec::with_capacity(coords.len() * 8);
+        for coord in &coords {
+            for offset in OCTREE_CHILD_OFFSETS {
+                expanded.push([
+                    coord[0] * 2 + offset[0],
+                    coord[1] * 2 + offset[1],
+                    coord[2] * 2 + offset[2],
+                ]);
+            }
+        }
+        coords = expanded;
     }
-    // Deterministic vertex/face order: the candidate set is hash-ordered, so
-    // sort by grid key before anything allocates output indices.
-    active_cells.sort_unstable_by_key(|cell| cell_key(*cell));
 
-    // ---- step 3+4: SDF corners and one QEF vertex per crossing cell --------
-    let parity = RayParity::build(vertices, faces);
-    let mut sampler = CornerSampler {
-        bvh,
-        parity: &parity,
-        origin,
-        spacing,
-        values: FxHashMap::default(),
-        scratch: Vec::new(),
-    };
-
-    let mut output_vertices: Vec<f32> = Vec::new();
-    let mut cell_vertices: FxHashMap<u64, u32> = FxHashMap::default();
-
-    for cell in &active_cells {
-        let mut corner_positions = [[0.0f32; 3]; 8];
-        let mut corner_sdf = [0.0f32; 8];
-        for (local, (position, value)) in corner_positions
-            .iter_mut()
-            .zip(corner_sdf.iter_mut())
-            .enumerate()
-        {
+    // ---- step 2: unique corner values = unsigned distance - eps -----------
+    // The official `get_sparse_voxel_grid_active_vertices` dedups the corners
+    // of the active voxels; the values are sampled once per unique corner.
+    let mut corner_indices: FxHashMap<u64, u32> =
+        FxHashMap::with_capacity_and_hasher(coords.len() * 2, Default::default());
+    let mut corners: Vec<[u32; 3]> = Vec::with_capacity(coords.len() * 2);
+    for voxel in &coords {
+        for local in 0..8i32 {
             let corner = [
-                (cell[0] + (local & 1) as i32) as u32,
-                (cell[1] + ((local >> 1) & 1) as i32) as u32,
-                (cell[2] + ((local >> 2) & 1) as i32) as u32,
+                (voxel[0] + (local & 1)) as u32,
+                (voxel[1] + ((local >> 1) & 1)) as u32,
+                (voxel[2] + ((local >> 2) & 1)) as u32,
             ];
-            *position = [
-                origin[0] + corner[0] as f32 * spacing,
-                origin[1] + corner[1] as f32 * spacing,
-                origin[2] + corner[2] as f32 * spacing,
-            ];
-            *value = sampler.value(corner);
-        }
-
-        let mut q_sym = [0.0f32; 10];
-        let mut crossing_sum = [0.0f64; 3];
-        let mut crossing_count = 0u32;
-        let mut plane_terms = 0u32;
-
-        for &(corner_a, corner_b) in CUBE_EDGES.iter() {
-            let sdf_a = corner_sdf[corner_a];
-            let sdf_b = corner_sdf[corner_b];
-            if (sdf_a <= 0.0) == (sdf_b <= 0.0) {
-                continue;
+            let key = corner_key(corner);
+            if let std::collections::hash_map::Entry::Vacant(entry) = corner_indices.entry(key) {
+                entry.insert(corners.len() as u32);
+                corners.push(corner);
             }
-            let position_a = corner_positions[corner_a];
-            let position_b = corner_positions[corner_b];
-            let denominator = sdf_a - sdf_b;
-            let t = if denominator != 0.0 {
-                sdf_a / denominator
-            } else {
-                0.5
-            };
-            let intersection = [
-                position_a[0] + (position_b[0] - position_a[0]) * t,
-                position_a[1] + (position_b[1] - position_a[1]) * t,
-                position_a[2] + (position_b[2] - position_a[2]) * t,
-            ];
-            crossing_sum[0] += intersection[0] as f64;
-            crossing_sum[1] += intersection[1] as f64;
-            crossing_sum[2] += intersection[2] as f64;
-            crossing_count += 1;
+        }
+    }
 
-            // Plane QEF term from the BVH-closest triangle at the crossing,
-            // oriented along increasing SDF (outward for the negative-inside
-            // convention).
-            let hit = bvh.closest_point(intersection);
-            let Some(normal) = triangle_normal(vertices, faces, hit.tri_id) else {
-                continue;
-            };
-            let edge = [
-                position_b[0] - position_a[0],
-                position_b[1] - position_a[1],
-                position_b[2] - position_a[2],
+    let mut corner_values: Vec<f32> = Vec::with_capacity(corners.len());
+    for chunk in corners.chunks(QUERY_CHUNK) {
+        let points: Vec<[f32; 3]> = chunk
+            .iter()
+            .map(|&corner| corner_point(corner, resolution_f32, scale, center))
+            .collect();
+        let hits = bvh.closest_points(&points);
+        for hit in hits {
+            corner_values.push(hit.unsigned_distance - eps);
+        }
+    }
+
+    // ---- step 3: one dual vertex per active voxel --------------------------
+    // Mirrors `simple_dual_contour.cu:28-156`: mean of the 12 edge
+    // intersections (grid coordinates) or the voxel center when no edge
+    // crosses, plus the per-axis `intersected` sign of the (u=1, v=1) edge.
+    let mut dual_vertices: Vec<[f32; 3]> = Vec::with_capacity(coords.len());
+    let mut intersected: Vec<[i32; 3]> = Vec::with_capacity(coords.len());
+    let mut values = [0.0f32; 8];
+
+    for voxel in &coords {
+        for (local, value) in values.iter_mut().enumerate() {
+            let corner = [
+                (voxel[0] + (local & 1) as i32) as u32,
+                (voxel[1] + ((local >> 1) & 1) as i32) as u32,
+                (voxel[2] + ((local >> 2) & 1) as i32) as u32,
             ];
-            let increasing = if sdf_b > sdf_a { 1.0f32 } else { -1.0f32 };
-            let normal = if dot_f32(normal, edge) * increasing < 0.0 {
-                [-normal[0], -normal[1], -normal[2]]
-            } else {
-                normal
-            };
-            let term = plane_q(normal, -dot_f32(normal, intersection));
-            for (accumulated, value) in q_sym.iter_mut().zip(term.iter()) {
-                *accumulated += *value;
+            let index = corner_indices[&corner_key(corner)] as usize;
+            *value = corner_values[index];
+        }
+
+        let mut sum = [0.0f32; 3];
+        let mut count = 0u32;
+        let mut signs = [0i32; 3];
+
+        // X axis: val1 = (vx, vy+u, vz+v), val2 = (vx+1, vy+u, vz+v).
+        for u in 0..=1i32 {
+            for v in 0..=1i32 {
+                let low = (u << 1 | v << 2) as usize;
+                let high = low | 1;
+                let val1 = values[low];
+                let val2 = values[high];
+                if edges_cross(val1, val2) {
+                    let t = -val1 / (val2 - val1);
+                    sum[0] += voxel[0] as f32 + t;
+                    sum[1] += (voxel[1] + u) as f32;
+                    sum[2] += (voxel[2] + v) as f32;
+                    count += 1;
+                }
+                if u == 1 && v == 1 {
+                    signs[0] = edge_sign(val1, val2);
+                }
             }
-            plane_terms += 1;
         }
 
-        if crossing_count == 0 {
-            continue;
+        // Y axis: val1 = (vx+u, vy, vz+v), val2 = (vx+u, vy+1, vz+v).
+        for u in 0..=1i32 {
+            for v in 0..=1i32 {
+                let low = (u | v << 2) as usize;
+                let high = low | 2;
+                let val1 = values[low];
+                let val2 = values[high];
+                if edges_cross(val1, val2) {
+                    let t = -val1 / (val2 - val1);
+                    sum[0] += (voxel[0] + u) as f32;
+                    sum[1] += voxel[1] as f32 + t;
+                    sum[2] += (voxel[2] + v) as f32;
+                    count += 1;
+                }
+                if u == 1 && v == 1 {
+                    signs[1] = edge_sign(val1, val2);
+                }
+            }
         }
 
-        let min_corner = [
-            origin[0] as f64 + cell[0] as f64 * spacing as f64,
-            origin[1] as f64 + cell[1] as f64 * spacing as f64,
-            origin[2] as f64 + cell[2] as f64 * spacing as f64,
-        ];
-        let max_corner = [
-            min_corner[0] + spacing as f64,
-            min_corner[1] + spacing as f64,
-            min_corner[2] + spacing as f64,
-        ];
-        let mut position = if plane_terms > 0 {
-            let q = q4_from_sym(&q_sym);
-            solve_qef_cell(&q, min_corner, max_corner)
+        // Z axis: val1 = (vx+u, vy+v, vz), val2 = (vx+u, vy+v, vz+1).
+        for u in 0..=1i32 {
+            for v in 0..=1i32 {
+                let low = (u | v << 1) as usize;
+                let high = low | 4;
+                let val1 = values[low];
+                let val2 = values[high];
+                if edges_cross(val1, val2) {
+                    let t = -val1 / (val2 - val1);
+                    sum[0] += (voxel[0] + u) as f32;
+                    sum[1] += (voxel[1] + v) as f32;
+                    sum[2] += voxel[2] as f32 + t;
+                    count += 1;
+                }
+                if u == 1 && v == 1 {
+                    signs[2] = edge_sign(val1, val2);
+                }
+            }
+        }
+
+        let vertex = if count > 0 {
+            let divisor = count as f32;
+            [sum[0] / divisor, sum[1] / divisor, sum[2] / divisor]
         } else {
-            // No usable triangle normal (degenerate input triangles): fall
-            // back to the mean of the edge intersection points, which lies in
-            // the cell by construction.
-            let inverse = 1.0 / crossing_count as f64;
             [
-                crossing_sum[0] * inverse,
-                crossing_sum[1] * inverse,
-                crossing_sum[2] * inverse,
+                voxel[0] as f32 + 0.5,
+                voxel[1] as f32 + 0.5,
+                voxel[2] as f32 + 0.5,
             ]
         };
-        for axis in 0..3 {
-            position[axis] = position[axis].clamp(min_corner[axis], max_corner[axis]);
-        }
-
-        let vertex_index = (output_vertices.len() / 3) as u32;
-        output_vertices.push(position[0] as f32);
-        output_vertices.push(position[1] as f32);
-        output_vertices.push(position[2] as f32);
-        cell_vertices.insert(cell_key(*cell), vertex_index);
+        dual_vertices.push(vertex);
+        intersected.push(signs);
     }
 
-    // ---- step 5: one quad per sign-changing grid edge ---------------------
-    // Each grid edge is owned by the cell for which the edge starts at the
-    // cell's max corner in the two perpendicular axes and at its low corner
-    // along the edge axis, so every edge is visited exactly once.
-    let mut output_faces: Vec<u32> = Vec::new();
-    for cell in &active_cells {
-        if !cell_vertices.contains_key(&cell_key(*cell)) {
-            continue;
-        }
+    // ---- step 4: topology, exact official quad construction ----------------
+    let mut voxel_indices: FxHashMap<u64, u32> =
+        FxHashMap::with_capacity_and_hasher(coords.len() * 2, Default::default());
+    for (index, voxel) in coords.iter().enumerate() {
+        voxel_indices.insert(voxel_key(*voxel), index as u32);
+    }
+
+    let mut quads: Vec<[u32; 4]> = Vec::new();
+    let mut quad_directions: Vec<i32> = Vec::new();
+    for (voxel_index, voxel) in coords.iter().enumerate() {
         for axis in 0..3usize {
-            let axis_u = (axis + 1) % 3;
-            let axis_v = (axis + 2) % 3;
-
-            let mut base_corner = [cell[0] as u32, cell[1] as u32, cell[2] as u32];
-            base_corner[axis_u] += 1;
-            base_corner[axis_v] += 1;
-            let mut high_corner = base_corner;
-            high_corner[axis] += 1;
-
-            let sdf_low = sampler.value(base_corner);
-            let sdf_high = sampler.value(high_corner);
-            if (sdf_low <= 0.0) == (sdf_high <= 0.0) {
+            let direction = intersected[voxel_index][axis];
+            if direction == 0 {
                 continue;
             }
-
-            // Cells around the edge, counter-clockwise in the (u, v) plane so
-            // that the quad normal is +axis when the SDF increases along the
-            // edge.
-            const OFFSETS: [(i32, i32); 4] = [(-1, -1), (0, -1), (0, 0), (-1, 0)];
             let mut quad = [0u32; 4];
             let mut complete = true;
-            for (index, (du, dv)) in OFFSETS.iter().enumerate() {
-                let mut neighbor = [0i32; 3];
-                neighbor[axis] = base_corner[axis] as i32;
-                neighbor[axis_u] = base_corner[axis_u] as i32 + du;
-                neighbor[axis_v] = base_corner[axis_v] as i32 + dv;
-                if neighbor
-                    .iter()
-                    .any(|&value| value < 0 || value >= resolution)
-                {
-                    complete = false;
-                    break;
-                }
-                match cell_vertices.get(&cell_key(neighbor)) {
-                    Some(&vertex) => quad[index] = vertex,
+            for (slot, offset) in EDGE_NEIGHBOR_VOXEL_OFFSETS[axis].iter().enumerate() {
+                let neighbor = [
+                    voxel[0] + offset[0],
+                    voxel[1] + offset[1],
+                    voxel[2] + offset[2],
+                ];
+                match voxel_indices.get(&voxel_key(neighbor)) {
+                    Some(&index) => quad[slot] = index,
                     None => {
                         complete = false;
                         break;
                     }
                 }
             }
-            if !complete {
-                continue;
+            if complete {
+                quads.push(quad);
+                quad_directions.push(direction);
             }
-            debug_assert_eq!(quad[0], cell_vertices[&cell_key(*cell)]);
-            if sdf_low >= sdf_high {
-                quad.reverse();
-            }
-            output_faces.extend_from_slice(&quad);
         }
     }
 
-    // ---- step 6: project back to the input surface ------------------------
+    // Official `torch.unique` keeps referenced dual vertices in ascending
+    // voxel-index order (`remeshing.py:205-210`).
+    let mut used: Vec<u32> = quads.iter().flatten().copied().collect();
+    used.sort_unstable();
+    used.dedup();
+
+    let mut vertex_map = vec![u32::MAX; dual_vertices.len()];
+    let mut output_vertices: Vec<f32> = Vec::with_capacity(used.len() * 3);
+    for (new_index, &old_index) in used.iter().enumerate() {
+        vertex_map[old_index as usize] = new_index as u32;
+        let dual = dual_vertices[old_index as usize];
+        output_vertices.push((dual[0] / resolution_f32 - 0.5) * scale + center[0]);
+        output_vertices.push((dual[1] / resolution_f32 - 0.5) * scale + center[1]);
+        output_vertices.push((dual[2] / resolution_f32 - 0.5) * scale + center[2]);
+    }
+    for quad in &mut quads {
+        for index in quad.iter_mut() {
+            *index = vertex_map[*index as usize];
+        }
+    }
+
+    // ---- step 5: official adaptive split into triangles -------------------
+    let mut output_faces: Vec<u32> = Vec::with_capacity(quads.len() * 6);
+    for (quad, &direction) in quads.iter().zip(quad_directions.iter()) {
+        let chosen = triangulate_quad(&output_vertices, *quad, direction);
+        output_faces.extend_from_slice(&chosen);
+    }
+
+    // ---- step 6: optional project-back to the input surface ---------------
     // Official guard: `if project_back > 0` (`remeshing.py:238`); `0`
     // disables and negative factors are rejected by validation.
     if options.project_back > 0.0 {
@@ -467,8 +511,7 @@ pub fn remesh_narrow_band_dc<'mesh>(
             let point = [vertex[0], vertex[1], vertex[2]];
             let hit = bvh.closest_point(point);
             for axis in 0..3 {
-                vertex[axis] =
-                    point[axis] + options.project_back * (hit.position[axis] - point[axis]);
+                vertex[axis] -= options.project_back * (point[axis] - hit.position[axis]);
             }
         }
     }
@@ -513,6 +556,40 @@ fn validate_options(options: &RemeshDcOptions) -> Result<()> {
     Ok(())
 }
 
+/// The grid cube must stay inside the finite f32 range: every sampled point
+/// (cell center or corner) is `center ± scale / 2` at most, and
+/// [`MeshBvh::closest_point`] requires finite query points.
+fn validate_grid_bounds(options: &RemeshDcOptions) -> Result<()> {
+    let half = options.scale as f64 * 0.5;
+    let limit = f32::MAX as f64;
+    for axis in 0..3 {
+        let low = options.center[axis] as f64 - half;
+        let high = options.center[axis] as f64 + half;
+        if !low.is_finite() || !high.is_finite() || low.abs() > limit || high.abs() > limit {
+            return Err(Lux3dError::InvalidInput(
+                "remesh narrow-band dual contouring grid cube is not finite",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Official base-resolution search (`remeshing.py:102-107`): halve while
+/// greater than 32, asserting evenness at every step.
+fn base_resolution(resolution: u32) -> Result<u32> {
+    let mut base = resolution;
+    while base > 32 {
+        if base % 2 != 0 {
+            return Err(Lux3dError::InvalidInput(
+                "remesh narrow-band dual contouring requires a resolution that halves evenly \
+                 down to 32 (official base-resolution loop)",
+            ));
+        }
+        base /= 2;
+    }
+    Ok(base)
+}
+
 fn validate_mesh(vertices: &[f32], faces: &[u32]) -> Result<()> {
     if vertices.len() % 3 != 0 {
         return Err(Lux3dError::InvalidInput(
@@ -544,234 +621,109 @@ fn validate_mesh(vertices: &[f32], faces: &[u32]) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Corner sampling (SDF magnitude from the BVH, sign from ray parity)
+// Grid sampling and dual-contour edges
 // ---------------------------------------------------------------------------
 
-struct CornerSampler<'a, 'mesh> {
-    bvh: &'a MeshBvh<'mesh>,
-    parity: &'a RayParity<'mesh>,
-    origin: [f32; 3],
-    spacing: f32,
-    values: FxHashMap<u64, f32>,
-    scratch: Vec<f64>,
+/// Official cell-center sample point (`remeshing.py:121`):
+/// `((coord + 0.5) / base - 0.5) * scale + center`.
+#[inline]
+fn cell_center_point(coord: [i32; 3], base: f32, scale: f32, center: [f32; 3]) -> [f32; 3] {
+    [
+        ((coord[0] as f32 + 0.5) / base - 0.5) * scale + center[0],
+        ((coord[1] as f32 + 0.5) / base - 0.5) * scale + center[1],
+        ((coord[2] as f32 + 0.5) / base - 0.5) * scale + center[2],
+    ]
 }
 
-impl CornerSampler<'_, '_> {
-    fn value(&mut self, corner: [u32; 3]) -> f32 {
-        let key = corner_key(corner);
-        if let Some(&value) = self.values.get(&key) {
-            return value;
-        }
-        let position = [
-            self.origin[0] + corner[0] as f32 * self.spacing,
-            self.origin[1] + corner[1] as f32 * self.spacing,
-            self.origin[2] + corner[2] as f32 * self.spacing,
-        ];
-        let inside = self.parity.is_inside(position, &mut self.scratch);
-        let distance = self.bvh.closest_point(position).unsigned_distance;
-        let value = if inside { -distance } else { distance };
-        self.values.insert(key, value);
-        value
-    }
+/// Official corner sample point (`remeshing.py:162`):
+/// `(corner / resolution - 0.5) * scale + center`.
+#[inline]
+fn corner_point(corner: [u32; 3], resolution: f32, scale: f32, center: [f32; 3]) -> [f32; 3] {
+    [
+        (corner[0] as f32 / resolution - 0.5) * scale + center[0],
+        (corner[1] as f32 / resolution - 0.5) * scale + center[1],
+        (corner[2] as f32 / resolution - 0.5) * scale + center[2],
+    ]
 }
 
-/// Even-odd ray-crossing counter with a 2D bucket index over the ray-plane
-/// invariant coordinates `u = y dx - dy x`, `w = z dx - dz x` (constant along
-/// a ray with direction `(dx, dy, dz)`).
-struct RayParity<'a> {
-    vertices: &'a [f32],
-    faces: &'a [u32],
-    min: [f64; 2],
-    max: [f64; 2],
-    buckets_per_axis: usize,
-    inv_extent: [f64; 2],
-    buckets: Vec<Vec<u32>>,
-    t_epsilon: f64,
+/// Official sign-change test (`simple_dual_contour.cu:62`): the second branch
+/// is `val2 < 0` with `val1 >= 0`, so a zero corner belongs to the
+/// non-negative side.
+#[inline]
+fn edges_cross(val1: f32, val2: f32) -> bool {
+    (val1 < 0.0 && val2 >= 0.0) || (val1 >= 0.0 && val2 < 0.0)
 }
 
-impl<'a> RayParity<'a> {
-    fn build(vertices: &'a [f32], faces: &'a [u32]) -> Self {
-        let direction = RAY_DIRECTION;
-        let triangle_count = faces.len() / 3;
-
-        let mut triangle_boxes: Vec<([f64; 2], [f64; 2])> = Vec::with_capacity(triangle_count);
-        let mut min = [f64::INFINITY; 2];
-        let mut max = [f64::NEG_INFINITY; 2];
-        let mut mesh_min = [f64::INFINITY; 3];
-        let mut mesh_max = [f64::NEG_INFINITY; 3];
-
-        for triangle in faces.chunks_exact(3) {
-            let a = vertex_f64(vertices, triangle[0]);
-            let b = vertex_f64(vertices, triangle[1]);
-            let c = vertex_f64(vertices, triangle[2]);
-            for axis in 0..3 {
-                mesh_min[axis] = mesh_min[axis].min(a[axis]).min(b[axis]).min(c[axis]);
-                mesh_max[axis] = mesh_max[axis].max(a[axis]).max(b[axis]).max(c[axis]);
-            }
-            let (au, aw) = invariant(a, direction);
-            let (bu, bw) = invariant(b, direction);
-            let (cu, cw) = invariant(c, direction);
-            let low = [au.min(bu).min(cu), aw.min(bw).min(cw)];
-            let high = [au.max(bu).max(cu), aw.max(bw).max(cw)];
-            min[0] = min[0].min(low[0]);
-            min[1] = min[1].min(low[1]);
-            max[0] = max[0].max(high[0]);
-            max[1] = max[1].max(high[1]);
-            triangle_boxes.push((low, high));
-        }
-        debug_assert_eq!(triangle_boxes.len(), triangle_count);
-
-        let diagonal = ((mesh_max[0] - mesh_min[0]).powi(2)
-            + (mesh_max[1] - mesh_min[1]).powi(2)
-            + (mesh_max[2] - mesh_min[2]).powi(2))
-        .sqrt();
-        let t_epsilon = (diagonal * 1e-6).max(f64::MIN_POSITIVE);
-        let padding = (diagonal * 1e-5).max(1e-9);
-        for (low, high) in &mut triangle_boxes {
-            low[0] -= padding;
-            low[1] -= padding;
-            high[0] += padding;
-            high[1] += padding;
-        }
-        min[0] -= padding;
-        min[1] -= padding;
-        max[0] += padding;
-        max[1] += padding;
-
-        let target_buckets = (triangle_count as f64).sqrt().ceil() as usize;
-        let buckets_per_axis = target_buckets.clamp(4, 128);
-        let mut inv_extent = [0.0f64; 2];
-        for axis in 0..2 {
-            let span = max[axis] - min[axis];
-            if span > 0.0 {
-                inv_extent[axis] = buckets_per_axis as f64 / span;
-            }
-        }
-
-        let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); buckets_per_axis * buckets_per_axis];
-        for (triangle_id, (low, high)) in triangle_boxes.iter().enumerate() {
-            let low_u = bucket_index(low[0], min[0], inv_extent[0], buckets_per_axis);
-            let high_u = bucket_index(high[0], min[0], inv_extent[0], buckets_per_axis);
-            let low_w = bucket_index(low[1], min[1], inv_extent[1], buckets_per_axis);
-            let high_w = bucket_index(high[1], min[1], inv_extent[1], buckets_per_axis);
-            for w in low_w..=high_w {
-                for u in low_u..=high_u {
-                    buckets[w * buckets_per_axis + u].push(triangle_id as u32);
-                }
-            }
-        }
-
-        Self {
-            vertices,
-            faces,
-            min,
-            max,
-            buckets_per_axis,
-            inv_extent,
-            buckets,
-            t_epsilon,
-        }
-    }
-
-    /// Even-odd inside test: `true` when the ray from `point` along
-    /// [`RAY_DIRECTION`] crosses the mesh an odd number of times.
-    fn is_inside(&self, point: [f32; 3], scratch: &mut Vec<f64>) -> bool {
-        let origin = [point[0] as f64, point[1] as f64, point[2] as f64];
-        let (u, w) = invariant(origin, RAY_DIRECTION);
-        if u < self.min[0] || u > self.max[0] || w < self.min[1] || w > self.max[1] {
-            return false;
-        }
-        let bucket = self.bucket_index(w, 1) * self.buckets_per_axis + self.bucket_index(u, 0);
-
-        scratch.clear();
-        for &triangle_id in &self.buckets[bucket] {
-            let base = triangle_id as usize * 3;
-            let a = vertex_f64(self.vertices, self.faces[base]);
-            let b = vertex_f64(self.vertices, self.faces[base + 1]);
-            let c = vertex_f64(self.vertices, self.faces[base + 2]);
-            if let Some(parameter) = ray_triangle_parameter(origin, RAY_DIRECTION, a, b, c) {
-                scratch.push(parameter);
-            }
-        }
-        if scratch.is_empty() {
-            return false;
-        }
-        scratch.sort_by(f64::total_cmp);
-        // Count distinct crossing parameters: a ray through a shared triangle
-        // edge/vertex reports one parameter per incident triangle.
-        let mut crossings = 1usize;
-        for pair in scratch.windows(2) {
-            if pair[1] - pair[0] > self.t_epsilon {
-                crossings += 1;
-            }
-        }
-        crossings % 2 == 1
-    }
-
-    fn bucket_index(&self, value: f64, axis: usize) -> usize {
-        bucket_index(
-            value,
-            self.min[axis],
-            self.inv_extent[axis],
-            self.buckets_per_axis,
-        )
-    }
-}
-
-fn bucket_index(value: f64, min: f64, inv_extent: f64, buckets_per_axis: usize) -> usize {
-    if inv_extent <= 0.0 {
-        return 0;
-    }
-    let index = ((value - min) * inv_extent).floor();
-    if !index.is_finite() {
-        return 0;
-    }
-    index.clamp(0.0, (buckets_per_axis - 1) as f64) as usize
-}
-
-/// Ray-plane invariant coordinates for direction `(dx, dy, dz)`, scaled by
-/// `dx` to avoid a division: `u = y dx - dy x`, `w = z dx - dz x`.
-fn invariant(point: [f64; 3], direction: [f64; 3]) -> (f64, f64) {
-    (
-        point[1] * direction[0] - direction[1] * point[0],
-        point[2] * direction[0] - direction[2] * point[0],
-    )
-}
-
-/// Möller–Trumbore ray/triangle parameter for `t > 0` (the ray direction is
-/// not necessarily normalized, so `t` is in direction-length units).
-fn ray_triangle_parameter(
-    origin: [f64; 3],
-    direction: [f64; 3],
-    a: [f64; 3],
-    b: [f64; 3],
-    c: [f64; 3],
-) -> Option<f64> {
-    let edge1 = sub_f64(b, a);
-    let edge2 = sub_f64(c, a);
-    let pvec = cross_f64(direction, edge2);
-    let determinant = dot_f64(edge1, pvec);
-    // Parallel / degenerate triangles: no usable crossing.
-    if determinant.abs() <= 1e-12 {
-        return None;
-    }
-    let inverse_determinant = 1.0 / determinant;
-    let tvec = sub_f64(origin, a);
-    let barycentric_u = dot_f64(tvec, pvec) * inverse_determinant;
-    if !(0.0..=1.0).contains(&barycentric_u) {
-        return None;
-    }
-    let qvec = cross_f64(tvec, edge1);
-    let barycentric_v = dot_f64(direction, qvec) * inverse_determinant;
-    if barycentric_v < 0.0 || barycentric_u + barycentric_v > 1.0 {
-        return None;
-    }
-    let parameter = dot_f64(edge2, qvec) * inverse_determinant;
-    if parameter > 0.0 {
-        Some(parameter)
+/// Official `intersected[axis]` sign (`simple_dual_contour.cu:71-81`).
+#[inline]
+fn edge_sign(val1: f32, val2: f32) -> i32 {
+    if val1 < 0.0 && val2 >= 0.0 {
+        1
+    } else if val1 >= 0.0 && val2 < 0.0 {
+        -1
     } else {
-        None
+        0
     }
+}
+
+// ---------------------------------------------------------------------------
+// Official adaptive quad split
+// ---------------------------------------------------------------------------
+
+/// Picks the official split of one quad and returns its two triangles
+/// (`remeshing.py:212-233`).
+///
+/// `attempt_0` uses the split-1 pattern, `attempt_1` the split-2 pattern; the
+/// `_p` variants are used for `direction == 1` and the `_n` variants
+/// otherwise. `align0 > align1` is strict, so ties choose split 2 exactly like
+/// the reference `torch.where`.
+fn triangulate_quad(vertices: &[f32], quad: [u32; 4], direction: i32) -> [u32; 6] {
+    let (attempt_0, attempt_1) = if direction == 1 {
+        (QUAD_SPLIT_1_P, QUAD_SPLIT_2_P)
+    } else {
+        (QUAD_SPLIT_1_N, QUAD_SPLIT_2_N)
+    };
+    let triangles_0 = apply_pattern(quad, attempt_0);
+    let triangles_1 = apply_pattern(quad, attempt_1);
+    let align_0 = split_alignment(vertices, &triangles_0);
+    let align_1 = split_alignment(vertices, &triangles_1);
+    if align_0 > align_1 {
+        triangles_0
+    } else {
+        triangles_1
+    }
+}
+
+#[inline]
+fn apply_pattern(quad: [u32; 4], pattern: [usize; 6]) -> [u32; 6] {
+    [
+        quad[pattern[0]],
+        quad[pattern[1]],
+        quad[pattern[2]],
+        quad[pattern[3]],
+        quad[pattern[4]],
+        quad[pattern[5]],
+    ]
+}
+
+/// Official normal-alignment metric, verbatim from `remeshing.py:220-231`:
+/// `normals0 = cross(v[t1] - v[t0], v[t2] - v[t0])`,
+/// `normals1 = cross(v[t2] - v[t1], v[t3] - v[t1])`,
+/// `align = abs(dot(normals0, normals1))`.
+fn split_alignment(vertices: &[f32], triangles: &[u32; 6]) -> f32 {
+    let position = |index: usize| -> [f32; 3] {
+        let base = triangles[index] as usize * 3;
+        [vertices[base], vertices[base + 1], vertices[base + 2]]
+    };
+    let normals_0 = cross_f32(
+        sub_f32(position(1), position(0)),
+        sub_f32(position(2), position(0)),
+    );
+    let normals_1 = cross_f32(
+        sub_f32(position(2), position(1)),
+        sub_f32(position(3), position(1)),
+    );
+    dot_f32(normals_0, normals_1).abs()
 }
 
 // ---------------------------------------------------------------------------
@@ -779,65 +731,14 @@ fn ray_triangle_parameter(
 // ---------------------------------------------------------------------------
 
 #[inline]
-fn cell_key(cell: [i32; 3]) -> u64 {
-    debug_assert!(cell.iter().all(|&value| value >= 0));
-    cell[0] as u64 | (cell[1] as u64) << 21 | (cell[2] as u64) << 42
+fn voxel_key(voxel: [i32; 3]) -> u64 {
+    debug_assert!(voxel.iter().all(|&value| value >= 0));
+    voxel[0] as u64 | (voxel[1] as u64) << 21 | (voxel[2] as u64) << 42
 }
 
 #[inline]
 fn corner_key(corner: [u32; 3]) -> u64 {
     corner[0] as u64 | (corner[1] as u64) << 21 | (corner[2] as u64) << 42
-}
-
-/// Clamps a float cell index into `[0, resolution - 1]` (non-finite values
-/// clamp to the corresponding grid edge, NaN to the low edge).
-fn clamp_cell_index(value: f32, resolution: i32) -> i32 {
-    if value.is_nan() {
-        return 0;
-    }
-    if value == f32::NEG_INFINITY {
-        return 0;
-    }
-    if value == f32::INFINITY {
-        return resolution - 1;
-    }
-    (value as i64).clamp(0, resolution as i64 - 1) as i32
-}
-
-#[inline]
-fn vertex_f32(vertices: &[f32], index: u32) -> [f32; 3] {
-    let base = index as usize * 3;
-    [vertices[base], vertices[base + 1], vertices[base + 2]]
-}
-
-#[inline]
-fn vertex_f64(vertices: &[f32], index: u32) -> [f64; 3] {
-    let base = index as usize * 3;
-    [
-        vertices[base] as f64,
-        vertices[base + 1] as f64,
-        vertices[base + 2] as f64,
-    ]
-}
-
-/// Unit geometric normal of triangle `triangle_id`, or `None` for
-/// degenerate (zero-area) triangles.
-fn triangle_normal(vertices: &[f32], faces: &[u32], triangle_id: u32) -> Option<[f32; 3]> {
-    let base = triangle_id as usize * 3;
-    let a = vertex_f32(vertices, faces[base]);
-    let b = vertex_f32(vertices, faces[base + 1]);
-    let c = vertex_f32(vertices, faces[base + 2]);
-    let normal = cross_f32(sub_f32(b, a), sub_f32(c, a));
-    let length_squared = dot_f32(normal, normal);
-    if !length_squared.is_finite() || length_squared <= 0.0 {
-        return None;
-    }
-    let inverse_length = 1.0 / length_squared.sqrt();
-    Some([
-        normal[0] * inverse_length,
-        normal[1] * inverse_length,
-        normal[2] * inverse_length,
-    ])
 }
 
 #[inline]
@@ -856,25 +757,6 @@ fn cross_f32(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 
 #[inline]
 fn dot_f32(a: [f32; 3], b: [f32; 3]) -> f32 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-#[inline]
-fn sub_f64(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-
-#[inline]
-fn cross_f64(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
-#[inline]
-fn dot_f64(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
@@ -972,30 +854,71 @@ mod tests {
         remesh_narrow_band_dc(vertices, faces, &bvh, options).expect("remesh")
     }
 
-    fn quad_point(mesh: &RemeshDcMesh, index: u32) -> [f32; 3] {
-        vertex_f32(&mesh.vertices, index)
+    fn triangle_point(mesh: &RemeshDcMesh, index: u32) -> [f32; 3] {
+        let base = index as usize * 3;
+        [
+            mesh.vertices[base],
+            mesh.vertices[base + 1],
+            mesh.vertices[base + 2],
+        ]
     }
 
-    /// Divergence-theorem signed volume of a closed quad mesh (each quad is
-    /// split into two triangles). Positive for outward winding.
+    /// Divergence-theorem signed volume of a closed triangle mesh. Positive
+    /// for outward winding.
     fn signed_volume(mesh: &RemeshDcMesh) -> f64 {
+        signed_volume_parts(&mesh.vertices, &mesh.faces)
+    }
+
+    fn signed_volume_parts(vertices: &[f32], faces: &[u32]) -> f64 {
         let mut volume = 0.0f64;
-        for quad in mesh.faces.chunks_exact(4) {
-            let a = vertex_f64(&mesh.vertices, quad[0]);
-            let b = vertex_f64(&mesh.vertices, quad[1]);
-            let c = vertex_f64(&mesh.vertices, quad[2]);
-            let d = vertex_f64(&mesh.vertices, quad[3]);
-            volume += dot_f64(a, cross_f64(b, c)) / 6.0;
-            volume += dot_f64(a, cross_f64(c, d)) / 6.0;
+        for triangle in faces.chunks_exact(3) {
+            let mut points = [[0.0f64; 3]; 3];
+            for (slot, &index) in points.iter_mut().zip(triangle.iter()) {
+                let base = index as usize * 3;
+                *slot = [
+                    vertices[base] as f64,
+                    vertices[base + 1] as f64,
+                    vertices[base + 2] as f64,
+                ];
+            }
+            let [a, b, c] = points;
+            volume += (a[0] * (b[1] * c[2] - b[2] * c[1])
+                + a[1] * (b[2] * c[0] - b[0] * c[2])
+                + a[2] * (b[0] * c[1] - b[1] * c[0]))
+                / 6.0;
         }
         volume
     }
 
-    /// Watertightness (every undirected edge shared by exactly two quads)
-    /// plus the Euler characteristic of the resulting closed quad surface.
-    fn assert_closed_quad_mesh(mesh: &RemeshDcMesh, expected_euler: i64) {
+    fn find_root(parents: &mut [u32], mut index: u32) -> u32 {
+        while parents[index as usize] != index {
+            let parent = parents[index as usize];
+            let grandparent = parents[parent as usize];
+            parents[index as usize] = grandparent;
+            index = grandparent;
+        }
+        index
+    }
+
+    fn union(parents: &mut [u32], a: u32, b: u32) {
+        let root_a = find_root(parents, a);
+        let root_b = find_root(parents, b);
+        if root_a != root_b {
+            parents[root_b as usize] = root_a;
+        }
+    }
+
+    /// Watertightness (every undirected edge shared by exactly two triangles),
+    /// the number of connected closed components, and the Euler characteristic
+    /// of each genus-0 component. Returns the per-component signed volumes.
+    fn assert_closed_triangle_mesh(mesh: &RemeshDcMesh, expected_components: usize) -> Vec<f64> {
         assert!(!mesh.faces.is_empty(), "remesh must produce faces");
-        assert_eq!(mesh.faces.len() % 4, 0, "output faces are quads");
+        assert_eq!(mesh.faces.len() % 3, 0, "output faces are triangles");
+        assert_eq!(
+            0,
+            mesh.faces.len() % 6,
+            "the official splitter emits two triangles per quad"
+        );
         assert_eq!(mesh.vertices.len() % 3, 0);
         assert!(
             mesh.vertices.iter().all(|value| value.is_finite()),
@@ -1010,11 +933,14 @@ mod tests {
         }
 
         let mut edge_counts: BTreeMap<(u32, u32), u32> = BTreeMap::new();
-        for quad in mesh.faces.chunks_exact(4) {
-            for edge in 0..4 {
-                let a = quad[edge];
-                let b = quad[(edge + 1) % 4];
-                assert_ne!(a, b, "degenerate quad edge");
+        let mut parents: Vec<u32> = (0..vertex_count as u32).collect();
+        for triangle in mesh.faces.chunks_exact(3) {
+            union(&mut parents, triangle[0], triangle[1]);
+            union(&mut parents, triangle[1], triangle[2]);
+            for edge in 0..3 {
+                let a = triangle[edge];
+                let b = triangle[(edge + 1) % 3];
+                assert_ne!(a, b, "degenerate triangle edge");
                 let key = if a < b { (a, b) } else { (b, a) };
                 *edge_counts.entry(key).or_insert(0) += 1;
             }
@@ -1023,8 +949,75 @@ mod tests {
             assert_eq!(*count, 2, "edge {edge:?} used {count} times");
         }
 
-        let euler = vertex_count as i64 - edge_counts.len() as i64 + (mesh.faces.len() / 4) as i64;
-        assert_eq!(euler, expected_euler, "Euler characteristic");
+        let mut component_of_vertex = vec![u32::MAX; vertex_count];
+        let mut component_count = 0u32;
+        for &index in &mesh.faces {
+            if component_of_vertex[index as usize] == u32::MAX {
+                let root = find_root(&mut parents, index);
+                component_of_vertex[index as usize] = component_count;
+                // Point every vertex of this component at the component id.
+                for (vertex, slot) in component_of_vertex.iter_mut().enumerate() {
+                    if *slot == u32::MAX && find_root(&mut parents, vertex as u32) == root {
+                        *slot = component_count;
+                    }
+                }
+                component_count += 1;
+            }
+        }
+        assert_eq!(
+            component_count as usize, expected_components,
+            "connected component count"
+        );
+        assert!(
+            component_of_vertex
+                .iter()
+                .all(|&component| component != u32::MAX),
+            "the remesher must remove unreferenced vertices"
+        );
+
+        let mut volumes = vec![0.0f64; component_count as usize];
+        for triangle in mesh.faces.chunks_exact(3) {
+            let a = triangle_point(mesh, triangle[0]);
+            let b = triangle_point(mesh, triangle[1]);
+            let c = triangle_point(mesh, triangle[2]);
+            let a = [a[0] as f64, a[1] as f64, a[2] as f64];
+            let b = [b[0] as f64, b[1] as f64, b[2] as f64];
+            let c = [c[0] as f64, c[1] as f64, c[2] as f64];
+            let determinant = a[0] * (b[1] * c[2] - b[2] * c[1])
+                + a[1] * (b[2] * c[0] - b[0] * c[2])
+                + a[2] * (b[0] * c[1] - b[1] * c[0]);
+            volumes[component_of_vertex[triangle[0] as usize] as usize] += determinant / 6.0;
+        }
+
+        let euler = vertex_count as i64 - edge_counts.len() as i64 + (mesh.faces.len() / 3) as i64;
+        assert_eq!(
+            euler,
+            2 * component_count as i64,
+            "each component must be a closed genus-0 surface"
+        );
+        volumes
+    }
+
+    /// Every emitted vertex must lie within one band cell plus the half cell
+    /// diagonal of the input surface.
+    fn assert_vertices_near_surface(
+        mesh: &RemeshDcMesh,
+        vertices: &[f32],
+        faces: &[u32],
+        options: &RemeshDcOptions,
+        maximum_factor: f32,
+    ) {
+        let bvh = MeshBvh::build(vertices, faces).expect("build bvh");
+        let spacing = options.scale / options.resolution as f32;
+        let maximum_distance = maximum_factor * spacing + 1e-4;
+        for chunk in mesh.vertices.chunks_exact(3) {
+            let point = [chunk[0], chunk[1], chunk[2]];
+            let distance = bvh.closest_point(point).unsigned_distance;
+            assert!(
+                distance <= maximum_distance,
+                "vertex {point:?} is {distance} from the surface (limit {maximum_distance})"
+            );
+        }
     }
 
     #[test]
@@ -1044,81 +1037,70 @@ mod tests {
     }
 
     #[test]
+    fn base_resolution_halving_matches_official_loop() {
+        // Official: while base > 32 { assert even; /= 2 }.
+        assert_eq!(base_resolution(2).unwrap(), 2);
+        assert_eq!(base_resolution(16).unwrap(), 16);
+        assert_eq!(base_resolution(32).unwrap(), 32);
+        assert_eq!(base_resolution(64).unwrap(), 32);
+        assert_eq!(base_resolution(512).unwrap(), 32);
+        assert_eq!(base_resolution(4096).unwrap(), 32);
+        assert_eq!(base_resolution(100).unwrap(), 25);
+        assert_eq!(base_resolution(36).unwrap(), 18);
+        assert_eq!(base_resolution(34).unwrap(), 17);
+        // Odd resolutions above 32 fail the official evenness assertion.
+        assert!(base_resolution(33).is_err());
+        assert!(base_resolution(1000).is_err());
+    }
+
+    #[test]
     fn sphere_remesh_is_closed_and_outward_oriented() {
         let (vertices, faces) = uv_sphere(20, 28, 0.5);
         let options = RemeshDcOptions::from_aabb([[-0.5; 3], [0.5; 3]], 24, 1.0, 0.0);
         let mesh = remesh(&vertices, &faces, &options);
-        assert_closed_quad_mesh(&mesh, 2);
+        let volumes = assert_closed_triangle_mesh(&mesh, 2);
+        assert_vertices_near_surface(&mesh, &vertices, &faces, &options, 2.0);
 
-        // Every vertex stays inside the grid cube and within one band cell
-        // plus the half cell diagonal of the input surface.
-        let spacing = options.scale / options.resolution as f32;
-        let maximum_distance = (options.band + 0.5 * 3.0f32.sqrt()) * spacing + 1e-4;
-        let bvh = MeshBvh::build(&vertices, &faces).expect("build bvh");
-        let half_extent = options.scale * 0.5;
-        for chunk in mesh.vertices.chunks_exact(3) {
-            let point = [chunk[0], chunk[1], chunk[2]];
-            let distance = bvh.closest_point(point).unsigned_distance;
-            assert!(
-                distance <= maximum_distance,
-                "vertex {point:?} is {distance} from the surface (limit {maximum_distance})"
-            );
-            for axis in 0..3 {
-                assert!(point[axis] >= options.center[axis] - half_extent - 1e-5);
-                assert!(point[axis] <= options.center[axis] + half_extent + 1e-5);
-            }
-        }
-
-        // Winding: for a convex sphere the quad normal must point away from
-        // the center. The Newell normal is used so quads whose first three
-        // corners are collinear still report a meaningful direction. Strongly
-        // non-planar quads (adjacent QEF vertices clamped onto the same
-        // point) can have a geometric normal that disagrees with the
-        // topological orientation, so instead of asserting every quad the
-        // test requires that inverted normals are a small minority; the
-        // global signed volume below is the exact orientation check.
-        let mut inverted = 0usize;
-        let mut quad_count = 0usize;
-        for quad in mesh.faces.chunks_exact(4) {
-            quad_count += 1;
-            let corners = [
-                quad_point(&mesh, quad[0]),
-                quad_point(&mesh, quad[1]),
-                quad_point(&mesh, quad[2]),
-                quad_point(&mesh, quad[3]),
-            ];
-            let mut normal = [0.0f32; 3];
-            let mut centroid = [0.0f32; 3];
-            for index in 0..4 {
-                let current = corners[index];
-                let next = corners[(index + 1) % 4];
-                normal[0] += (current[1] - next[1]) * (current[2] + next[2]);
-                normal[1] += (current[2] - next[2]) * (current[0] + next[0]);
-                normal[2] += (current[0] - next[0]) * (current[1] + next[1]);
-                centroid[0] += current[0] * 0.25;
-                centroid[1] += current[1] * 0.25;
-                centroid[2] += current[2] * 0.25;
-            }
-            if dot_f32(normal, centroid) <= 0.0 {
-                inverted += 1;
-            }
-        }
+        // `UDF - eps` has two closed components: the outer offset sphere at
+        // +eps (positive/outward) and the inner offset sphere at -eps
+        // (negative/inward).
+        assert_eq!(2, volumes.len());
+        let outer = volumes.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let inner = volumes.iter().copied().fold(f64::INFINITY, f64::min);
         assert!(
-            inverted * 10 < quad_count,
-            "{inverted} of {quad_count} quads have a geometric inward normal"
+            outer > 0.0,
+            "the outer shell must wind outward: {volumes:?}"
+        );
+        assert!(inner < 0.0, "the inner shell must wind inward: {volumes:?}");
+        assert!(
+            outer > -inner,
+            "the outer shell must enclose the inner one: {volumes:?}"
         );
 
-        // Global orientation: the divergence-theorem signed volume of a
-        // closed outward-wound surface is positive and approximates the
-        // sphere volume.
+        let eps = (options.band * options.scale / options.resolution as f32) as f64;
+        let expected_outer = 4.0 / 3.0 * std::f64::consts::PI * (0.5 + eps).powi(3);
+        let expected_inner = 4.0 / 3.0 * std::f64::consts::PI * (0.5 - eps).powi(3);
+        assert!(
+            (outer - expected_outer).abs() < 0.1 * expected_outer,
+            "outer shell volume {outer} far from {expected_outer}"
+        );
+        assert!(
+            (inner + expected_inner).abs() < 0.1 * expected_inner,
+            "inner shell volume {inner} far from {}",
+            -expected_inner
+        );
+
+        // The signed volume of the two shells cancels to the shell volume and
+        // stays positive.
         let volume = signed_volume(&mesh);
         assert!(
             volume > 0.0,
             "outward winding must give a positive signed volume, got {volume}"
         );
+        let expected_shell = expected_outer - expected_inner;
         assert!(
-            (volume - 4.0 / 3.0 * std::f64::consts::PI * 0.5f64.powi(3)).abs() < 0.15,
-            "remeshed volume {volume} far from the sphere volume"
+            (volume - expected_shell).abs() < 0.1 * expected_shell,
+            "remeshed shell volume {volume} far from {expected_shell}"
         );
     }
 
@@ -1127,13 +1109,82 @@ mod tests {
         let (vertices, faces) = cube();
         let options = RemeshDcOptions::from_aabb([[0.0; 3], [1.0; 3]], 24, 1.0, 0.0);
         let mesh = remesh(&vertices, &faces, &options);
-        assert_closed_quad_mesh(&mesh, 2);
+        let volumes = assert_closed_triangle_mesh(&mesh, 2);
+        assert_vertices_near_surface(&mesh, &vertices, &faces, &options, 2.0);
+
+        // Two closed components: the outer Minkowski sum of the unit cube with
+        // a ball of radius eps (positive) and the sharp eroded cube
+        // `[eps, 1 - eps]^3` (negative).
+        assert_eq!(2, volumes.len());
+        let outer = volumes.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let inner = volumes.iter().copied().fold(f64::INFINITY, f64::min);
+        assert!(
+            outer > 0.0,
+            "the outer shell must wind outward: {volumes:?}"
+        );
+        assert!(inner < 0.0, "the inner shell must wind inward: {volumes:?}");
+
+        let eps = (options.band * options.scale / options.resolution as f32) as f64;
+        let expected_outer = 1.0
+            + 6.0 * eps
+            + 3.0 * std::f64::consts::PI * eps * eps
+            + 4.0 / 3.0 * std::f64::consts::PI * eps.powi(3);
+        let expected_inner = (1.0 - 2.0 * eps).powi(3);
+        assert!(
+            (outer - expected_outer).abs() < 0.1 * expected_outer,
+            "outer shell volume {outer} far from {expected_outer}"
+        );
+        assert!(
+            (inner + expected_inner).abs() < 0.1 * expected_inner,
+            "inner shell volume {inner} far from {}",
+            -expected_inner
+        );
+
         let volume = signed_volume(&mesh);
         assert!(volume > 0.0, "outward winding must give a positive volume");
+        let expected_shell = expected_outer - expected_inner;
         assert!(
-            (volume - 1.0).abs() < 0.2,
-            "remeshed box volume {volume} far from 1.0"
+            (volume - expected_shell).abs() < 0.1 * expected_shell,
+            "remeshed shell volume {volume} far from {expected_shell}"
         );
+    }
+
+    #[test]
+    fn triangle_count_scales_with_resolution() {
+        let (vertices, faces) = uv_sphere(16, 20, 0.5);
+        let coarse = remesh(
+            &vertices,
+            &faces,
+            &RemeshDcOptions::from_aabb([[-0.5; 3], [0.5; 3]], 16, 1.0, 0.0),
+        );
+        let fine = remesh(
+            &vertices,
+            &faces,
+            &RemeshDcOptions::from_aabb([[-0.5; 3], [0.5; 3]], 32, 1.0, 0.0),
+        );
+        assert_eq!(0, coarse.faces.len() % 6);
+        assert_eq!(0, fine.faces.len() % 6);
+        let coarse_triangles = coarse.faces.len() / 3;
+        let fine_triangles = fine.faces.len() / 3;
+        // Surface area scales with resolution^2; allow a wide band around the
+        // expected 4x ratio (the offset thickness shifts it slightly).
+        assert!(
+            fine_triangles > coarse_triangles * 2,
+            "expected roughly 4x more triangles, got {coarse_triangles} -> {fine_triangles}"
+        );
+        assert!(
+            fine_triangles < coarse_triangles * 8,
+            "expected roughly 4x more triangles, got {coarse_triangles} -> {fine_triangles}"
+        );
+    }
+
+    #[test]
+    fn non_power_of_two_resolution_uses_official_halving() {
+        let (vertices, faces) = uv_sphere(14, 18, 0.5);
+        // 36 halves to 18, then doubles back to 36 once.
+        let options = RemeshDcOptions::from_aabb([[-0.5; 3], [0.5; 3]], 36, 1.0, 0.0);
+        let mesh = remesh(&vertices, &faces, &options);
+        assert_closed_triangle_mesh(&mesh, 2);
     }
 
     #[test]
@@ -1163,7 +1214,7 @@ mod tests {
         let none = mean_distance(0.0);
         let half = mean_distance(0.5);
         let full = mean_distance(1.0);
-        assert!(none > 0.0, "the raw QEF mesh must sit off the surface");
+        assert!(none > 0.0, "the raw dual mesh must sit off the surface");
         assert!(
             half < none,
             "half projection must reduce the mean distance: {half} vs {none}"
@@ -1179,12 +1230,104 @@ mod tests {
     }
 
     #[test]
+    fn band_controls_the_offset_surface() {
+        let (vertices, faces) = uv_sphere(14, 18, 0.5);
+        let bvh = MeshBvh::build(&vertices, &faces).expect("build bvh");
+        let base = RemeshDcOptions::from_aabb([[-0.5; 3], [0.5; 3]], 16, 1.0, 0.0);
+
+        let mean_distance = |band: f32| -> (f32, usize) {
+            let options = RemeshDcOptions { band, ..base };
+            let mesh = remesh_narrow_band_dc(&vertices, &faces, &bvh, &options).expect("remesh");
+            let total: f32 = mesh
+                .vertices
+                .chunks_exact(3)
+                .map(|chunk| {
+                    bvh.closest_point([chunk[0], chunk[1], chunk[2]])
+                        .unsigned_distance
+                })
+                .sum();
+            (total / (mesh.vertices.len() / 3) as f32, mesh.faces.len())
+        };
+
+        // band = 0: every corner value is an unsigned distance (>= 0), so the
+        // official strict sign-change test never fires and the output is
+        // empty.
+        let (_, band_zero_faces) = mean_distance(0.0);
+        assert_eq!(0, band_zero_faces, "band = 0 yields the empty mesh");
+
+        // The extracted surface sits at distance eps = band * spacing.
+        let spacing = base.scale / base.resolution as f32;
+        let (one, one_faces) = mean_distance(1.0);
+        let (two, two_faces) = mean_distance(2.0);
+        assert!(one_faces > 0 && two_faces > 0);
+        let eps_one = spacing;
+        assert!(
+            one > 0.5 * eps_one && one < 1.5 * eps_one,
+            "band = 1 offset {one} not near eps {eps_one}"
+        );
+        assert!(
+            two > one * 1.4,
+            "band = 2 must sit farther out: {two} vs {one}"
+        );
+    }
+
+    #[test]
     fn remesh_is_deterministic() {
         let (vertices, faces) = uv_sphere(16, 20, 0.5);
         let options = RemeshDcOptions::from_aabb([[-0.5; 3], [0.5; 3]], 20, 1.0, 0.25);
         let first = remesh(&vertices, &faces, &options);
         let second = remesh(&vertices, &faces, &options);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn quad_split_patterns_match_official_tables() {
+        assert_eq!(QUAD_SPLIT_1_N, [0, 1, 2, 0, 2, 3]);
+        assert_eq!(QUAD_SPLIT_1_P, [0, 2, 1, 0, 3, 2]);
+        assert_eq!(QUAD_SPLIT_2_N, [0, 1, 3, 3, 1, 2]);
+        assert_eq!(QUAD_SPLIT_2_P, [0, 3, 1, 3, 2, 1]);
+    }
+
+    #[test]
+    fn adaptive_split_matches_official_alignment_rule() {
+        let flat = |points: [[f32; 3]; 4]| -> Vec<f32> {
+            points.iter().flatten().copied().collect::<Vec<f32>>()
+        };
+        let quad = [0, 1, 2, 3];
+
+        // Planar unit square: align0 = 1 > align1 = 0, so split 1 wins.
+        // direction -1 uses the `_n` pattern, direction 1 the `_p` pattern.
+        let planar = flat([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ]);
+        assert_eq!(
+            [0, 1, 2, 0, 2, 3],
+            triangulate_quad(&planar, quad, -1),
+            "split 1 must win for a non-degenerate planar quad"
+        );
+        assert_eq!(
+            [0, 2, 1, 0, 3, 2],
+            triangulate_quad(&planar, quad, 1),
+            "direction 1 selects the official `_p` pattern"
+        );
+
+        // Degenerate quad (all four corners coincide): align0 == align1 == 0,
+        // and the strict `align0 > align1` tie chooses split 2, exactly like
+        // the reference `torch.where`.
+        let degenerate = flat([[0.0, 0.0, 0.0]; 4]);
+        assert_eq!(
+            [0, 1, 3, 3, 1, 2],
+            triangulate_quad(&degenerate, quad, -1),
+            "a tie chooses split 2 (`_n`)"
+        );
+        assert_eq!(
+            [0, 3, 1, 3, 2, 1],
+            triangulate_quad(&degenerate, quad, 1),
+            "a tie chooses split 2 (`_p`)"
+        );
     }
 
     #[test]
@@ -1196,56 +1339,93 @@ mod tests {
             |options: &RemeshDcOptions| remesh_narrow_band_dc(&vertices, &faces, &bvh, options);
         assert!(run(&valid).is_ok());
 
-        assert!(run(&RemeshDcOptions {
-            resolution: 1,
-            ..valid
-        })
-        .is_err());
-        assert!(run(&RemeshDcOptions {
-            resolution: MAX_GRID_SIZE_PER_AXIS + 1,
-            ..valid
-        })
-        .is_err());
-        assert!(run(&RemeshDcOptions {
-            scale: 0.0,
-            ..valid
-        })
-        .is_err());
-        assert!(run(&RemeshDcOptions {
-            scale: f32::NAN,
-            ..valid
-        })
-        .is_err());
-        assert!(run(&RemeshDcOptions {
-            center: [f32::NAN, 0.0, 0.0],
-            ..valid
-        })
-        .is_err());
-        assert!(run(&RemeshDcOptions {
-            band: -0.5,
-            ..valid
-        })
-        .is_err());
-        assert!(run(&RemeshDcOptions {
-            band: f32::INFINITY,
-            ..valid
-        })
-        .is_err());
-        assert!(run(&RemeshDcOptions {
-            project_back: f32::NAN,
-            ..valid
-        })
-        .is_err());
-        assert!(run(&RemeshDcOptions {
-            project_back: -0.5,
-            ..valid
-        })
-        .is_err());
-        assert!(run(&RemeshDcOptions {
-            project_back: f32::NEG_INFINITY,
-            ..valid
-        })
-        .is_err());
+        assert!(
+            run(&RemeshDcOptions {
+                resolution: 1,
+                ..valid
+            })
+            .is_err()
+        );
+        assert!(
+            run(&RemeshDcOptions {
+                resolution: MAX_GRID_SIZE_PER_AXIS + 1,
+                ..valid
+            })
+            .is_err()
+        );
+        // Odd resolution above 32 fails the official base-resolution halving.
+        assert!(
+            run(&RemeshDcOptions {
+                resolution: 33,
+                ..valid
+            })
+            .is_err()
+        );
+        assert!(
+            run(&RemeshDcOptions {
+                scale: 0.0,
+                ..valid
+            })
+            .is_err()
+        );
+        assert!(
+            run(&RemeshDcOptions {
+                scale: f32::NAN,
+                ..valid
+            })
+            .is_err()
+        );
+        assert!(
+            run(&RemeshDcOptions {
+                center: [f32::NAN, 0.0, 0.0],
+                ..valid
+            })
+            .is_err()
+        );
+        // The grid cube must stay inside the finite f32 range.
+        assert!(
+            run(&RemeshDcOptions {
+                center: [f32::MAX, 0.0, 0.0],
+                scale: f32::MAX,
+                ..valid
+            })
+            .is_err()
+        );
+        assert!(
+            run(&RemeshDcOptions {
+                band: -0.5,
+                ..valid
+            })
+            .is_err()
+        );
+        assert!(
+            run(&RemeshDcOptions {
+                band: f32::INFINITY,
+                ..valid
+            })
+            .is_err()
+        );
+        assert!(
+            run(&RemeshDcOptions {
+                project_back: f32::NAN,
+                ..valid
+            })
+            .is_err()
+        );
+        assert!(
+            run(&RemeshDcOptions {
+                project_back: -0.5,
+                ..valid
+            })
+            .is_err()
+        );
+        assert!(
+            run(&RemeshDcOptions {
+                project_back: f32::NEG_INFINITY,
+                ..valid
+            })
+            .is_err()
+        );
 
         // Malformed buffers are rejected before any grid work.
         assert!(remesh_narrow_band_dc(&vertices[..8], &faces, &bvh, &valid).is_err());
@@ -1255,5 +1435,181 @@ mod tests {
         let mut bad_faces = faces.clone();
         bad_faces[0] = u32::MAX;
         assert!(remesh_narrow_band_dc(&vertices, &bad_faces, &bvh, &valid).is_err());
+    }
+
+    // ---- gated official CuMesh goldens (OR1) ------------------------------
+
+    fn read_npy_gz_f32(path: &std::path::Path) -> Vec<f32> {
+        use flate2::read::GzDecoder;
+        use ndarray::Array2;
+        use ndarray_npy::ReadNpyExt;
+
+        let file = std::fs::File::open(path).expect("open fixture");
+        let decoder = GzDecoder::new(std::io::BufReader::new(file));
+        let array: Array2<f32> = Array2::read_npy(decoder).expect("read npy");
+        array.iter().copied().collect()
+    }
+
+    fn read_npy_gz_u32(path: &std::path::Path) -> Vec<u32> {
+        use flate2::read::GzDecoder;
+        use ndarray::Array2;
+        use ndarray_npy::ReadNpyExt;
+
+        let file = std::fs::File::open(path).expect("open fixture");
+        let decoder = GzDecoder::new(std::io::BufReader::new(file));
+        let array: Array2<i32> = Array2::read_npy(decoder).expect("read npy");
+        array.iter().map(|&value| value as u32).collect()
+    }
+
+    /// Order-insensitive vertex-set comparison: every golden vertex must have
+    /// its own computed vertex within `tolerance`. The official vertex order
+    /// is a hash/index artifact, so it is not compared.
+    fn assert_vertex_sets_match(ours: &[f32], golden: &[f32], tolerance: f32, label: &str) {
+        use std::collections::HashMap;
+
+        assert_eq!(ours.len(), golden.len(), "{label}: vertex buffer length");
+        let cell = (tolerance * 2.0).max(1e-6);
+        let cell_key = |point: [f32; 3]| -> (i32, i32, i32) {
+            (
+                (point[0] / cell).round() as i32,
+                (point[1] / cell).round() as i32,
+                (point[2] / cell).round() as i32,
+            )
+        };
+        let mut buckets: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
+        for (index, chunk) in ours.chunks_exact(3).enumerate() {
+            buckets
+                .entry(cell_key([chunk[0], chunk[1], chunk[2]]))
+                .or_default()
+                .push(index);
+        }
+
+        let mut used = vec![false; ours.len() / 3];
+        let mut worst = 0.0f32;
+        for chunk in golden.chunks_exact(3) {
+            let point = [chunk[0], chunk[1], chunk[2]];
+            let (kx, ky, kz) = cell_key(point);
+            let mut best = f32::INFINITY;
+            let mut best_index = usize::MAX;
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        let Some(indices) = buckets.get(&(kx + dx, ky + dy, kz + dz)) else {
+                            continue;
+                        };
+                        for &index in indices {
+                            if used[index] {
+                                continue;
+                            }
+                            let candidate =
+                                [ours[index * 3], ours[index * 3 + 1], ours[index * 3 + 2]];
+                            let distance = ((point[0] - candidate[0]).powi(2)
+                                + (point[1] - candidate[1]).powi(2)
+                                + (point[2] - candidate[2]).powi(2))
+                            .sqrt();
+                            if distance < best {
+                                best = distance;
+                                best_index = index;
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(
+                best_index != usize::MAX && best <= tolerance,
+                "{label}: no computed vertex within {tolerance} of golden {point:?} \
+                 (nearest unused distance {best})"
+            );
+            used[best_index] = true;
+            worst = worst.max(best);
+        }
+        eprintln!("{label}: max golden/computed vertex distance {worst}");
+    }
+
+    /// Comparison against the official `cumesh.remeshing.remesh_narrow_band_dc`
+    /// goldens produced by OR1 (`tests/fixtures/remesh/`, see
+    /// `scripts/generate_cumesh_remesh_goldens.py`). Skips with a message when
+    /// the fixture directory is absent; does not fail CI without the fixtures.
+    #[test]
+    fn official_cumesh_goldens_match() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/remesh");
+        if !root.is_dir() {
+            eprintln!(
+                "skipping official CuMesh remesh goldens: {} is absent",
+                root.display()
+            );
+            return;
+        }
+
+        let mut compared = 0usize;
+        for name in ["cube_res32", "cube_res64", "sphere_res32", "sphere_res64"] {
+            let dir = root.join(name);
+            if !dir.join("params.json").is_file() {
+                eprintln!("skipping {name}: fixture directory is incomplete");
+                continue;
+            }
+            let params: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(dir.join("params.json"))
+                    .expect("read remesh fixture params"),
+            )
+            .expect("parse remesh fixture params");
+            let param_f32 = |key: &str| -> f32 {
+                params[key]
+                    .as_f64()
+                    .unwrap_or_else(|| panic!("{name}: missing numeric param `{key}`"))
+                    as f32
+            };
+            let center: Vec<f32> = params["center"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name}: missing center array"))
+                .iter()
+                .map(|value| value.as_f64().expect("center entry") as f32)
+                .collect();
+            assert_eq!(3, center.len(), "{name}: center length");
+            let options = RemeshDcOptions {
+                center: [center[0], center[1], center[2]],
+                scale: param_f32("scale"),
+                resolution: params["resolution"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("{name}: missing integer param `resolution`"))
+                    as u32,
+                band: param_f32("band"),
+                project_back: param_f32("project_back"),
+            };
+
+            let input_vertices = read_npy_gz_f32(&dir.join("input_vertices.npy.gz"));
+            let input_faces = read_npy_gz_u32(&dir.join("input_faces.npy.gz"));
+            let golden_vertices = read_npy_gz_f32(&dir.join("vertices.npy.gz"));
+            let golden_faces = read_npy_gz_u32(&dir.join("faces.npy.gz"));
+
+            let bvh = MeshBvh::build(&input_vertices, &input_faces).expect("build fixture bvh");
+            let mesh = remesh_narrow_band_dc(&input_vertices, &input_faces, &bvh, &options)
+                .unwrap_or_else(|error| panic!("{name}: remesh failed: {error}"));
+
+            // Exact topology parity: the official quad count is `faces / 6`.
+            assert_eq!(
+                golden_vertices.len(),
+                mesh.vertices.len(),
+                "{name}: vertex count"
+            );
+            assert_eq!(golden_faces.len(), mesh.faces.len(), "{name}: face count");
+            assert_eq!(
+                0,
+                mesh.faces.len() % 6,
+                "{name}: two triangles per official quad"
+            );
+
+            assert_vertex_sets_match(&mesh.vertices, &golden_vertices, 1e-4, name);
+
+            let golden_volume = signed_volume_parts(&golden_vertices, &golden_faces);
+            let volume = signed_volume(&mesh);
+            assert!(golden_volume > 0.0, "{name}: golden winding is outward");
+            assert!(
+                (volume - golden_volume).abs() <= 1e-4 * golden_volume.abs().max(1.0),
+                "{name}: volume {volume} vs golden {golden_volume}"
+            );
+            compared += 1;
+        }
+        assert!(compared > 0, "no official remesh goldens were compared");
     }
 }
