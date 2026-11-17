@@ -36,8 +36,8 @@ use super::voxelize::{
     quantize_attr, resolve_voxelization_settings, textured_mesh_to_volumetric_attr,
     MaterialVoxelization, VoxelizationSettings,
 };
-use super::{npz, ply, vxz, OvoxFormat, VoxelAttr, VoxelGrid};
 use super::vxz::{VxzCompression, VxzWriteOptions};
+use super::{npz, ply, vxz, OvoxFormat, VoxelAttr, VoxelGrid};
 
 /// Default voxelization resolution of the shipped examples (`RES = 512`).
 pub const OVOX_DEFAULT_RESOLUTION: u32 = 512;
@@ -162,7 +162,10 @@ impl MeshToOvoxOptions {
                 ));
             }
         }
-        if !matches!(self.compression, VxzCompression::None | VxzCompression::Deflate) {
+        if !matches!(
+            self.compression,
+            VxzCompression::None | VxzCompression::Deflate
+        ) {
             return Err(Lux3dError::InvalidInput(
                 "o_voxel .vxz writing supports only `none` and `deflate` compression",
             ));
@@ -202,7 +205,11 @@ pub struct MeshToOvoxStats {
 /// Voxelize a textured mesh into a sparse PBR `.vxz` volume.
 ///
 /// Equivalent to `python examples/mesh2ovox.py` with `--res` / options.
-pub fn mesh2ovox(input: &Path, output: &Path, options: &MeshToOvoxOptions) -> Result<MeshToOvoxStats> {
+pub fn mesh2ovox(
+    input: &Path,
+    output: &Path,
+    options: &MeshToOvoxOptions,
+) -> Result<MeshToOvoxStats> {
     options.validate()?;
     let mut mesh = load_textured_mesh(input)?;
     let input_vertices = mesh.vertex_count();
@@ -224,12 +231,8 @@ pub fn mesh2ovox(input: &Path, output: &Path, options: &MeshToOvoxOptions) -> Re
         None if options.normalize_to_unit_cube => Some(OVOX_DEFAULT_AABB),
         None => None,
     };
-    let settings = resolve_voxelization_settings(
-        bounds,
-        options.voxel_size,
-        options.grid_size,
-        aabb,
-    )?;
+    let settings =
+        resolve_voxelization_settings(bounds, options.voxel_size, options.grid_size, aabb)?;
     if settings.grid_size.iter().any(|size| *size < 2) {
         return Err(Lux3dError::InvalidInput(
             "o_voxel geometry voxelization needs grid_size >= 2 per axis",
@@ -237,7 +240,12 @@ pub fn mesh2ovox(input: &Path, output: &Path, options: &MeshToOvoxOptions) -> Re
     }
 
     let geometry = crate::geometry::mesh_to_flexible_dual_grid(
-        &mesh.vertices.iter().flatten().copied().collect::<Vec<f32>>(),
+        &mesh
+            .vertices
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<f32>>(),
         &mesh.faces,
         &crate::geometry::MeshToDualGridOptions {
             grid_size: settings.grid_size,
@@ -356,13 +364,14 @@ fn align_and_pack(
 
     for &index in &order {
         let coord = geometry.voxel_indices[index];
-        let source = *material_map.get(&coord).ok_or_else(|| {
-            Lux3dError::CanonicalWeightsValidation {
-                message: format!(
-                    "o_voxel geometry voxel {coord:?} has no material attribute row"
-                ),
-            }
-        })?;
+        let source =
+            *material_map
+                .get(&coord)
+                .ok_or_else(|| Lux3dError::CanonicalWeightsValidation {
+                    message: format!(
+                        "o_voxel geometry voxel {coord:?} has no material attribute row"
+                    ),
+                })?;
         coords.push(coord);
         for channel in 0..3 {
             base_color.push(quantize_attr(material.base_color[source][channel]));
@@ -391,19 +400,13 @@ fn align_and_pack(
     }
 
     let mut attrs = BTreeMap::new();
-    attrs.insert(
-        "base_color".to_string(),
-        VoxelAttr::new(3, base_color)?,
-    );
+    attrs.insert("base_color".to_string(), VoxelAttr::new(3, base_color)?);
     attrs.insert("metallic".to_string(), VoxelAttr::new(1, metallic)?);
     attrs.insert("roughness".to_string(), VoxelAttr::new(1, roughness)?);
     attrs.insert("emissive".to_string(), VoxelAttr::new(3, emissive)?);
     attrs.insert("alpha".to_string(), VoxelAttr::new(1, alpha)?);
     attrs.insert("normal".to_string(), VoxelAttr::new(3, normal)?);
-    attrs.insert(
-        "dual_vertices".to_string(),
-        VoxelAttr::new(3, dual_packed)?,
-    );
+    attrs.insert("dual_vertices".to_string(), VoxelAttr::new(3, dual_packed)?);
     attrs.insert(
         "intersected".to_string(),
         VoxelAttr::new(1, intersected_packed)?,
@@ -503,14 +506,14 @@ pub fn decode_ovox(path: &Path, options: &OvoxDecodeOptions) -> Result<DecodedOv
     options.validate()?;
     let grid = super::read_voxels(path)?;
     grid.validate()?;
-    let dual_attr = grid.attr("dual_vertices").ok_or_else(|| {
-        Lux3dError::CanonicalWeightsValidation {
-            message: format!(
-                "o_voxel asset `{}` has no `dual_vertices` attribute",
-                path.display()
-            ),
-        }
-    })?;
+    let dual_attr =
+        grid.attr("dual_vertices")
+            .ok_or_else(|| Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "o_voxel asset `{}` has no `dual_vertices` attribute",
+                    path.display()
+                ),
+            })?;
     if dual_attr.channels != 3 {
         return Err(Lux3dError::CanonicalWeightsValidation {
             message: format!(
@@ -519,14 +522,14 @@ pub fn decode_ovox(path: &Path, options: &OvoxDecodeOptions) -> Result<DecodedOv
             ),
         });
     }
-    let intersected_attr = grid.attr("intersected").ok_or_else(|| {
-        Lux3dError::CanonicalWeightsValidation {
-            message: format!(
-                "o_voxel asset `{}` has no `intersected` attribute",
-                path.display()
-            ),
-        }
-    })?;
+    let intersected_attr =
+        grid.attr("intersected")
+            .ok_or_else(|| Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "o_voxel asset `{}` has no `intersected` attribute",
+                    path.display()
+                ),
+            })?;
     if intersected_attr.channels != 1 {
         return Err(Lux3dError::CanonicalWeightsValidation {
             message: format!(
@@ -555,7 +558,13 @@ pub fn decode_ovox(path: &Path, options: &OvoxDecodeOptions) -> Result<DecodedOv
     let dual_vertices: Vec<[f32; 3]> = dual_attr
         .data
         .chunks_exact(3)
-        .map(|chunk| [chunk[0] as f32 / 255.0, chunk[1] as f32 / 255.0, chunk[2] as f32 / 255.0])
+        .map(|chunk| {
+            [
+                chunk[0] as f32 / 255.0,
+                chunk[1] as f32 / 255.0,
+                chunk[2] as f32 / 255.0,
+            ]
+        })
         .collect();
     let intersected: Vec<[bool; 3]> = intersected_attr
         .data
@@ -613,7 +622,11 @@ pub fn decode_ovox(path: &Path, options: &OvoxDecodeOptions) -> Result<DecodedOv
 
 /// Reconstruct a mesh from a `.vxz`/`.npz`/`.ply` o_voxel asset and write a
 /// PLY with base-color vertex colors — `examples/ovox2mesh.py`.
-pub fn ovox2mesh(input: &Path, output: &Path, options: &OvoxDecodeOptions) -> Result<OvoxToMeshStats> {
+pub fn ovox2mesh(
+    input: &Path,
+    output: &Path,
+    options: &OvoxDecodeOptions,
+) -> Result<OvoxToMeshStats> {
     let extension = output
         .extension()
         .and_then(|extension| extension.to_str())
@@ -766,15 +779,16 @@ pub fn ovox2glb(input: &Path, output: &Path, options: &OvoxToGlbOptions) -> Resu
         ));
     }
     let decoded = decode_ovox(input, &options.decode)?;
-    let pbr6 = decoded.pbr6.as_ref().ok_or_else(|| {
-        Lux3dError::CanonicalWeightsValidation {
+    let pbr6 = decoded
+        .pbr6
+        .as_ref()
+        .ok_or_else(|| Lux3dError::CanonicalWeightsValidation {
             message: format!(
                 "o_voxel asset `{}` is missing one of base_color/metallic/roughness/alpha, which \
                  ovox2glb needs for the PBR bake",
                 input.display()
             ),
-        }
-    })?;
+        })?;
     let grid_size = [
         options.decode.grid_size[0] as usize,
         options.decode.grid_size[1] as usize,
@@ -823,8 +837,14 @@ pub fn ovox2glb(input: &Path, output: &Path, options: &OvoxToGlbOptions) -> Resu
         .chunks_exact(3)
         .map(|chunk| [chunk[0], chunk[1], chunk[2]])
         .collect();
-    let atlas = crate::geometry::uv_unwrap(&vertices, &postprocessed.faces, options.texture_size as u32)?;
-    let normals = crate::geometry::area_weighted_vertex_normals(&atlas.vertices, &atlas.indices);
+    let atlas =
+        crate::geometry::uv_unwrap(&vertices, &postprocessed.faces, options.texture_size as u32)?;
+    // Official order (`postprocess.py:215-216`): compute vertex normals on the
+    // PRE-unwrap mesh, then gather them through the atlas vertex map. Computing
+    // area-weighted normals on `atlas.vertices/atlas.indices` instead would give
+    // seam-duplicated vertices only the normals of their own chart, producing
+    // lighting seams at chart boundaries.
+    let normals = gather_atlas_normals(&vertices, &postprocessed.faces, &atlas.vmapping)?;
     let baked = crate::geometry::bake_pbr_texture_with_snap_in_grid(
         &atlas.vertices,
         &atlas.uvs,
@@ -885,5 +905,128 @@ fn vertex_bounds(vertices: &[f32]) -> ([f32; 3], [f32; 3]) {
         ([0.0; 3], [0.0; 3])
     } else {
         (min, max)
+    }
+}
+
+/// Area-weighted vertex normals on the pre-unwrap topology, gathered through
+/// the UV atlas `vmapping` (`normals = mesh.read_vertex_normals()[vmaps]`,
+/// `postprocess.py:215-216`).
+fn gather_atlas_normals(
+    vertices: &[[f32; 3]],
+    faces: &[u32],
+    vmapping: &[u32],
+) -> Result<Vec<[f32; 3]>> {
+    let pre_unwrap = crate::geometry::area_weighted_vertex_normals(vertices, faces);
+    let mut normals = Vec::new();
+    normals.try_reserve_exact(vmapping.len()).map_err(|_| {
+        Lux3dError::CanonicalWeightsValidation {
+            message: "o_voxel ovox2glb: out of memory while gathering atlas normals".to_string(),
+        }
+    })?;
+    for &original in vmapping {
+        let normal = pre_unwrap.get(original as usize).copied().ok_or_else(|| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "o_voxel ovox2glb: UV atlas vmapping points at missing vertex {original} \
+                     (pre-unwrap mesh has {} vertices)",
+                    pre_unwrap.len()
+                ),
+            }
+        })?;
+        normals.push(normal);
+    }
+    Ok(normals)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Unit cube welded to 8 shared vertices and 12 outward triangles. The
+    /// hard 90-degree edges force the UV unwrap to duplicate seam vertices.
+    fn welded_cube() -> (Vec<[f32; 3]>, Vec<u32>) {
+        let vertices = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [0.0, 1.0, 1.0],
+        ];
+        let faces = vec![
+            0, 2, 1, 0, 3, 2, // bottom (-z)
+            4, 5, 6, 4, 6, 7, // top (+z)
+            0, 1, 5, 0, 5, 4, // front (-y)
+            2, 3, 7, 2, 7, 6, // back (+y)
+            0, 4, 7, 0, 7, 3, // left (-x)
+            1, 2, 6, 1, 6, 5, // right (+x)
+        ];
+        (vertices, faces)
+    }
+
+    #[test]
+    fn gathered_atlas_normals_use_pre_unwrap_topology_at_seams() {
+        let (vertices, faces) = welded_cube();
+        let pre_unwrap = crate::geometry::area_weighted_vertex_normals(&vertices, &faces);
+        let atlas = crate::geometry::uv_unwrap(&vertices, &faces, 64).expect("uv unwrap");
+        assert!(
+            atlas.vmapping.len() > vertices.len(),
+            "the cube's hard edges must split atlas vertices (atlas {} vs source {})",
+            atlas.vmapping.len(),
+            vertices.len()
+        );
+
+        let gathered =
+            gather_atlas_normals(&vertices, &faces, &atlas.vmapping).expect("gather normals");
+        assert_eq!(gathered.len(), atlas.vmapping.len());
+        for (index, &original) in atlas.vmapping.iter().enumerate() {
+            assert_eq!(
+                gathered[index], pre_unwrap[original as usize],
+                "atlas vertex {index} must reuse the pre-unwrap normal of source vertex {original}"
+            );
+        }
+
+        // Every atlas copy of an original vertex shares one normal, and at
+        // least one copy differs from the chart-local area-weighted normal
+        // (which sees only its own face), i.e. the old computation would have
+        // produced a seam.
+        let mut duplicates = 0usize;
+        let chart_normals =
+            crate::geometry::area_weighted_vertex_normals(&atlas.vertices, &atlas.indices);
+        let mut differs = false;
+        for original in 0..vertices.len() as u32 {
+            let copies: Vec<usize> = atlas
+                .vmapping
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &value)| (value == original).then_some(index))
+                .collect();
+            if copies.len() < 2 {
+                continue;
+            }
+            duplicates += 1;
+            for &copy in &copies {
+                assert_eq!(gathered[copy], pre_unwrap[original as usize]);
+                if chart_normals[copy] != gathered[copy] {
+                    differs = true;
+                }
+            }
+        }
+        assert!(duplicates > 0, "expected seam-duplicated source vertices");
+        assert!(
+            differs,
+            "chart-local normals should disagree with the gathered normal at some seam copy"
+        );
+    }
+
+    #[test]
+    fn gathered_atlas_normals_reject_out_of_range_vmapping() {
+        let vertices = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let faces = vec![0, 1, 2];
+        let error = gather_atlas_normals(&vertices, &faces, &[0, 1, 2, 3])
+            .expect_err("vmapping index 3 is out of range");
+        assert!(error.to_string().contains("missing vertex"));
     }
 }

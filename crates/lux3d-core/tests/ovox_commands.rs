@@ -95,7 +95,11 @@ fn cube_surface_distance(point: [f32; 3], half: f32) -> f32 {
         .map(|coordinate| (coordinate.abs() - half).max(0.0))
         .collect();
     if outside.iter().any(|distance| *distance > 0.0) {
-        outside.iter().map(|distance| distance * distance).sum::<f32>().sqrt()
+        outside
+            .iter()
+            .map(|distance| distance * distance)
+            .sum::<f32>()
+            .sqrt()
     } else {
         point
             .iter()
@@ -145,14 +149,23 @@ fn mesh_to_vxz_attribute_layout_matches_official_channels() {
         for index in 0..count {
             let base = grid.attr("base_color").unwrap().row(index).unwrap();
             assert!((base[0] as i32 - 64).abs() <= 1, "base_color red {base:?}");
-            assert!((base[1] as i32 - 128).abs() <= 1, "base_color green {base:?}");
-            assert!((base[2] as i32 - 192).abs() <= 1, "base_color blue {base:?}");
+            assert!(
+                (base[1] as i32 - 128).abs() <= 1,
+                "base_color green {base:?}"
+            );
+            assert!(
+                (base[2] as i32 - 192).abs() <= 1,
+                "base_color blue {base:?}"
+            );
             let metallic = grid.attr("metallic").unwrap().row(index).unwrap()[0];
             assert!((metallic as i32 - 64).abs() <= 2, "metallic {metallic}");
             let roughness = grid.attr("roughness").unwrap().row(index).unwrap()[0];
             assert!((roughness as i32 - 191).abs() <= 2, "roughness {roughness}");
             assert_eq!(grid.attr("alpha").unwrap().row(index).unwrap()[0], 255);
-            assert_eq!(grid.attr("emissive").unwrap().row(index).unwrap(), &[0, 0, 0]);
+            assert_eq!(
+                grid.attr("emissive").unwrap().row(index).unwrap(),
+                &[0, 0, 0]
+            );
             let dual = grid.attr("dual_vertices").unwrap().row(index).unwrap();
             assert_eq!(dual.len(), 3);
             let intersected = grid.attr("intersected").unwrap().row(index).unwrap()[0];
@@ -162,7 +175,7 @@ fn mesh_to_vxz_attribute_layout_matches_official_channels() {
 }
 
 #[test]
-fn mesh_vxz_mesh_roundtrip_stays_within_one_voxel() {
+fn mesh_vxz_mesh_roundtrip_stays_within_two_voxel_diagonals() {
     let dir = temp_dir("ovox_roundtrip");
     let input = dir.join("cube.glb");
     write_fixture(&input, 0.5);
@@ -214,11 +227,21 @@ fn mesh_vxz_mesh_roundtrip_stays_within_one_voxel() {
         "reconstructed bbox {decoded:?} left the voxel box"
     );
     // Dual vertices are packed to 1/255 of a cell and the QEF vertex may sit
-    // in a neighbouring surface voxel; two voxel diagonals is a safe bound.
+    // in a neighbouring surface voxel; two voxel diagonals is a safe bound
+    // (~3.46 voxels), which is why this test is NOT called "within one voxel".
+    // Measured regression baseline at res 64: max_distance = 1.18e-4 =
+    // 7.55e-3 * voxel_size (mean 3.2e-5 = 2.05e-3 * voxel_size). The tighter
+    // 0.05-voxel guard below keeps the observed quality while the diagonal
+    // bound documents the theoretical packing/QEF limit.
     let tolerance = 2.0 * voxel_size * 3.0f32.sqrt();
     assert!(
         max_distance <= tolerance,
         "max distance {max_distance} exceeds tolerance {tolerance}"
+    );
+    assert!(
+        max_distance <= 0.05 * voxel_size,
+        "max distance {max_distance} exceeds the measured regression bound (7.55e-3 voxels; \
+         0.05 voxels allowed)"
     );
     assert!(
         mean_distance <= 0.5 * voxel_size as f64,
@@ -280,14 +303,34 @@ fn ovox2glb_end_to_end_at_official_resolution() {
     );
 
     // Read the baked GLB back to confirm the textured mesh contract.
-    let reloaded =
-        lux3d_core::export::load_textured_mesh(&glb).expect("reload baked GLB");
+    let reloaded = lux3d_core::export::load_textured_mesh(&glb).expect("reload baked GLB");
     assert_eq!(reloaded.vertex_count(), baked.atlas_vertices);
     assert_eq!(reloaded.face_count(), baked.atlas_faces);
     assert!(!reloaded.materials.is_empty());
-    assert_eq!(reloaded.materials[0].base_color_texture.as_ref().unwrap().width, 2048);
-    assert_eq!(reloaded.materials[0].metallic_texture.as_ref().unwrap().width, 2048);
-    assert_eq!(reloaded.materials[0].roughness_texture.as_ref().unwrap().width, 2048);
+    assert_eq!(
+        reloaded.materials[0]
+            .base_color_texture
+            .as_ref()
+            .unwrap()
+            .width,
+        2048
+    );
+    assert_eq!(
+        reloaded.materials[0]
+            .metallic_texture
+            .as_ref()
+            .unwrap()
+            .width,
+        2048
+    );
+    assert_eq!(
+        reloaded.materials[0]
+            .roughness_texture
+            .as_ref()
+            .unwrap()
+            .width,
+        2048
+    );
 }
 
 /// Minimal ASCII PLY vertex reader (the writer emits `format ascii 1.0` with

@@ -264,18 +264,60 @@ fn compress_section(
     }
 }
 
-fn decompress_section(data: &[u8], compression: &str) -> Result<Vec<u8>> {
-    match compression {
-        "none" => Ok(data.to_vec()),
-        "deflate" => {
-            let mut decoder = flate2::read::DeflateDecoder::new(data);
-            let mut output = Vec::new();
-            decoder
-                .read_to_end(&mut output)
-                .map_err(|error| vxz_error(format!("raw deflate decompression failed: {error}")))?;
-            Ok(output)
+/// Read a byte stream into a `Vec`, failing once `limit` bytes would be
+/// exceeded instead of letting a decompression bomb grow the buffer.
+///
+/// `try_reserve` is used for growth so an allocation failure returns a clear
+/// error rather than aborting the process.
+fn read_limited(mut reader: impl Read, limit: usize, what: &str) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| vxz_error(format!("{what} decompression failed: {error}")))?;
+        if read == 0 {
+            break;
         }
-        "lzma" => super::lzma2::decompress(data),
+        let new_len = output
+            .len()
+            .checked_add(read)
+            .ok_or_else(|| vxz_error(format!("{what} decoded size overflows usize")))?;
+        if new_len > limit {
+            return Err(vxz_error(format!(
+                "{what} expands past its {limit}-byte limit (possible decompression bomb)"
+            )));
+        }
+        output
+            .try_reserve(read)
+            .map_err(|_| vxz_error(format!("out of memory while decompressing {what}")))?;
+        output.extend_from_slice(&buffer[..read]);
+    }
+    Ok(output)
+}
+
+/// Decompress one section, bounding the decoded size by `max_output`.
+///
+/// The caller derives `max_output` from the container structure (the expected
+/// attribute size for a chunk, or the octree-node bound for the SVO section)
+/// so a crafted file cannot expand the section beyond what the declared voxel
+/// count can use.
+fn decompress_section(data: &[u8], compression: &str, max_output: usize) -> Result<Vec<u8>> {
+    match compression {
+        "none" => {
+            if data.len() > max_output {
+                return Err(vxz_error(format!(
+                    "uncompressed section has {} bytes, past its {max_output}-byte limit",
+                    data.len()
+                )));
+            }
+            Ok(data.to_vec())
+        }
+        "deflate" => {
+            let decoder = flate2::read::DeflateDecoder::new(data);
+            read_limited(decoder, max_output, "raw deflate section")
+        }
+        "lzma" => super::lzma2::decompress_with_limit(data, max_output),
         "zstd" => Err(vxz_error(
             "zstd-compressed sections require a zstd decoder; this build only reads \
              none, deflate and lzma",
@@ -300,6 +342,25 @@ fn chunk_depth(chunk_size: usize) -> Result<u32> {
         )));
     }
     Ok(chunk_size.trailing_zeros())
+}
+
+/// Upper bound on the decoded SVO byte stream for one chunk.
+///
+/// The stream stores one byte per octree node, and any chunk SVO is a subtree
+/// of the full octree of depth `chunk_depth` (every node has an occupied
+/// descendant), whose node count is `1 + 8 + ... + 8^depth`. Sizing the
+/// decompression cap from that structural bound keeps crafted streams from
+/// expanding into unrelated memory.
+fn max_svo_bytes(chunk_size: usize) -> Result<usize> {
+    let depth = chunk_depth(chunk_size)?;
+    let mut nodes = 1usize;
+    for _ in 0..depth {
+        nodes = nodes
+            .checked_mul(8)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| vxz_error("SVO node bound overflows usize"))?;
+    }
+    Ok(nodes)
 }
 
 fn validate_attr_schema(attrs: &BTreeMap<String, VoxelAttr>) -> Result<()> {
@@ -478,7 +539,9 @@ pub fn encode_vxz(grid: &VoxelGrid, options: &VxzWriteOptions) -> Result<Vec<u8>
         });
     }
 
-    let raw_size = (grid.coords.len() * 4) as u64
+    // Official `raw_size` counts `coord.numel() * 4` (N * 3 int32 coordinates)
+    // plus the attribute bytes (`vxz.py:263`).
+    let raw_size = (grid.coords.len() * 3 * 4) as u64
         + grid
             .attrs
             .values()
@@ -546,12 +609,13 @@ fn decompress_stream(
     sections: &BTreeMap<String, [u64; 2]>,
     key: &str,
     compression: &str,
+    max_output: usize,
 ) -> Result<Vec<u8>> {
     let range = sections
         .get(key)
         .copied()
         .ok_or_else(|| vxz_error(format!("chunk is missing the `{key}` section")))?;
-    decompress_section(section(chunk, range, key)?, compression)
+    decompress_section(section(chunk, range, key)?, compression, max_output)
 }
 
 fn decode_chunk_attrs(
@@ -566,10 +630,10 @@ fn decode_chunk_attrs(
     match interleave {
         VxzInterleave::AsIs => {
             for (name, channels) in schema {
-                let bytes = decompress_stream(chunk, sections, name, compression)?;
                 let expected = num_voxel
                     .checked_mul(*channels)
                     .ok_or_else(|| vxz_error("attribute stream size overflow"))?;
+                let bytes = decompress_stream(chunk, sections, name, compression, expected)?;
                 if bytes.len() != expected {
                     return Err(vxz_error(format!(
                         "attribute `{name}` has {} bytes; expected {expected} for {num_voxel} \
@@ -582,10 +646,17 @@ fn decode_chunk_attrs(
         }
         VxzInterleave::None => {
             for (name, channels) in schema {
-                let mut interleaved = vec![0u8; num_voxel * *channels];
+                let expected = num_voxel
+                    .checked_mul(*channels)
+                    .ok_or_else(|| vxz_error("attribute stream size overflow"))?;
+                let mut interleaved = Vec::new();
+                interleaved
+                    .try_reserve_exact(expected)
+                    .map_err(|_| vxz_error("out of memory while assembling attribute channels"))?;
+                interleaved.resize(expected, 0u8);
                 for channel in 0..*channels {
                     let key = format!("{name}_{channel}");
-                    let bytes = decompress_stream(chunk, sections, &key, compression)?;
+                    let bytes = decompress_stream(chunk, sections, &key, compression, num_voxel)?;
                     if bytes.len() != num_voxel {
                         return Err(vxz_error(format!(
                             "attribute stream `{key}` has {} bytes; expected {num_voxel}",
@@ -600,19 +671,31 @@ fn decode_chunk_attrs(
             }
         }
         VxzInterleave::All => {
-            let bytes = decompress_stream(chunk, sections, "attr", compression)?;
-            let total_channels: usize = schema.iter().map(|(_, channels)| channels).sum();
-            let expected = num_voxel * total_channels;
+            let total_channels = schema
+                .iter()
+                .try_fold(0usize, |total, (_, channels)| total.checked_add(*channels))
+                .ok_or_else(|| vxz_error("attribute channel count overflows usize"))?;
+            let expected = num_voxel
+                .checked_mul(total_channels)
+                .ok_or_else(|| vxz_error("attribute stream size overflow"))?;
+            let bytes = decompress_stream(chunk, sections, "attr", compression, expected)?;
             if bytes.len() != expected {
                 return Err(vxz_error(format!(
                     "attribute stream `attr` has {} bytes; expected {expected}",
                     bytes.len()
                 )));
             }
-            let mut per_attr: Vec<Vec<u8>> = schema
-                .iter()
-                .map(|(_, channels)| Vec::with_capacity(num_voxel * channels))
-                .collect();
+            let mut per_attr: Vec<Vec<u8>> = Vec::with_capacity(schema.len());
+            for (_, channels) in schema {
+                let size = num_voxel
+                    .checked_mul(*channels)
+                    .ok_or_else(|| vxz_error("attribute stream size overflow"))?;
+                let mut values = Vec::new();
+                values
+                    .try_reserve_exact(size)
+                    .map_err(|_| vxz_error("out of memory while splitting attribute channels"))?;
+                per_attr.push(values);
+            }
             for row in 0..num_voxel {
                 let mut offset = row * total_channels;
                 for (index, (_, channels)) in schema.iter().enumerate() {
@@ -662,18 +745,65 @@ pub fn decode_vxz(bytes: &[u8]) -> Result<VoxelGrid> {
         schema.push((name.clone(), *channels));
     }
 
-    let mut coords: Vec<[i32; 3]> = Vec::with_capacity(info.num_voxel);
+    // Bound the decoded octree stream by the node count of the full octree
+    // for this chunk size, and the declared total by the chunks' voxel
+    // capacity, before reserving anything for untrusted lengths.
+    let svo_output_limit = max_svo_bytes(info.chunk_size)?;
+    let voxels_per_chunk = (info.chunk_size as u64)
+        .checked_mul(info.chunk_size as u64)
+        .and_then(|value| value.checked_mul(info.chunk_size as u64))
+        .ok_or_else(|| vxz_error("chunk voxel capacity overflows u64"))?;
+    let chunk_capacity = (info.chunks.len() as u64)
+        .checked_mul(voxels_per_chunk)
+        .ok_or_else(|| vxz_error("total chunk voxel capacity overflows u64"))?;
+    let declared_voxels = u64::try_from(info.num_voxel)
+        .map_err(|_| vxz_error("header num_voxel does not fit in u64"))?;
+    if declared_voxels > chunk_capacity {
+        return Err(vxz_error(format!(
+            "header declares {} voxels but its {} chunk(s) of {}^3 can hold at most {}",
+            info.num_voxel,
+            info.chunks.len(),
+            info.chunk_size,
+            chunk_capacity
+        )));
+    }
+
+    let mut coords: Vec<[i32; 3]> = Vec::new();
+    coords
+        .try_reserve_exact(info.num_voxel)
+        .map_err(|_| vxz_error("out of memory while reserving voxel coordinates"))?;
     let mut attrs: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    for (name, _) in &schema {
-        attrs.insert(name.clone(), Vec::new());
+    for (name, channels) in &schema {
+        let expected = info
+            .num_voxel
+            .checked_mul(*channels)
+            .ok_or_else(|| vxz_error("attribute stream size overflow"))?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(expected)
+            .map_err(|_| vxz_error(format!("out of memory while reserving attribute `{name}`")))?;
+        attrs.insert(name.clone(), data);
     }
 
     for chunk_info in &info.chunks {
         let chunk = section(binary, chunk_info.ptr, "chunk")?;
-        let svo = decompress_section(section(chunk, chunk_info.svo, "svo")?, &info.compression)?;
+        let svo = decompress_section(
+            section(chunk, chunk_info.svo, "svo")?,
+            &info.compression,
+            svo_output_limit,
+        )?;
         let codes = serialize::decode_sparse_voxel_octree(&svo, depth)?;
         let local = serialize::decode_seq(&codes, DEFAULT_PERMUTE, SeqMode::ZOrder)?;
         let num_voxel = local.len();
+        if coords
+            .len()
+            .checked_add(num_voxel)
+            .map_or(true, |total| total > info.num_voxel)
+        {
+            return Err(vxz_error(format!(
+                "chunk {:?} pushes the voxel total past the header num_voxel {}",
+                chunk_info.idx, info.num_voxel
+            )));
+        }
         for coord in local {
             let global = [
                 chunk_info.idx[0]
@@ -703,6 +833,14 @@ pub fn decode_vxz(bytes: &[u8]) -> Result<VoxelGrid> {
         for (name, values) in chunk_attrs {
             attrs.entry(name).or_default().extend(values);
         }
+    }
+
+    if coords.len() != info.num_voxel {
+        return Err(vxz_error(format!(
+            "decoded {} voxels but the header declares {}",
+            coords.len(),
+            info.num_voxel
+        )));
     }
 
     let mut grid = VoxelGrid {
@@ -828,7 +966,7 @@ mod tests {
                 );
                 assert_eq!(
                     info.raw_size,
-                    (grid.coords.len() * 4) as u64
+                    (grid.coords.len() * 3 * 4) as u64
                         + grid
                             .attrs
                             .values()
@@ -973,6 +1111,74 @@ mod tests {
         });
         let error = decode_vxz(&interleave).expect_err("missing attr section must fail");
         assert!(error.to_string().contains("attr"));
+    }
+
+    #[test]
+    fn vxz_rejects_header_num_voxel_above_chunk_capacity() {
+        let grid = sample_grid();
+        let options = VxzWriteOptions {
+            chunk_size: 4,
+            compression: VxzCompression::None,
+            compression_level: None,
+            attr_interleave: VxzInterleave::AsIs,
+        };
+        let bytes = encode_vxz(&grid, &options).expect("encode");
+        let (info, _) = parse_header(&bytes).expect("header");
+        let capacity = info.chunks.len() as u64 * 4u64.pow(3);
+        assert!(capacity < 1_000_000_000);
+
+        // A tiny file declaring a billion voxels must fail before reserving
+        // the coordinate/attribute buffers.
+        let malformed = patch_header(&bytes, |value| {
+            value["num_voxel"] = serde_json::json!(1_000_000_000u64);
+        });
+        let error = decode_vxz(&malformed).expect_err("huge num_voxel must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("can hold at most"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn vxz_section_limits_stop_decompression_bombs() {
+        let payload = vec![0u8; 1 << 20];
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(&payload).expect("deflate");
+        let compressed = encoder.finish().expect("deflate finish");
+
+        let error = decompress_section(&compressed, "deflate", 1024)
+            .expect_err("a 1 MiB expansion must not pass a 1 KiB cap");
+        assert!(
+            error.to_string().contains("limit"),
+            "unexpected error: {error}"
+        );
+        let decoded = decompress_section(&compressed, "deflate", payload.len())
+            .expect("sufficient cap decodes");
+        assert_eq!(decoded, payload);
+
+        let error = decompress_section(&payload[..64], "none", 32)
+            .expect_err("uncompressed sections obey the cap");
+        assert!(error.to_string().contains("limit"));
+
+        // The raw LZMA2 path goes through the same limit.
+        let stream = [0x02, 0x00, 0x03, b't', b'e', b's', b't', 0x00];
+        let error =
+            decompress_section(&stream, "lzma", 3).expect_err("LZMA2 output must be bounded");
+        assert!(
+            error.to_string().contains("limit"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn vxz_svo_limit_is_the_full_octree_node_bound() {
+        assert_eq!(max_svo_bytes(4).unwrap(), 1 + 8 + 64);
+        assert_eq!(
+            max_svo_bytes(256).unwrap(),
+            ((8u64.pow(9) - 1) / 7) as usize
+        );
     }
 
     fn assert_fixture_grid(grid: &VoxelGrid) {

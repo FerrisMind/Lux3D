@@ -85,10 +85,9 @@ pub struct Mesh2OvoxArgs {
         long = "grid-size",
         value_delimiter = ',',
         value_name = "N[,N,N]",
-        default_value = "512",
-        help = "Voxel resolution per axis; one value repeats, three values set X,Y,Z. Default 512 (official RES). Required unless --voxel-size is given."
+        help = "Voxel resolution per axis; one value repeats, three values set X,Y,Z. Default 512 (official RES) when neither resolution flag is given. If --grid-size is omitted and --voxel-size is supplied, the grid range is derived from the mesh bounds (the core auto-derives round(extent / voxel_size))."
     )]
-    pub grid_size: Vec<u32>,
+    pub grid_size: Option<Vec<u32>>,
 
     #[arg(
         long = "voxel-size",
@@ -695,7 +694,7 @@ pub struct RunArgs {
 
     #[arg(
         long,
-        help = "TRELLIS.2 sample count (default 1). Values > 1 run the deterministic stages sequentially with per-sample seed offset (seed + i) over the same conditioning — NOT batched inference — and write one output per sample with a `_0`, `_1`, ... suffix."
+        help = "TRELLIS.2 sample count (default 1). Values > 1 share one conditioning pass and one joint batched noise draw (a `[S,8,R,R,R]` sparse-structure tensor plus concatenated SLAT rows; sample 0 matches a single-sample run) and write one output per sample with a `_0`, `_1`, ... suffix."
     )]
     pub num_samples: Option<usize>,
 
@@ -1416,6 +1415,23 @@ fn resolve_voxel_size(values: &[f32]) -> anyhow::Result<Option<[f32; 3]>> {
     expand3(values, values[0]).map(Some)
 }
 
+/// Map `mesh2ovox --grid-size` / `--voxel-size` onto the core option pair.
+///
+/// An explicit `--grid-size` always wins. When it is absent and `--voxel-size`
+/// is supplied, the grid is left `None` so the core derives the index range
+/// from the mesh bounds and the requested voxel size. With neither flag the
+/// official default (512) applies.
+fn resolve_mesh2ovox_grid_size(
+    grid_size: Option<&[u32]>,
+    voxel_size: &[f32],
+) -> anyhow::Result<Option<[u32; 3]>> {
+    match grid_size {
+        Some(values) => expand3(values, 512).map(Some),
+        None if !voxel_size.is_empty() => Ok(None),
+        None => Ok(Some([512; 3])),
+    }
+}
+
 /// Run one `ovox` subcommand and return its JSON stats report.
 pub fn run_ovox(args: OvoxArgs) -> anyhow::Result<String> {
     use lux3d_core::export::{
@@ -1425,7 +1441,7 @@ pub fn run_ovox(args: OvoxArgs) -> anyhow::Result<String> {
     match args.command {
         OvoxCommand::Mesh2Ovox(a) => {
             let options = MeshToOvoxOptions {
-                grid_size: Some(expand3(&a.grid_size, 512)?),
+                grid_size: resolve_mesh2ovox_grid_size(a.grid_size.as_deref(), &a.voxel_size)?,
                 voxel_size: resolve_voxel_size(&a.voxel_size)?,
                 aabb: a.aabb.as_deref().map(parse_aabb).transpose()?,
                 normalize_to_unit_cube: !a.no_normalize,
@@ -1502,6 +1518,7 @@ pub fn run_model(args: RunArgs) -> anyhow::Result<PathBuf> {
             )?
         }
         ModelFamily::Pi3x => {
+            reject_unsupported_pi3x_options(&args)?;
             reject_triposg_only_options(&args, args.family)?;
             reject_vggt_only_options(&args, args.family)?;
             reject_trellis2_only_options(&args, args.family)?;
@@ -1781,6 +1798,29 @@ fn reject_unsupported_pi3_options(args: &RunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Pi3X accepts the VO-only knobs (`--chunk-size`, `--overlap`,
+/// `--conf-threshold`, `--inject-condition`) only when `--vo` selects the VO
+/// pipeline. Without `--vo` the non-VO branch calls
+/// `infer_from_path(source, conditions, interval, device)` and never reads
+/// them, so reject them instead of silently ignoring the user's intent.
+fn reject_unsupported_pi3x_options(args: &RunArgs) -> anyhow::Result<()> {
+    if args.vo {
+        return Ok(());
+    }
+    let set: [(&str, bool); 4] = [
+        ("--chunk-size", args.chunk_size.is_some()),
+        ("--overlap", args.overlap.is_some()),
+        ("--conf-threshold", args.conf_threshold.is_some()),
+        ("--inject-condition", !args.inject_condition.is_empty()),
+    ];
+    for (flag, is_set) in set {
+        if is_set {
+            anyhow::bail!("`{flag}` requires `--vo` for `pi3x`");
+        }
+    }
+    Ok(())
+}
+
 /// TripoSR exposes image-to-mesh only (`--mc-resolution` / `--mc-threshold` are
 /// consumed). Reject the Pi3/Pi3X/conditioning options, the Pi3 video
 /// `--interval`, the confidence gate and the RMBG override instead of silently
@@ -1805,7 +1845,9 @@ fn reject_unsupported_triposr_options(args: &RunArgs) -> anyhow::Result<()> {
 }
 
 /// VGGT exposes point/depth/camera inference only. Reject Pi3X VO and
-/// TripoSR meshing options instead of silently ignoring them.
+/// TripoSR meshing options plus the Pi3/TripoSR confidence gate and the RMBG
+/// override instead of silently ignoring them (VGGT's own confidence knob is
+/// `--depth-conf-threshold` / `--colmap-conf-threshold`).
 fn reject_unsupported_vggt_options(args: &RunArgs) -> anyhow::Result<()> {
     if args.conditions.is_some() {
         anyhow::bail!("`--conditions` is not supported for `vggt`");
@@ -1821,6 +1863,18 @@ fn reject_unsupported_vggt_options(args: &RunArgs) -> anyhow::Result<()> {
     }
     if !args.inject_condition.is_empty() {
         anyhow::bail!("`--inject-condition` is not supported for `vggt`");
+    }
+    if args.conf_threshold.is_some() {
+        anyhow::bail!(
+            "`--conf-threshold` is not supported for `vggt`; use `--depth-conf-threshold` or \
+             `--colmap-conf-threshold`"
+        );
+    }
+    if args.rmbg_model_path.is_some() {
+        anyhow::bail!(
+            "`--rmbg-model-path` is not supported for `vggt` (VGGT consumes raw images without \
+             an RMBG foreground step)"
+        );
     }
     if args.mc_resolution.is_some() {
         anyhow::bail!("`--mc-resolution` is not supported for `vggt`");
@@ -1939,6 +1993,25 @@ fn reject_unsupported_triposg_options(args: &RunArgs) -> anyhow::Result<()> {
     }
     if args.mc_threshold.is_some() {
         anyhow::bail!("`--mc-threshold` is not supported for `triposg`");
+    }
+    // `--surface-input` encodes the VAE latents directly
+    // (`scripts/inference_vae.py`), skipping image conditioning and the DiT
+    // denoise loop, so the denoise schedule knobs have no effect.
+    if args.surface_input.is_some() {
+        let set: [(&str, bool); 3] = [
+            ("--steps", args.steps.is_some()),
+            ("--guidance-scale", args.guidance_scale.is_some()),
+            ("--timesteps", args.timesteps.is_some()),
+        ];
+        for (flag, is_set) in set {
+            if is_set {
+                anyhow::bail!(
+                    "`{flag}` has no effect with `--surface-input`: the surface encode path skips \
+                     the denoise loop (the reference `scripts/inference_vae.py` extracts the \
+                     latent directly)"
+                );
+            }
+        }
     }
     if args.mode == TriposgMode::Image {
         if args.surface_input.is_some() && args.num_shapes.is_some() {
@@ -4011,8 +4084,6 @@ mod tests {
             canonical_package_dir(ModelFamily::Vggt)
                 .to_string_lossy()
                 .as_ref(),
-            "--conf-threshold",
-            "1.0",
             "--output",
             repo_root()
                 .join("3d")
@@ -4025,7 +4096,6 @@ mod tests {
         let Command::Run(args) = cli.command else {
             panic!("expected run command");
         };
-        assert_eq!(Some(1.0), args.conf_threshold);
         super::reject_unsupported_vggt_options(&args).expect("vggt supported options");
     }
 
@@ -4040,6 +4110,34 @@ mod tests {
         let error = super::reject_unsupported_vggt_options(&args)
             .expect_err("--vo must be rejected for vggt");
         assert!(error.to_string().contains("--vo"));
+    }
+
+    /// `--conf-threshold` and `--rmbg-model-path` are never read by `run_vggt`
+    /// (VGGT uses `--depth-conf-threshold` / `--colmap-conf-threshold` and raw
+    /// images), so they must fail fast instead of being silently ignored.
+    #[test]
+    fn run_vggt_rejects_unread_conf_threshold_and_rmbg() {
+        let flag_options: [(&str, &[&str]); 2] = [
+            ("--conf-threshold", &["--conf-threshold", "0.9"]),
+            ("--rmbg-model-path", &["--rmbg-model-path", "rmbg"]),
+        ];
+        for (flag, extra) in flag_options {
+            let mut argv = vec![
+                "lux3d", "run", "vggt", "--source", "frames", "--output", "out.ply",
+            ];
+            argv.extend_from_slice(extra);
+            let cli = Cli::parse_from(argv);
+            let Command::Run(args) = cli.command else {
+                panic!("expected run command");
+            };
+            let error = super::reject_unsupported_vggt_options(&args)
+                .expect_err(&format!("{flag} must be rejected for vggt"));
+            let message = error.to_string();
+            assert!(
+                message.contains(flag) && message.contains("not supported for `vggt`"),
+                "unexpected message for {flag}: `{message}`"
+            );
+        }
     }
 
     /// The VGGT-only flags parse, map onto `VggtRunOptions` / the COLMAP
@@ -6528,6 +6626,60 @@ mod tests {
         assert_eq!(options.seed, 42);
     }
 
+    /// The surface encode branch skips the denoise loop, so the denoise
+    /// schedule flags would be silent no-ops and must be rejected.
+    #[test]
+    fn triposg_surface_input_rejects_denoise_flags() {
+        let flag_options: [(&str, &[&str]); 3] = [
+            ("--steps", &["--steps", "20"]),
+            ("--guidance-scale", &["--guidance-scale", "5"]),
+            ("--timesteps", &["--timesteps", "999,500,0"]),
+        ];
+        for (flag, extra) in flag_options {
+            let mut argv = vec![
+                "lux3d",
+                "run",
+                "triposg",
+                "--surface-input",
+                "surface.npy",
+                "--output",
+                "out.glb",
+            ];
+            argv.extend_from_slice(extra);
+            let cli = Cli::parse_from(argv);
+            let Command::Run(args) = cli.command else {
+                panic!("expected run command");
+            };
+            let error = super::reject_unsupported_triposg_options(&args)
+                .expect_err(&format!("{flag} with --surface-input must be rejected"));
+            let message = error.to_string();
+            assert!(
+                message.contains(flag) && message.contains("no effect with `--surface-input`"),
+                "unexpected message for {flag}: `{message}`"
+            );
+        }
+
+        // The same flags remain valid for image-to-3D denoising.
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "triposg",
+            "--source",
+            "image.png",
+            "--steps",
+            "20",
+            "--guidance-scale",
+            "5",
+            "--output",
+            "out.glb",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        super::reject_unsupported_triposg_options(&args)
+            .expect("denoise flags are consumed by the image path");
+    }
+
     #[test]
     fn run_triposg_surface_input_keeps_explicit_decoder_overrides() {
         let cli = Cli::parse_from([
@@ -6984,6 +7136,58 @@ mod tests {
             ],
             args.inject_condition
         );
+    }
+
+    #[test]
+    fn pi3x_rejects_vo_only_flags_without_vo() {
+        let flag_options: [(&str, &[&str]); 4] = [
+            ("--chunk-size", &["--chunk-size", "8"]),
+            ("--overlap", &["--overlap", "4"]),
+            ("--conf-threshold", &["--conf-threshold", "0.5"]),
+            ("--inject-condition", &["--inject-condition", "pose"]),
+        ];
+        for (flag, extra) in flag_options {
+            let mut argv = vec![
+                "lux3d", "run", "pi3x", "--source", "frames", "--output", "out.ply",
+            ];
+            argv.extend_from_slice(extra);
+            let cli = Cli::parse_from(argv);
+            let Command::Run(args) = cli.command else {
+                panic!("expected run command");
+            };
+            let error = super::reject_unsupported_pi3x_options(&args)
+                .expect_err(&format!("{flag} without --vo must be rejected"));
+            let message = error.to_string();
+            assert!(
+                message.contains(flag) && message.contains("requires `--vo`"),
+                "unexpected message for {flag}: `{message}`"
+            );
+        }
+
+        // With `--vo` the same flags feed the VO pipeline and stay accepted.
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "pi3x",
+            "--source",
+            "frames",
+            "--vo",
+            "--chunk-size",
+            "8",
+            "--overlap",
+            "4",
+            "--conf-threshold",
+            "0.5",
+            "--inject-condition",
+            "pose",
+            "--output",
+            "out.ply",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        super::reject_unsupported_pi3x_options(&args)
+            .expect("VO flags are consumed when --vo is set");
     }
 
     #[test]
@@ -7681,5 +7885,81 @@ mod tests {
         let error = super::validate_trellis2_texturing_mode(&args)
             .expect_err("image-to-3D flags must be rejected");
         assert!(error.to_string().contains("--pipeline-type"));
+    }
+
+    /// `--voxel-size` without an explicit `--grid-size` must leave the grid
+    /// unset so the core derives it; an explicit or default grid still maps.
+    #[test]
+    fn mesh2ovox_grid_size_mapping_auto_derives_from_voxel_size() {
+        assert_eq!(
+            Some([256, 256, 256]),
+            super::resolve_mesh2ovox_grid_size(Some(&[256]), &[0.01]).expect("explicit grid")
+        );
+        assert_eq!(
+            Some([64, 128, 256]),
+            super::resolve_mesh2ovox_grid_size(Some(&[64, 128, 256]), &[]).expect("per-axis grid")
+        );
+
+        let cli = Cli::parse_from([
+            "lux3d",
+            "ovox",
+            "mesh2ovox",
+            "in.glb",
+            "out.vxz",
+            "--voxel-size",
+            "0.01",
+        ]);
+        let Command::Ovox(args) = cli.command else {
+            panic!("expected ovox command");
+        };
+        let super::OvoxCommand::Mesh2Ovox(a) = args.command else {
+            panic!("expected mesh2ovox");
+        };
+        assert_eq!(None, a.grid_size, "--grid-size must stay unset");
+        assert_eq!(
+            Some([0.01, 0.01, 0.01]),
+            super::resolve_voxel_size(&a.voxel_size).expect("voxel size")
+        );
+        assert_eq!(
+            None,
+            super::resolve_mesh2ovox_grid_size(a.grid_size.as_deref(), &a.voxel_size)
+                .expect("auto-derived grid")
+        );
+
+        let cli = Cli::parse_from(["lux3d", "ovox", "mesh2ovox", "in.glb", "out.vxz"]);
+        let Command::Ovox(args) = cli.command else {
+            panic!("expected ovox command");
+        };
+        let super::OvoxCommand::Mesh2Ovox(a) = args.command else {
+            panic!("expected mesh2ovox");
+        };
+        assert_eq!(
+            Some([512, 512, 512]),
+            super::resolve_mesh2ovox_grid_size(a.grid_size.as_deref(), &a.voxel_size)
+                .expect("default grid")
+        );
+
+        let cli = Cli::parse_from([
+            "lux3d",
+            "ovox",
+            "mesh2ovox",
+            "in.glb",
+            "out.vxz",
+            "--grid-size",
+            "128",
+            "--voxel-size",
+            "0.02",
+        ]);
+        let Command::Ovox(args) = cli.command else {
+            panic!("expected ovox command");
+        };
+        let super::OvoxCommand::Mesh2Ovox(a) = args.command else {
+            panic!("expected mesh2ovox");
+        };
+        assert_eq!(
+            Some([128, 128, 128]),
+            super::resolve_mesh2ovox_grid_size(a.grid_size.as_deref(), &a.voxel_size)
+                .expect("explicit grid wins")
+        );
     }
 }

@@ -422,9 +422,30 @@ fn decode_lzma_chunk(
     Ok(())
 }
 
+fn reserve_output(output: &mut Vec<u8>, additional: usize, max_output: usize) -> Result<()> {
+    let new_len = output
+        .len()
+        .checked_add(additional)
+        .ok_or_else(|| lzma_error("decoded output size overflows usize"))?;
+    if new_len > max_output {
+        return Err(lzma_error(format!(
+            "decoded output would reach {new_len} bytes, past the {max_output}-byte limit \
+             (possible decompression bomb)"
+        )));
+    }
+    output
+        .try_reserve(additional)
+        .map_err(|_| lzma_error("out of memory while growing the decoded output buffer"))?;
+    Ok(())
+}
+
 /// Decode one standalone raw LZMA2 stream (as stored in one `.vxz` chunk
-/// section) into bytes.
-pub(crate) fn decompress(data: &[u8]) -> Result<Vec<u8>> {
+/// section) into bytes, refusing to produce more than `max_output` bytes.
+///
+/// The limit is mandatory for untrusted inputs: a crafted stream can otherwise
+/// expand until the process aborts on OOM. Growth uses `try_reserve` so an
+/// allocation failure surfaces as a [`Lux3dError`] instead of aborting.
+pub(crate) fn decompress_with_limit(data: &[u8], max_output: usize) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     let mut dict_start = 0usize;
     let mut state = LzmaState::new();
@@ -463,6 +484,7 @@ pub(crate) fn decompress(data: &[u8]) -> Result<Vec<u8>> {
                     need_properties = true;
                 }
                 let bytes = take(&mut position, unpacked_size)?;
+                reserve_output(&mut output, unpacked_size, max_output)?;
                 output.extend_from_slice(bytes);
             }
             control if control >= 0x80 => {
@@ -511,6 +533,7 @@ pub(crate) fn decompress(data: &[u8]) -> Result<Vec<u8>> {
                 }
 
                 let block = take(&mut position, packed_size)?;
+                reserve_output(&mut output, unpacked_size, max_output)?;
                 decode_lzma_chunk(&mut state, block, unpacked_size, &mut output, dict_start)?;
             }
             other => {
@@ -522,6 +545,14 @@ pub(crate) fn decompress(data: &[u8]) -> Result<Vec<u8>> {
     }
 
     Ok(output)
+}
+
+/// Convenience wrapper with a 1 GiB output cap (test fixtures and callers
+/// that already validated the expected size); [`decompress_with_limit`] is the
+/// untrusted-input entry point.
+#[cfg(test)]
+pub(crate) fn decompress(data: &[u8]) -> Result<Vec<u8>> {
+    decompress_with_limit(data, 1 << 30)
 }
 
 #[cfg(test)]
@@ -542,5 +573,19 @@ mod tests {
         // control 0x02, size-1 = 3, "test", end marker
         let stream = [0x02, 0x00, 0x03, b't', b'e', b's', b't', 0x00];
         assert_eq!(decompress(&stream).unwrap(), b"test");
+    }
+
+    #[test]
+    fn output_limit_stops_expansion_before_allocating() {
+        // Small input stream that would decode to 4 bytes: a 4-byte limit
+        // succeeds, a 3-byte limit fails with a limit error (no OOM/abort).
+        let stream = [0x02, 0x00, 0x03, b't', b'e', b's', b't', 0x00];
+        assert_eq!(decompress_with_limit(&stream, 4).unwrap(), b"test".to_vec());
+        let error = decompress_with_limit(&stream, 3).expect_err("limit must be enforced");
+        assert!(
+            error.to_string().contains("limit"),
+            "unexpected error: {error}"
+        );
+        assert!(decompress_with_limit(&stream, 0).is_err());
     }
 }

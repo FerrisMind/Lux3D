@@ -245,6 +245,22 @@ fn attr_prefix(name: &str) -> Result<&str> {
     Ok(prefix)
 }
 
+/// Minimum body bytes one vertex row can occupy: the sum of the property
+/// sizes for binary PLY, or one character per property for ASCII (whitespace
+/// separators only add bytes, so this is a safe lower bound).
+fn minimum_row_bytes(header: &PlyHeader) -> Result<usize> {
+    if header.ascii {
+        return Ok(header.properties.len());
+    }
+    let mut size = 0usize;
+    for property in &header.properties {
+        size = size
+            .checked_add(property.ty.size())
+            .ok_or_else(|| ply_error("binary vertex row size overflows usize"))?;
+    }
+    Ok(size)
+}
+
 fn build_grid(header: &PlyHeader, rows: &[Vec<f64>]) -> Result<VoxelGrid> {
     let x_index = header
         .properties
@@ -262,7 +278,10 @@ fn build_grid(header: &PlyHeader, rows: &[Vec<f64>]) -> Result<VoxelGrid> {
         .position(|property| property.name == "z")
         .expect("validated z");
 
-    let mut coords = Vec::with_capacity(rows.len());
+    let mut coords = Vec::new();
+    coords
+        .try_reserve_exact(rows.len())
+        .map_err(|_| ply_error("out of memory while reserving vertex coordinates"))?;
     for row in rows {
         let mut coord = [0i32; 3];
         for (axis, index) in [x_index, y_index, z_index].into_iter().enumerate() {
@@ -340,11 +359,27 @@ pub fn read_ply(path: &Path) -> Result<VoxelGrid> {
         source,
     })?;
     let header = parse_header(&bytes)?;
-    let mut rows: Vec<Vec<f64>> = Vec::with_capacity(header.count);
+    let body = &bytes[header.body_offset..];
+    let minimum_row = minimum_row_bytes(&header)?;
+    let required = header
+        .count
+        .checked_mul(minimum_row)
+        .ok_or_else(|| ply_error("declared vertex count overflows the body size calculation"))?;
+    if required > body.len() {
+        return Err(ply_error(format!(
+            "header declares {} vertices needing at least {required} body bytes, but only {} \
+             remain after the header",
+            header.count,
+            body.len()
+        )));
+    }
+    let mut rows: Vec<Vec<f64>> = Vec::new();
+    rows.try_reserve_exact(header.count)
+        .map_err(|_| ply_error("out of memory while reserving vertex rows"))?;
 
     if header.ascii {
-        let body = std::str::from_utf8(&bytes[header.body_offset..])
-            .map_err(|_| ply_error("ASCII body is not valid UTF-8"))?;
+        let body =
+            std::str::from_utf8(body).map_err(|_| ply_error("ASCII body is not valid UTF-8"))?;
         let mut tokens = body.split_whitespace();
         for _ in 0..header.count {
             let mut row = Vec::with_capacity(header.properties.len());
@@ -467,6 +502,38 @@ mod tests {
         let path = temp_path("ply");
         std::fs::write(&path, "ply\nformat binary_big_endian 1.0\n").unwrap();
         assert!(read_ply(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ply_rejects_vertex_counts_larger_than_the_body() {
+        let path = temp_path("ply");
+
+        // ASCII: a huge declared count with a tiny body must fail before
+        // reserving `count` rows.
+        let ascii = "ply\nformat ascii 1.0\nelement vertex 1000000000\n\
+                     property float x\nproperty float y\nproperty float z\nend_header\n\
+                     0 1 2\n";
+        std::fs::write(&path, ascii).expect("write ascii ply");
+        let error = read_ply(&path).expect_err("oversized ASCII vertex count must fail");
+        assert!(
+            error.to_string().contains("body bytes"),
+            "unexpected error: {error}"
+        );
+
+        // Binary: same guard with the binary row-size lower bound.
+        let mut binary = Vec::new();
+        binary.extend_from_slice(
+            b"ply\nformat binary_little_endian 1.0\nelement vertex 1000000000\n\
+              property float x\nproperty float y\nproperty float z\nend_header\n",
+        );
+        binary.extend_from_slice(&0.0f32.to_le_bytes());
+        std::fs::write(&path, binary).expect("write binary ply");
+        let error = read_ply(&path).expect_err("oversized binary vertex count must fail");
+        assert!(
+            error.to_string().contains("body bytes"),
+            "unexpected error: {error}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }
