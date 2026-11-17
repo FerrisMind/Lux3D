@@ -766,8 +766,10 @@ decode a mesh, reproducing `scripts/inference_vae.py`.
   hierarchical depth 9) unless the corresponding flags override them ✅
 
 **Limits:** `--num-shapes` is rejected with `--surface-input` (one latent); the
-sampled latent uses the Lux3D seeded RNG, so it is distribution-equivalent, not
-torch-draw-identical.
+surface must contain at least 204800 points (the reference takes a fixed
+204800-point subset — smaller inputs now error instead of being resampled with
+replacement); the sampled latent uses the Lux3D seeded RNG, so it is
+distribution-equivalent, not torch-draw-identical.
 
 **Tests:** `npy` reader unit tests, `vae_encode_triposg` FPS/quant tests, CLI
 surface-input mapping/conflict/family-rejection cases ✅
@@ -1032,7 +1034,8 @@ As a user, I can texture `.glb`, `.obj`, `.ply` or `.stl` inputs.
 **Functions:**
 - `export/import.rs:load_mesh()` — extension dispatch ✅
 - `read_obj()` — ASCII `v`/`f`, fan-triangulation, `v`, `v/vt`, `v//vn`, `v/vt/vn`,
-  1-based positive and negative relative indices; `vt`/`vn`/groups/materials ignored ✅
+  1-based positive and negative relative indices; `vt` is parsed into per-corner UVs
+  (`ImportedMesh::uvs`, used by TRELLIS.2 texturing UV reuse), `vn`/groups/materials ignored ✅
 - `read_ply()` — ASCII and binary little-endian; arbitrary vertex property order;
   `vertex_indices`/`vertex_index` face lists, fan-triangulated; big-endian/compressed
   variants rejected ✅
@@ -1056,11 +1059,11 @@ As a user, I know exactly which flags apply and what the output contains.
 - Output: one textured `.glb`; no `<stem>.pbrvox.bin` / `<stem>.pbr.json` sidecar ✅
 
 **Limits/approximations:**
-- The core `texture_mesh(..., corner_uvs)` API reuses caller-supplied per-corner UVs
-  (reference UV-reuse branch: no xatlas, `chart_count = 0`), but the CLI
-  `--texture-mesh` and the HTTP texturing job call `texture_mesh_from_path`, which does
-  not pass input UVs, so those surfaces always re-unwrap. Existing input UVs are
-  therefore not preserved on the CLI/server path.
+- The core `texture_mesh(..., corner_uvs)` API and `texture_mesh_from_path` reuse
+  caller-supplied per-corner UVs (reference UV-reuse branch: no xatlas,
+  `chart_count = 0`); the CLI `--texture-mesh` and the HTTP texturing job pass the
+  imported mesh's `ImportedMesh::uvs`, so an input with UVs keeps them while a mesh
+  without UVs still unwraps.
 - Duplicate-position vertices (including `repair_non_manifold_edges` splits) are welded
   before charting, UV seams duplicate vertices, and xatlas' non-parameterizable
   (zero-area) faces are dropped from the atlas index buffer ✅
@@ -1340,10 +1343,12 @@ Also touched: `crates/lux3d-core/tests/vggt_export.rs` (fixture gains empty `pos
 - **Server surfaces:** the HTTP mesh API exposes the TripoSG `timesteps`/`bounds`/`faces`
   fields, the TRELLIS.2 per-stage sampler/rescale fields, `num_samples`, `texture_size`
   and the postprocess/remesh fields, and `POST /v1/meshes/texturings` textures an
-  existing mesh. Still CLI-only: TripoSG `--surface-input`/`--mode scribble`/repeatable
-  `--source`/`--num-shapes`, VGGT preprocess/batch/COLMAP/track/GLB flags, and
-  `--return-latent`. `num_samples > 1` serves sample 0 through `/content`; the remaining
-  samples stay in the workspace.
+  existing mesh. Request budgets are enforced before job insertion (HTTP 400):
+  `num_samples <= 64`, `timesteps` length <= 1000, per-stage `steps` <= 1000; mesh
+  payloads must carry a supported extension. Still CLI-only: TripoSG
+  `--surface-input`/`--mode scribble`/repeatable `--source`/`--num-shapes`, VGGT
+  preprocess/batch/COLMAP/track/GLB flags, and `--return-latent`. `num_samples > 1`
+  serves sample 0 through `/content`; the remaining samples stay in the workspace.
 - **Quantization:** TRELLIS.2 DiT-only GGUF policy is unchanged; the texturing-only
   `shape_enc` checkpoint is outside the canonical package and is never quantized.
 
