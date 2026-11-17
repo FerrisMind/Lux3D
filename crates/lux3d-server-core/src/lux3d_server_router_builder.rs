@@ -2,11 +2,11 @@
 
 use anyhow::Result;
 use axum::{
-    Router,
     extract::DefaultBodyLimit,
-    http::{Method, header::HeaderName},
+    http::{header::HeaderName, Method},
     middleware::from_fn_with_state,
     routing::{get, post},
+    Router,
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
 #[cfg(feature = "swagger-ui")]
@@ -18,11 +18,11 @@ use crate::{
     background_tasks::spawn_cleanup_task,
     files::{delete_file, get_file, get_file_content, list_files, upload_file},
     handlers::{
-        cancel_generation, create_mesh_generation, create_point_cloud_generation,
-        delete_generation, get_generation, get_generation_content, health, list_generations,
-        model_status, models, reload_model, root, unload_model,
+        cancel_generation, create_mesh_generation, create_mesh_texturing,
+        create_point_cloud_generation, delete_generation, get_generation, get_generation_content,
+        health, list_generations, model_status, models, reload_model, root, unload_model,
     },
-    metrics::{self, ObservabilityState, install_prometheus_recorder, metrics_handler},
+    metrics::{self, install_prometheus_recorder, metrics_handler, ObservabilityState},
     stream::stream_generation,
     system::{system_doctor, system_info},
     types::SharedLux3dState,
@@ -159,6 +159,7 @@ impl Lux3dServerRouterBuilder {
                 post(create_point_cloud_generation),
             )
             .route("/v1/meshes/generations", post(create_mesh_generation))
+            .route("/v1/meshes/texturings", post(create_mesh_texturing))
             .route("/v1/system/info", get(system_info))
             .route("/v1/system/doctor", post(system_doctor))
             .layer(from_fn_with_state(observability, metrics::observe_http))

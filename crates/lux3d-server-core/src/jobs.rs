@@ -8,17 +8,20 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, bail, ensure};
-use lux3d_core::export::{MeshFormat, PointCloudFormat};
-use lux3d_core::runtime::{Pi3xInjectConditions, Trellis2RunOptions, TripoSgRunOptions};
-use lux3d_core::{Trellis2PipelineType, export::pbrvox};
+use anyhow::{bail, ensure, Context, Result};
+use lux3d_core::export::{load_mesh, MeshFormat, PointCloudFormat};
+use lux3d_core::runtime::{
+    Pi3xInjectConditions, Trellis2RunOptions, Trellis2SamplerOverrides, Trellis2TexturingOptions,
+    TripoSgRunOptions,
+};
+use lux3d_core::{export::pbrvox, Trellis2PipelineType};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
     api_types::{
         GenerationError, GenerationObject, GenerationStatus, MeshGenerationOptions,
-        PointCloudGenerationOptions,
+        MeshTexturingOptions, PointCloudGenerationOptions,
     },
     metrics::{record_generation_finished, record_generation_started},
     types::Lux3dState,
@@ -471,14 +474,39 @@ fn triposg_options_from_mesh_options(options: &MeshGenerationOptions) -> Result<
         query_chunk_size: options
             .query_chunk_size
             .unwrap_or(defaults.query_chunk_size),
-        // New TripoSgRunOptions fields with no mesh-API surface yet: keep the
-        // defaults (`None`) so the API behavior is unchanged.
-        timesteps: None,
-        bounds: None,
-        faces: None,
+        timesteps: options.timesteps.clone(),
+        bounds: options.bounds,
+        faces: options.faces,
     };
     run_options.validate().map_err(anyhow::Error::from)?;
     Ok(run_options)
+}
+
+/// Per-stage sampler overrides from the mesh-request fields. All-`None`
+/// yields `None` so the pipeline-config defaults stay in charge; the legacy
+/// `steps` field is handled by the caller through the `*_steps` base counts.
+fn sampler_overrides(
+    steps: Option<usize>,
+    guidance_strength: Option<f32>,
+    guidance_rescale: Option<f32>,
+    guidance_interval: Option<[f32; 2]>,
+    rescale_t: Option<f32>,
+) -> Option<Trellis2SamplerOverrides> {
+    if steps.is_none()
+        && guidance_strength.is_none()
+        && guidance_rescale.is_none()
+        && guidance_interval.is_none()
+        && rescale_t.is_none()
+    {
+        return None;
+    }
+    Some(Trellis2SamplerOverrides {
+        steps,
+        guidance_strength,
+        guidance_rescale,
+        guidance_interval: guidance_interval.map(|[low, high]| (low, high)),
+        rescale_t,
+    })
 }
 
 /// Build the TRELLIS.2 run options from the reference defaults plus explicit
@@ -500,27 +528,67 @@ fn trellis2_options_from_mesh_options(
         ),
     };
     let steps = options.steps.unwrap_or(defaults.ss_steps);
+
+    let mut postprocess = defaults.postprocess.clone();
+    if let Some(enabled) = options.postprocess {
+        postprocess.enabled = enabled;
+    }
+    if let Some(value) = options.decimation_target {
+        postprocess.decimation_target = value;
+    }
+    if let Some(value) = options.fill_hole_perimeter {
+        postprocess.fill_hole_perimeter = value;
+    }
+    if let Some(value) = options.min_component_area {
+        postprocess.min_component_area = value;
+    }
+    postprocess.validate().map_err(anyhow::Error::from)?;
+
+    let mut texture_export = defaults.texture_export.clone();
+    if let Some(value) = options.texture_size {
+        texture_export.texture_size = value;
+    }
+    texture_export.validate().map_err(anyhow::Error::from)?;
+
+    let num_samples = options.num_samples.unwrap_or(defaults.num_samples);
+    ensure!(
+        num_samples >= 1,
+        "Trellis2 `num_samples` must be at least 1"
+    );
+
     Ok(Trellis2RunOptions {
         seed: options.seed.unwrap_or(defaults.seed),
         pipeline_type,
         ss_steps: steps,
         shape_steps: options.steps.unwrap_or(defaults.shape_steps),
         tex_steps: options.steps.unwrap_or(defaults.tex_steps),
-        // Per-stage sampler overrides and multi-sample runs are CLI/runtime
-        // surfaces; the mesh API keeps the pipeline defaults and one sample.
-        ss_sampler: None,
-        shape_sampler: None,
-        tex_sampler: None,
+        ss_sampler: sampler_overrides(
+            options.ss_steps,
+            options.ss_guidance_strength,
+            options.ss_guidance_rescale,
+            options.ss_guidance_interval,
+            options.ss_rescale_t,
+        ),
+        shape_sampler: sampler_overrides(
+            options.shape_steps,
+            options.shape_guidance_strength,
+            options.shape_guidance_rescale,
+            options.shape_guidance_interval,
+            options.shape_rescale_t,
+        ),
+        tex_sampler: sampler_overrides(
+            options.tex_steps,
+            options.tex_guidance_strength,
+            options.tex_guidance_rescale,
+            options.tex_guidance_interval,
+            options.tex_rescale_t,
+        ),
         with_texture: options.texture.unwrap_or(defaults.with_texture),
         max_num_tokens: options.max_num_tokens.unwrap_or(defaults.max_num_tokens),
         preprocess: defaults.preprocess,
-        num_samples: 1,
-        // Geometry post-process keeps the upstream `to_glb` defaults (the
-        // mesh API exposes no knobs for it yet).
-        postprocess: defaults.postprocess,
-        // Textured-GLB export keeps the upstream defaults (UV unwrap + bake
-        // at 2048 when the texture stage ran).
-        texture_export: defaults.texture_export,
+        num_samples,
+        postprocess,
+        texture_export,
     })
 }
 
@@ -550,9 +618,57 @@ fn validate_mesh_generation_request(model: &str, options: &MeshGenerationOptions
             ("use_flash_decoder", options.use_flash_decoder.is_some()),
             ("flash_octree_depth", options.flash_octree_depth.is_some()),
             ("query_chunk_size", options.query_chunk_size.is_some()),
+            ("timesteps", options.timesteps.is_some()),
+            ("bounds", options.bounds.is_some()),
+            ("faces", options.faces.is_some()),
             ("pipeline_type", options.pipeline_type.is_some()),
             ("max_num_tokens", options.max_num_tokens.is_some()),
             ("texture", options.texture.is_some()),
+            ("ss_steps", options.ss_steps.is_some()),
+            (
+                "ss_guidance_strength",
+                options.ss_guidance_strength.is_some(),
+            ),
+            ("ss_guidance_rescale", options.ss_guidance_rescale.is_some()),
+            (
+                "ss_guidance_interval",
+                options.ss_guidance_interval.is_some(),
+            ),
+            ("ss_rescale_t", options.ss_rescale_t.is_some()),
+            ("shape_steps", options.shape_steps.is_some()),
+            (
+                "shape_guidance_strength",
+                options.shape_guidance_strength.is_some(),
+            ),
+            (
+                "shape_guidance_rescale",
+                options.shape_guidance_rescale.is_some(),
+            ),
+            (
+                "shape_guidance_interval",
+                options.shape_guidance_interval.is_some(),
+            ),
+            ("shape_rescale_t", options.shape_rescale_t.is_some()),
+            ("tex_steps", options.tex_steps.is_some()),
+            (
+                "tex_guidance_strength",
+                options.tex_guidance_strength.is_some(),
+            ),
+            (
+                "tex_guidance_rescale",
+                options.tex_guidance_rescale.is_some(),
+            ),
+            (
+                "tex_guidance_interval",
+                options.tex_guidance_interval.is_some(),
+            ),
+            ("tex_rescale_t", options.tex_rescale_t.is_some()),
+            ("num_samples", options.num_samples.is_some()),
+            ("texture_size", options.texture_size.is_some()),
+            ("postprocess", options.postprocess.is_some()),
+            ("decimation_target", options.decimation_target.is_some()),
+            ("fill_hole_perimeter", options.fill_hole_perimeter.is_some()),
+            ("min_component_area", options.min_component_area.is_some()),
         ] {
             ensure!(!present, "`{name}` is not supported for `triposr`");
         }
@@ -581,6 +697,9 @@ fn validate_mesh_generation_request(model: &str, options: &MeshGenerationOptions
             ("use_flash_decoder", options.use_flash_decoder.is_some()),
             ("flash_octree_depth", options.flash_octree_depth.is_some()),
             ("query_chunk_size", options.query_chunk_size.is_some()),
+            ("timesteps", options.timesteps.is_some()),
+            ("bounds", options.bounds.is_some()),
+            ("faces", options.faces.is_some()),
         ] {
             ensure!(!present, "`{name}` is not supported for `trellis2`");
         }
@@ -600,6 +719,51 @@ fn validate_mesh_generation_request(model: &str, options: &MeshGenerationOptions
         ("pipeline_type", options.pipeline_type.is_some()),
         ("max_num_tokens", options.max_num_tokens.is_some()),
         ("texture", options.texture.is_some()),
+        ("ss_steps", options.ss_steps.is_some()),
+        (
+            "ss_guidance_strength",
+            options.ss_guidance_strength.is_some(),
+        ),
+        ("ss_guidance_rescale", options.ss_guidance_rescale.is_some()),
+        (
+            "ss_guidance_interval",
+            options.ss_guidance_interval.is_some(),
+        ),
+        ("ss_rescale_t", options.ss_rescale_t.is_some()),
+        ("shape_steps", options.shape_steps.is_some()),
+        (
+            "shape_guidance_strength",
+            options.shape_guidance_strength.is_some(),
+        ),
+        (
+            "shape_guidance_rescale",
+            options.shape_guidance_rescale.is_some(),
+        ),
+        (
+            "shape_guidance_interval",
+            options.shape_guidance_interval.is_some(),
+        ),
+        ("shape_rescale_t", options.shape_rescale_t.is_some()),
+        ("tex_steps", options.tex_steps.is_some()),
+        (
+            "tex_guidance_strength",
+            options.tex_guidance_strength.is_some(),
+        ),
+        (
+            "tex_guidance_rescale",
+            options.tex_guidance_rescale.is_some(),
+        ),
+        (
+            "tex_guidance_interval",
+            options.tex_guidance_interval.is_some(),
+        ),
+        ("tex_rescale_t", options.tex_rescale_t.is_some()),
+        ("num_samples", options.num_samples.is_some()),
+        ("texture_size", options.texture_size.is_some()),
+        ("postprocess", options.postprocess.is_some()),
+        ("decimation_target", options.decimation_target.is_some()),
+        ("fill_hole_perimeter", options.fill_hole_perimeter.is_some()),
+        ("min_component_area", options.min_component_area.is_some()),
     ] {
         ensure!(!present, "`{name}` is not supported for `triposg`");
     }
@@ -685,6 +849,7 @@ pub async fn spawn_mesh_generation(
                     let device = runtime.device()?;
                     let output_path =
                         workspace.join(format!("{model}.{}", output_format.extension()));
+                    let mut served_output = output_path.clone();
                     match model.as_str() {
                         "triposr" => runtime.models.with_triposr(|pipeline| {
                             let inference = pipeline
@@ -722,32 +887,283 @@ pub async fn spawn_mesh_generation(
                         "trellis2" => {
                             let run_options = trellis2_run_options
                                 .expect("trellis2 options validated before the job was queued");
-                            runtime.models.with_trellis2(|pipeline| {
-                                let stages = pipeline
-                                    .run_from_path_with_stages(&source, &device, &run_options)
-                                    .map_err(anyhow::Error::from)?;
-                                let mesh =
-                                    stages.mesh.expect("trellis2 run always produces a mesh");
-                                if run_options.with_texture
-                                    && mesh.voxel_attr_channels == pbrvox::CHANNELS
-                                {
-                                    // The mesh plus the <stem>.pbrvox.bin /
-                                    // <stem>.pbr.json sidecar pair; the sidecars
-                                    // stay in the job workspace (only the mesh is
-                                    // served through /content).
-                                    pipeline
-                                        .export_mesh_with_pbr(&mesh, &output_path)
-                                        .map_err(anyhow::Error::from)?;
+                            served_output = runtime.models.with_trellis2(|pipeline| {
+                                // `num_samples = 1` runs the single-sample
+                                // surface (bit-identical to the pre-
+                                // num_samples behavior); above 1 runs the
+                                // sequential seed-offset emulation.
+                                let stages_list = if run_options.num_samples == 1 {
+                                    vec![pipeline.run_from_path_with_stages(
+                                        &source,
+                                        &device,
+                                        &run_options,
+                                    )?]
                                 } else {
-                                    pipeline
-                                        .export_mesh(&mesh, &output_path)
-                                        .map_err(anyhow::Error::from)?;
+                                    pipeline.run_many_from_path(&source, &device, &run_options)?
+                                };
+                                ensure!(
+                                    !stages_list.is_empty(),
+                                    "trellis2 run produced no samples"
+                                );
+                                let sample_count = stages_list.len();
+                                for (index, stages) in stages_list.iter().enumerate() {
+                                    let sample_output =
+                                        sample_output_path(&output_path, index, sample_count);
+                                    let mesh = stages
+                                        .mesh
+                                        .as_ref()
+                                        .expect("trellis2 run always produces a mesh");
+                                    let textured = stages
+                                        .textured
+                                        .as_ref()
+                                        .filter(|_| matches!(output_format, MeshFormat::Glb));
+                                    if let Some(textured) = textured {
+                                        // Upstream `to_glb` textured export:
+                                        // embedded PBR textures + UVs.
+                                        pipeline
+                                            .export
+                                            .write_textured_glb(textured, &sample_output)
+                                            .map_err(anyhow::Error::from)?;
+                                        if run_options.with_texture
+                                            && mesh.voxel_attr_channels == pbrvox::CHANNELS
+                                        {
+                                            pipeline
+                                                .export
+                                                .write_pbr_vox(
+                                                    mesh,
+                                                    &pbr_sidecar_stem(&sample_output),
+                                                )
+                                                .map_err(anyhow::Error::from)?;
+                                        }
+                                    } else if run_options.with_texture
+                                        && mesh.voxel_attr_channels == pbrvox::CHANNELS
+                                    {
+                                        // The mesh plus the <stem>.pbrvox.bin /
+                                        // <stem>.pbr.json sidecar pair; the
+                                        // sidecars stay in the job workspace
+                                        // (only the mesh is served through
+                                        // /content).
+                                        pipeline
+                                            .export_mesh_with_pbr(mesh, &sample_output)
+                                            .map_err(anyhow::Error::from)?;
+                                    } else {
+                                        pipeline
+                                            .export_mesh(mesh, &sample_output)
+                                            .map_err(anyhow::Error::from)?;
+                                    }
                                 }
-                                Ok(())
-                            })?
+                                // The job serves a single artifact; with
+                                // num_samples > 1 that is sample 0, while the
+                                // remaining samples stay in the workspace.
+                                Ok(sample_output_path(&output_path, 0, sample_count))
+                            })?;
                         }
                         other => bail!("unsupported mesh model `{other}`"),
                     }
+                    Ok(served_output)
+                }
+            })
+            .await;
+
+        let elapsed = started.elapsed().as_secs_f64();
+        if state_for_task.jobs.is_cancelled(&job_id) {
+            let _ = state_for_task.jobs.mark_cancelled(&job_id);
+            record_generation_finished(&model, "cancelled", elapsed);
+            maybe_deliver_webhook(&state_for_task, &job_id, "generation.cancelled").await;
+            return;
+        }
+
+        match result {
+            Ok(output_path) => {
+                if let Err(error) = state_for_task.jobs.mark_completed(&job_id, output_path) {
+                    tracing::error!("failed to mark job completed: {error}");
+                } else {
+                    record_generation_finished(&model, "completed", elapsed);
+                    maybe_deliver_webhook(&state_for_task, &job_id, "generation.completed").await;
+                }
+            }
+            Err(error) => {
+                let status = if error.to_string().contains("cancelled") {
+                    let _ = state_for_task.jobs.mark_cancelled(&job_id);
+                    "cancelled"
+                } else if let Err(update_error) =
+                    state_for_task.jobs.mark_failed(&job_id, error.to_string())
+                {
+                    tracing::error!("failed to mark job failed: {update_error}");
+                    "failed"
+                } else {
+                    "failed"
+                };
+                record_generation_finished(&model, status, elapsed);
+                maybe_deliver_webhook(&state_for_task, &job_id, "generation.failed").await;
+            }
+        }
+    });
+
+    Ok(response)
+}
+
+/// Per-sample artifact path: a single sample keeps the exact `output` path;
+/// multiple samples suffix the stem with `_<index>` (CLI parity).
+fn sample_output_path(output: &Path, index: usize, count: usize) -> PathBuf {
+    if count <= 1 {
+        return output.to_path_buf();
+    }
+    let file_name = output
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| format!("sample_{index}"));
+    let suffixed = match file_name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() && !extension.is_empty() => {
+            format!("{stem}_{index}.{extension}")
+        }
+        _ => format!("{file_name}_{index}"),
+    };
+    output.with_file_name(suffixed)
+}
+
+/// The `<parent>/<stem>` prefix the PBR sidecar writer extends into
+/// `<stem>.pbrvox.bin` / `<stem>.pbr.json`.
+fn pbr_sidecar_stem(path: &Path) -> PathBuf {
+    path.parent().unwrap_or_else(|| Path::new(".")).join(
+        path.file_stem()
+            .unwrap_or_else(|| std::ffi::OsStr::new("mesh")),
+    )
+}
+
+/// Build the TRELLIS.2 texturing-pipeline options from the texturing-request
+/// fields. Pure helper so the mapping and validation are unit-testable.
+fn trellis2_texturing_options_from_request(
+    options: &MeshTexturingOptions,
+) -> Result<Trellis2TexturingOptions> {
+    let defaults = Trellis2TexturingOptions::default();
+    let texturing = Trellis2TexturingOptions {
+        seed: options.seed.unwrap_or(defaults.seed),
+        resolution: options.texture_resolution.unwrap_or(defaults.resolution),
+        tex_sampler: Trellis2SamplerOverrides {
+            steps: options.tex_steps,
+            guidance_strength: options.tex_guidance_strength,
+            guidance_rescale: options.tex_guidance_rescale,
+            guidance_interval: options.tex_guidance_interval.map(|[low, high]| (low, high)),
+            rescale_t: options.tex_rescale_t,
+        },
+        texture_size: options.texture_size.unwrap_or(defaults.texture_size),
+        preprocess_image: options
+            .preprocess_image
+            .unwrap_or(defaults.preprocess_image),
+        preprocess_mesh: options.preprocess_mesh.unwrap_or(defaults.preprocess_mesh),
+    };
+    texturing.validate().map_err(anyhow::Error::from)?;
+    Ok(texturing)
+}
+
+/// Pure texturing-request guard: the family allow-list plus the GLB-only
+/// output contract (the baked PBR atlas is embedded in the GLB).
+fn validate_mesh_texturing_request(model: &str, options: &MeshTexturingOptions) -> Result<()> {
+    ensure!(
+        model == "trellis2",
+        "unsupported texturing model `{model}`; expected `trellis2`"
+    );
+    if let Some(format) = options.output_format.as_deref() {
+        ensure!(
+            matches!(
+                MeshFormat::from_extension(format).map_err(anyhow::Error::from)?,
+                MeshFormat::Glb
+            ),
+            "`output_format` must be `glb` for mesh texturing; the baked PBR atlas is \
+             embedded in the GLB"
+        );
+    }
+    trellis2_texturing_options_from_request(options).map(|_| ())
+}
+
+pub async fn spawn_mesh_texturing(
+    state: Arc<Lux3dState>,
+    record: JobRecord,
+    mesh: PathBuf,
+    image: PathBuf,
+    options: MeshTexturingOptions,
+) -> Result<GenerationObject> {
+    let model = record.object.model.clone();
+    validate_mesh_texturing_request(&model, &options)?;
+    let texturing_options = trellis2_texturing_options_from_request(&options)?;
+
+    let job_id = record.object.id.clone();
+    state.jobs.insert(record);
+    let response = state
+        .jobs
+        .get(&job_id)
+        .expect("job just inserted")
+        .object
+        .clone();
+    record_generation_started(&model);
+
+    let state_for_task = state.clone();
+    tokio::spawn(async move {
+        if state_for_task.jobs.is_cancelled(&job_id) {
+            let _ = state_for_task.jobs.mark_cancelled(&job_id);
+            record_generation_finished(&model, "cancelled", 0.0);
+            maybe_deliver_webhook(&state_for_task, &job_id, "generation.cancelled").await;
+            return;
+        }
+
+        if let Err(error) = state_for_task.jobs.mark_in_progress(&job_id) {
+            tracing::error!("failed to mark job in progress: {error}");
+            return;
+        }
+
+        let started = Instant::now();
+        let job_id_for_blocking = job_id.clone();
+        let result = state_for_task
+            .run_blocking({
+                let workspace = state_for_task
+                    .jobs
+                    .get(&job_id)
+                    .map(|record| record.workspace.clone());
+                let mesh = mesh.clone();
+                let image = image.clone();
+                let texturing_options = texturing_options.clone();
+                move |runtime| {
+                    if runtime.jobs.is_cancelled(&job_id_for_blocking) {
+                        bail!("generation was cancelled");
+                    }
+                    runtime
+                        .models
+                        .ensure_loaded(runtime, "trellis2")
+                        .context("failed to load `trellis2` pipeline")?;
+                    let workspace =
+                        workspace.ok_or_else(|| anyhow::anyhow!("job workspace missing"))?;
+                    fs::create_dir_all(&workspace).with_context(|| {
+                        format!(
+                            "failed to create generation workspace at `{}`",
+                            workspace.display()
+                        )
+                    })?;
+                    let device = runtime.device()?;
+                    let output_path = workspace
+                        .join(format!("trellis2-textured.{}", MeshFormat::Glb.extension()));
+                    runtime.models.with_trellis2(|pipeline| {
+                        let imported = load_mesh(&mesh).map_err(anyhow::Error::from)?;
+                        ensure!(
+                            !imported.faces.is_empty(),
+                            "texturing mesh `{}` contains no triangles",
+                            mesh.display()
+                        );
+                        let textured = pipeline
+                            .texture_mesh_from_path(
+                                &imported.vertices,
+                                &imported.faces,
+                                &image,
+                                &texturing_options,
+                                &device,
+                            )
+                            .map_err(anyhow::Error::from)?;
+                        pipeline
+                            .export
+                            .write_textured_glb(&textured.mesh, &output_path)
+                            .map_err(anyhow::Error::from)?;
+                        Ok(())
+                    })?;
                     Ok(output_path)
                 }
             })
@@ -825,9 +1241,11 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        MeshGenerationOptions, Trellis2PipelineType, Trellis2RunOptions, TripoSgRunOptions,
-        trellis2_options_from_mesh_options, triposg_options_from_mesh_options,
-        validate_mesh_generation_request,
+        sample_output_path, trellis2_options_from_mesh_options,
+        trellis2_texturing_options_from_request, triposg_options_from_mesh_options,
+        validate_mesh_generation_request, validate_mesh_texturing_request, MeshGenerationOptions,
+        MeshTexturingOptions, Trellis2PipelineType, Trellis2RunOptions, Trellis2TexturingOptions,
+        TripoSgRunOptions,
     };
 
     fn default_mesh_options() -> MeshGenerationOptions {
@@ -840,9 +1258,7 @@ mod tests {
             .expect("default triposg options");
         assert_eq!(TripoSgRunOptions::default(), run);
         assert_eq!(
-            (
-                50usize, 7.0f32, 42u64, 2048usize, 8u32, 9u32, true, 9u32, 16384usize
-            ),
+            (50usize, 7.0f32, 42u64, 2048usize, 8u32, 9u32, true, 9u32, 16384usize),
             (
                 run.steps,
                 run.guidance_scale,
@@ -1152,5 +1568,270 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn triposg_options_map_schedule_bounds_and_faces() {
+        let options = MeshGenerationOptions {
+            timesteps: Some(vec![900.0, 500.0, 100.0]),
+            bounds: Some([-1.0, -0.5, -1.0, 1.0, 0.5, 1.0]),
+            faces: Some(5_000),
+            ..default_mesh_options()
+        };
+        let run = triposg_options_from_mesh_options(&options).expect("mapped triposg options");
+        assert_eq!(Some(vec![900.0, 500.0, 100.0]), run.timesteps);
+        assert_eq!(Some([-1.0, -0.5, -1.0, 1.0, 0.5, 1.0]), run.bounds);
+        assert_eq!(Some(5_000), run.faces);
+    }
+
+    #[test]
+    fn triposg_schedule_fields_are_rejected_by_other_families() {
+        for model in ["triposr", "trellis2"] {
+            for (name, options) in [
+                (
+                    "timesteps",
+                    MeshGenerationOptions {
+                        timesteps: Some(vec![900.0, 100.0]),
+                        ..default_mesh_options()
+                    },
+                ),
+                (
+                    "bounds",
+                    MeshGenerationOptions {
+                        bounds: Some([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0]),
+                        ..default_mesh_options()
+                    },
+                ),
+                (
+                    "faces",
+                    MeshGenerationOptions {
+                        faces: Some(1_000),
+                        ..default_mesh_options()
+                    },
+                ),
+            ] {
+                let error = validate_mesh_generation_request(model, &options)
+                    .expect_err("triposg-only field must be rejected");
+                let message = error.to_string();
+                assert!(
+                    message.contains(&format!("`{name}` is not supported for `{model}`")),
+                    "unexpected message for {model}/{name}: `{message}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trellis2_options_map_per_stage_sampler_overrides() {
+        let options = MeshGenerationOptions {
+            ss_steps: Some(6),
+            ss_guidance_strength: Some(3.0),
+            ss_guidance_rescale: Some(0.2),
+            ss_guidance_interval: Some([0.1, 0.9]),
+            ss_rescale_t: Some(5.0),
+            shape_steps: Some(7),
+            shape_guidance_strength: Some(4.0),
+            shape_guidance_rescale: Some(0.3),
+            shape_guidance_interval: Some([0.2, 0.8]),
+            shape_rescale_t: Some(6.0),
+            tex_steps: Some(8),
+            tex_guidance_strength: Some(5.0),
+            tex_guidance_rescale: Some(0.4),
+            tex_guidance_interval: Some([0.3, 0.7]),
+            tex_rescale_t: Some(7.0),
+            ..default_mesh_options()
+        };
+        let run = trellis2_options_from_mesh_options(&options).expect("per-stage options");
+
+        let ss = run.ss_sampler.expect("ss sampler overrides");
+        assert_eq!(Some(6), ss.steps);
+        assert_eq!(Some(3.0), ss.guidance_strength);
+        assert_eq!(Some(0.2), ss.guidance_rescale);
+        assert_eq!(Some((0.1, 0.9)), ss.guidance_interval);
+        assert_eq!(Some(5.0), ss.rescale_t);
+
+        let shape = run.shape_sampler.expect("shape sampler overrides");
+        assert_eq!(Some(7), shape.steps);
+        assert_eq!(Some(4.0), shape.guidance_strength);
+        assert_eq!(Some(0.3), shape.guidance_rescale);
+        assert_eq!(Some((0.2, 0.8)), shape.guidance_interval);
+        assert_eq!(Some(6.0), shape.rescale_t);
+
+        let tex = run.tex_sampler.expect("tex sampler overrides");
+        assert_eq!(Some(8), tex.steps);
+        assert_eq!(Some(5.0), tex.guidance_strength);
+        assert_eq!(Some(0.4), tex.guidance_rescale);
+        assert_eq!(Some((0.3, 0.7)), tex.guidance_interval);
+        assert_eq!(Some(7.0), tex.rescale_t);
+    }
+
+    #[test]
+    fn trellis2_options_map_num_samples_and_postprocess() {
+        let options = MeshGenerationOptions {
+            num_samples: Some(3),
+            texture_size: Some(4096),
+            postprocess: Some(false),
+            decimation_target: Some(50_000),
+            fill_hole_perimeter: Some(0.05),
+            min_component_area: Some(1e-4),
+            ..default_mesh_options()
+        };
+        let run = trellis2_options_from_mesh_options(&options).expect("mapped trellis2 options");
+        assert_eq!(3, run.num_samples);
+        assert_eq!(4096, run.texture_export.texture_size);
+        assert!(!run.postprocess.enabled);
+        assert_eq!(50_000, run.postprocess.decimation_target);
+        assert_eq!(0.05, run.postprocess.fill_hole_perimeter);
+        assert_eq!(1e-4, run.postprocess.min_component_area);
+    }
+
+    #[test]
+    fn trellis2_rejects_zero_num_samples_and_invalid_texture_size() {
+        let zero = MeshGenerationOptions {
+            num_samples: Some(0),
+            ..default_mesh_options()
+        };
+        let error = trellis2_options_from_mesh_options(&zero)
+            .expect_err("num_samples = 0 must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("`num_samples` must be at least 1"),
+            "unexpected message: `{error}`"
+        );
+
+        let bad_size = MeshGenerationOptions {
+            texture_size: Some(1001),
+            ..default_mesh_options()
+        };
+        let error = trellis2_options_from_mesh_options(&bad_size)
+            .expect_err("non-multiple-of-8 texture_size must be rejected");
+        assert!(
+            error.to_string().contains("multiple of 8"),
+            "unexpected message: `{error}`"
+        );
+    }
+
+    #[test]
+    fn texturing_options_default_to_reference_values() {
+        let texturing = trellis2_texturing_options_from_request(&MeshTexturingOptions::default())
+            .expect("default texturing options");
+        assert_eq!(Trellis2TexturingOptions::default(), texturing);
+        assert_eq!(
+            (42u64, 1024u32, 2048usize, true, true),
+            (
+                texturing.seed,
+                texturing.resolution,
+                texturing.texture_size,
+                texturing.preprocess_image,
+                texturing.preprocess_mesh,
+            )
+        );
+    }
+
+    #[test]
+    fn texturing_options_map_every_override() {
+        let options = MeshTexturingOptions {
+            seed: Some(7),
+            texture_resolution: Some(1536),
+            texture_size: Some(1024),
+            tex_steps: Some(4),
+            tex_guidance_strength: Some(2.5),
+            tex_guidance_rescale: Some(0.1),
+            tex_guidance_interval: Some([0.2, 0.6]),
+            tex_rescale_t: Some(3.0),
+            preprocess_image: Some(false),
+            preprocess_mesh: Some(false),
+            ..MeshTexturingOptions::default()
+        };
+        let texturing =
+            trellis2_texturing_options_from_request(&options).expect("overridden texturing");
+        assert_eq!(7, texturing.seed);
+        assert_eq!(1536, texturing.resolution);
+        assert_eq!(1024, texturing.texture_size);
+        assert_eq!(Some(4), texturing.tex_sampler.steps);
+        assert_eq!(Some(2.5), texturing.tex_sampler.guidance_strength);
+        assert_eq!(Some(0.1), texturing.tex_sampler.guidance_rescale);
+        assert_eq!(Some((0.2, 0.6)), texturing.tex_sampler.guidance_interval);
+        assert_eq!(Some(3.0), texturing.tex_sampler.rescale_t);
+        assert!(!texturing.preprocess_image);
+        assert!(!texturing.preprocess_mesh);
+    }
+
+    #[test]
+    fn texturing_request_validation_rejects_bad_models_and_formats() {
+        let default = MeshTexturingOptions::default();
+        validate_mesh_texturing_request("trellis2", &default).expect("default texturing request");
+
+        let error = validate_mesh_texturing_request("triposg", &default)
+            .expect_err("only trellis2 textures meshes");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported texturing model `triposg`"),
+            "unexpected message: `{error}`"
+        );
+
+        let obj = MeshTexturingOptions {
+            output_format: Some("obj".to_string()),
+            ..MeshTexturingOptions::default()
+        };
+        let error = validate_mesh_texturing_request("trellis2", &obj)
+            .expect_err("non-GLB texturing output must be rejected");
+        assert!(
+            error.to_string().contains("must be `glb`"),
+            "unexpected message: `{error}`"
+        );
+
+        let unknown = MeshTexturingOptions {
+            output_format: Some("fbx".to_string()),
+            ..MeshTexturingOptions::default()
+        };
+        assert!(validate_mesh_texturing_request("trellis2", &unknown).is_err());
+    }
+
+    #[test]
+    fn texturing_request_rejects_invalid_resolution_and_texture_size() {
+        for (name, options) in [
+            (
+                "resolution",
+                MeshTexturingOptions {
+                    texture_resolution: Some(768),
+                    ..MeshTexturingOptions::default()
+                },
+            ),
+            (
+                "texture_size",
+                MeshTexturingOptions {
+                    texture_size: Some(1001),
+                    ..MeshTexturingOptions::default()
+                },
+            ),
+        ] {
+            let error = validate_mesh_texturing_request("trellis2", &options)
+                .expect_err("invalid texturing option must be rejected");
+            let message = error.to_string();
+            assert!(
+                message.contains(name) || message.contains("resolution") || message.contains("8"),
+                "unexpected message for {name}: `{message}`"
+            );
+        }
+    }
+
+    #[test]
+    fn sample_output_path_suffixes_multi_sample_runs() {
+        let output = std::path::Path::new("trellis2.glb");
+        assert_eq!(
+            std::path::PathBuf::from("trellis2.glb"),
+            sample_output_path(output, 0, 1)
+        );
+        assert_eq!(
+            std::path::PathBuf::from("trellis2_0.glb"),
+            sample_output_path(output, 0, 3)
+        );
+        assert_eq!(
+            std::path::PathBuf::from("trellis2_2.glb"),
+            sample_output_path(output, 2, 3)
+        );
     }
 }

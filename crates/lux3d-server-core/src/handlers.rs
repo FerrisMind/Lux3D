@@ -4,11 +4,11 @@ use std::path::Path;
 
 use anyhow::Context;
 use axum::{
-    Json,
     body::Body,
     extract::{FromRequest, Path as AxumPath, Query, Request, State},
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
+    Json,
 };
 use serde::Deserialize;
 
@@ -17,19 +17,23 @@ use lux3d_core::export::{MeshFormat, PointCloudFormat};
 use crate::{
     api_types::{
         ErrorBody, ErrorResponse, GenerationListResponse, GenerationObject, GenerationStatus,
-        MeshGenerationOptions, MeshGenerationRequest, ModelListResponse, ModelObject,
-        PointCloudGenerationOptions, PointCloudGenerationRequest, RouteSummary, ServerInfoResponse,
+        MeshGenerationOptions, MeshGenerationRequest, MeshTexturingOptions, MeshTexturingRequest,
+        ModelListResponse, ModelObject, PointCloudGenerationOptions, PointCloudGenerationRequest,
+        RouteSummary, ServerInfoResponse,
     },
     errors::{conflict, internal_error, invalid_request, not_found},
     jobs::{
-        NewJobRecord, create_job_record, job_workspace, new_job_id, spawn_mesh_generation,
-        spawn_point_cloud_generation,
+        create_job_record, job_workspace, new_job_id, spawn_mesh_generation, spawn_mesh_texturing,
+        spawn_point_cloud_generation, NewJobRecord,
     },
-    media_source::{MediaSourceInput, resolve_conditions_path, resolve_source_path},
+    media_source::{
+        resolve_conditions_path, resolve_mesh_path, resolve_source_path, MediaSourceInput,
+        MeshSourceInput,
+    },
     models::{ModelOperationRequest, ModelStatusResponse},
     route_registry::LUX3D_API_ROUTES,
     types::ExtractedLux3dState,
-    upload::parse_generation_upload,
+    upload::{parse_generation_upload, parse_texturing_upload},
 };
 
 #[derive(Debug, Deserialize)]
@@ -374,6 +378,39 @@ pub async fn create_mesh_generation(
     }
 }
 
+#[utoipa::path(
+    post,
+    tag = "Lux3D",
+    path = "/v1/meshes/texturings",
+    request_body(content = String, description = "multipart/form-data or JSON texturing request"),
+    responses(
+        (status = 202, description = "Accepted texturing job", body = GenerationObject),
+        (status = 400, description = "Invalid request")
+    )
+)]
+pub async fn create_mesh_texturing(
+    State(state): ExtractedLux3dState,
+    request: Request,
+) -> Response {
+    if is_json_request(&request) {
+        match axum::Json::<MeshTexturingRequest>::from_request(request, &state).await {
+            Ok(Json(body)) => match create_mesh_texturing_json(state, body).await {
+                Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),
+                Err(error) => invalid_request(error.to_string()),
+            },
+            Err(rejection) => invalid_request(rejection.to_string()),
+        }
+    } else {
+        match axum::extract::Multipart::from_request(request, &state).await {
+            Ok(multipart) => match create_mesh_texturing_multipart(state, multipart).await {
+                Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),
+                Err(error) => invalid_request(error.to_string()),
+            },
+            Err(rejection) => invalid_request(rejection.to_string()),
+        }
+    }
+}
+
 async fn create_point_cloud_generation_multipart(
     state: std::sync::Arc<crate::types::Lux3dState>,
     multipart: axum::extract::Multipart,
@@ -527,6 +564,96 @@ async fn create_mesh_generation_json(
     spawn_mesh_generation(state, record, source, request.options).await
 }
 
+/// Texturing output format: the baked PBR atlas is embedded in the GLB, so
+/// only `glb` (the default) is accepted.
+fn texturing_output_format(options: &MeshTexturingOptions) -> anyhow::Result<MeshFormat> {
+    match options.output_format.as_deref() {
+        Some(format) => match MeshFormat::from_extension(format).map_err(anyhow::Error::from)? {
+            MeshFormat::Glb => Ok(MeshFormat::Glb),
+            other => anyhow::bail!(
+                "`output_format` must be `glb` for mesh texturing (got `{}`); the baked \
+                 PBR atlas is embedded in the GLB",
+                other.extension()
+            ),
+        },
+        None => Ok(MeshFormat::Glb),
+    }
+}
+
+fn texturing_download_filename(format: MeshFormat) -> String {
+    format!("trellis2-textured.{}", format.extension())
+}
+
+async fn create_mesh_texturing_multipart(
+    state: std::sync::Arc<crate::types::Lux3dState>,
+    multipart: axum::extract::Multipart,
+) -> anyhow::Result<GenerationObject> {
+    let job_id = new_job_id();
+    let workspace = job_workspace(&state.upload_dir, &job_id);
+    let (upload, options): (_, MeshTexturingOptions) =
+        parse_texturing_upload(multipart, &workspace).await?;
+    let model = upload.model.unwrap_or_else(|| "trellis2".to_string());
+    let format = texturing_output_format(&options)?;
+
+    let record = create_job_record(NewJobRecord {
+        job_id,
+        model,
+        output_format: format.extension().to_string(),
+        workspace,
+        content_type: format.content_type().to_string(),
+        download_filename: texturing_download_filename(format),
+        ttl_secs: state.generation_defaults.job_ttl_secs,
+        webhook_url: None,
+    });
+
+    spawn_mesh_texturing(state, record, upload.mesh, upload.image, options).await
+}
+
+async fn create_mesh_texturing_json(
+    state: std::sync::Arc<crate::types::Lux3dState>,
+    request: MeshTexturingRequest,
+) -> anyhow::Result<GenerationObject> {
+    let job_id = new_job_id();
+    let workspace = job_workspace(&state.upload_dir, &job_id);
+    let image = resolve_source_path(
+        &state,
+        &workspace,
+        &MediaSourceInput {
+            source_url: request.source_url,
+            source_file_id: request.source_file_id,
+            source_base64: request.source_base64,
+            source_filename: request.source_filename,
+            conditions_file_id: None,
+        },
+    )
+    .await?;
+    let mesh = resolve_mesh_path(
+        &state,
+        &workspace,
+        &MeshSourceInput {
+            mesh_url: request.mesh_url,
+            mesh_file_id: request.mesh_file_id,
+            mesh_base64: request.mesh_base64,
+            mesh_filename: request.mesh_filename,
+        },
+    )
+    .await?;
+    let format = texturing_output_format(&request.options)?;
+
+    let record = create_job_record(NewJobRecord {
+        job_id,
+        model: request.model,
+        output_format: format.extension().to_string(),
+        workspace,
+        content_type: format.content_type().to_string(),
+        download_filename: texturing_download_filename(format),
+        ttl_secs: state.generation_defaults.job_ttl_secs,
+        webhook_url: request.webhook_url,
+    });
+
+    spawn_mesh_texturing(state, record, mesh, image, request.options).await
+}
+
 fn is_json_request(request: &Request<Body>) -> bool {
     request
         .headers()
@@ -630,5 +757,34 @@ mod tests {
             ..PointCloudGenerationOptions::default()
         };
         assert!(point_cloud_output_format(&invalid).is_err());
+    }
+
+    #[test]
+    fn texturing_jobs_are_glb_only() {
+        let default = MeshTexturingOptions::default();
+        assert_eq!(texturing_output_format(&default).unwrap(), MeshFormat::Glb);
+        assert_eq!(
+            texturing_download_filename(MeshFormat::Glb),
+            "trellis2-textured.glb"
+        );
+
+        let explicit = MeshTexturingOptions {
+            output_format: Some("GLB".to_string()),
+            ..MeshTexturingOptions::default()
+        };
+        assert_eq!(texturing_output_format(&explicit).unwrap(), MeshFormat::Glb);
+
+        for format in ["obj", "ply", "stl"] {
+            let invalid = MeshTexturingOptions {
+                output_format: Some(format.to_string()),
+                ..MeshTexturingOptions::default()
+            };
+            let error = texturing_output_format(&invalid)
+                .expect_err("non-GLB texturing output must be rejected");
+            assert!(
+                error.to_string().contains("must be `glb`"),
+                "unexpected message for {format}: `{error}`"
+            );
+        }
     }
 }

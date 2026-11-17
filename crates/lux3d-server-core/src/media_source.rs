@@ -5,8 +5,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, bail, ensure};
-use base64::{Engine, engine::general_purpose::STANDARD};
+use anyhow::{bail, ensure, Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use url::Url;
 
 use crate::{files::resolve_file_path, types::Lux3dState};
@@ -20,23 +20,71 @@ pub struct MediaSourceInput {
     pub conditions_file_id: Option<String>,
 }
 
+/// Mesh input for the texturing endpoint: same resolution rules as
+/// [`MediaSourceInput`] but with `mesh_*` field names.
+#[derive(Debug, Clone, Default)]
+pub struct MeshSourceInput {
+    pub mesh_url: Option<String>,
+    pub mesh_file_id: Option<String>,
+    pub mesh_base64: Option<String>,
+    pub mesh_filename: Option<String>,
+}
+
 pub async fn resolve_source_path(
     state: &Lux3dState,
     workspace: &Path,
     input: &MediaSourceInput,
 ) -> Result<PathBuf> {
-    if let Some(url) = input.source_url.as_deref() {
-        return fetch_url_to_workspace(state, workspace, url, input.source_filename.as_deref())
-            .await;
+    resolve_media_path(
+        state,
+        workspace,
+        input.source_url.as_deref(),
+        input.source_file_id.as_deref(),
+        input.source_base64.as_deref(),
+        input.source_filename.as_deref(),
+        "one of `source`, `source_url`, `source_file_id`, or `source_base64` is required",
+    )
+    .await
+}
+
+pub async fn resolve_mesh_path(
+    state: &Lux3dState,
+    workspace: &Path,
+    input: &MeshSourceInput,
+) -> Result<PathBuf> {
+    resolve_media_path(
+        state,
+        workspace,
+        input.mesh_url.as_deref(),
+        input.mesh_file_id.as_deref(),
+        input.mesh_base64.as_deref(),
+        input.mesh_filename.as_deref(),
+        "one of `mesh`, `mesh_url`, `mesh_file_id`, or `mesh_base64` is required",
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_media_path(
+    state: &Lux3dState,
+    workspace: &Path,
+    url: Option<&str>,
+    file_id: Option<&str>,
+    base64_payload: Option<&str>,
+    filename: Option<&str>,
+    missing_message: &str,
+) -> Result<PathBuf> {
+    if let Some(url) = url {
+        return fetch_url_to_workspace(state, workspace, url, filename).await;
     }
-    if let Some(file_id) = input.source_file_id.as_deref() {
+    if let Some(file_id) = file_id {
         let source_path = resolve_file_path(state, file_id)?;
         return copy_file_to_workspace(workspace, &source_path);
     }
-    if let Some(encoded) = input.source_base64.as_deref() {
-        return write_base64_to_workspace(workspace, encoded, input.source_filename.as_deref());
+    if let Some(encoded) = base64_payload {
+        return write_base64_to_workspace(workspace, encoded, filename);
     }
-    bail!("one of `source`, `source_url`, `source_file_id`, or `source_base64` is required")
+    bail!("{missing_message}")
 }
 
 pub fn resolve_conditions_path(

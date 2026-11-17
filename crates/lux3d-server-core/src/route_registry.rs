@@ -30,6 +30,7 @@ pub const GENERATION_STREAM_ROUTE: RouteInfo = RouteInfo::new("/v1/generations/{
 pub const POINT_CLOUD_GENERATIONS_ROUTE: RouteInfo =
     RouteInfo::new("/v1/point-clouds/generations", "POST");
 pub const MESH_GENERATIONS_ROUTE: RouteInfo = RouteInfo::new("/v1/meshes/generations", "POST");
+pub const MESH_TEXTURINGS_ROUTE: RouteInfo = RouteInfo::new("/v1/meshes/texturings", "POST");
 pub const SYSTEM_INFO_ROUTE: RouteInfo = RouteInfo::new("/v1/system/info", "GET");
 pub const SYSTEM_DOCTOR_ROUTE: RouteInfo = RouteInfo::new("/v1/system/doctor", "POST");
 
@@ -51,6 +52,26 @@ pub const LUX3D_API_ROUTES: &[RouteInfo] = &[
     GENERATION_STREAM_ROUTE,
     POINT_CLOUD_GENERATIONS_ROUTE,
     MESH_GENERATIONS_ROUTE,
+    MESH_TEXTURINGS_ROUTE,
     SYSTEM_INFO_ROUTE,
     SYSTEM_DOCTOR_ROUTE,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::{LUX3D_API_ROUTES, MESH_TEXTURINGS_ROUTE};
+
+    #[test]
+    fn texturing_route_is_registered_after_mesh_generations() {
+        let position = LUX3D_API_ROUTES
+            .iter()
+            .position(|route| *route == MESH_TEXTURINGS_ROUTE)
+            .expect("/v1/meshes/texturings must be listed in LUX3D_API_ROUTES");
+        assert_eq!(
+            "/v1/meshes/generations",
+            LUX3D_API_ROUTES[position - 1].path,
+            "the texturing route follows the mesh generations route"
+        );
+        assert_eq!("POST", MESH_TEXTURINGS_ROUTE.methods);
+    }
+}

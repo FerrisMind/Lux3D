@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use axum::extract::multipart::{Field, Multipart};
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
@@ -14,6 +14,14 @@ use uuid::Uuid;
 pub struct PreparedUpload {
     pub source: PathBuf,
     pub conditions: Option<PathBuf>,
+    pub model: Option<String>,
+}
+
+/// Multipart fields for `POST /v1/meshes/texturings`: `source` is the
+/// condition image and `mesh` the mesh to texture.
+pub struct PreparedTexturingUpload {
+    pub image: PathBuf,
+    pub mesh: PathBuf,
     pub model: Option<String>,
 }
 
@@ -70,6 +78,68 @@ where
         PreparedUpload {
             source: source_path,
             conditions: conditions_path,
+            model,
+        },
+        options,
+    ))
+}
+
+/// Parse the texturing multipart body: `source` (condition image), `mesh`
+/// (mesh to texture), optional `model` and `options` JSON.
+pub async fn parse_texturing_upload<T>(
+    mut multipart: Multipart,
+    workspace: &Path,
+) -> Result<(PreparedTexturingUpload, T)>
+where
+    T: DeserializeOwned + Default,
+{
+    fs::create_dir_all(workspace).with_context(|| {
+        format!(
+            "failed to create generation workspace at `{}`",
+            workspace.display()
+        )
+    })?;
+
+    let mut image_path = None;
+    let mut mesh_path = None;
+    let mut model = None;
+    let mut options_json = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .context("failed to read multipart field")?
+    {
+        match field.name().unwrap_or_default() {
+            "source" => {
+                image_path = Some(save_upload_field(field, workspace, "source").await?);
+            }
+            "mesh" => {
+                mesh_path = Some(save_upload_field(field, workspace, "mesh").await?);
+            }
+            "model" => {
+                model = Some(field.text().await.context("failed to read model field")?);
+            }
+            "options" => {
+                options_json = Some(field.text().await.context("failed to read options field")?);
+            }
+            _ => {}
+        }
+    }
+
+    let image_path = image_path.context("missing required multipart field `source`")?;
+    let mesh_path = mesh_path.context("missing required multipart field `mesh`")?;
+    let options = match options_json {
+        Some(json) => {
+            serde_json::from_str(&json).context("failed to parse `options` JSON field")?
+        }
+        None => T::default(),
+    };
+
+    Ok((
+        PreparedTexturingUpload {
+            image: image_path,
+            mesh: mesh_path,
             model,
         },
         options,
