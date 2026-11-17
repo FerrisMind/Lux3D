@@ -559,10 +559,10 @@ CPU and Vulkan numeric parity was verified manually (PLY vertex count and bbox a
 Python baseline; see `.swarm/results/backends-and-bench.md`). The automated parity test is
 CUDA-only; Metal has no test host in this repository.
 
-**Excluded:** the official fine tracker stages B/C (ALIKED/SuperPoint keypoint
-extractors, LightGlue-style refinement) and non-visible track completion. Tracking stage A
-is shipped: DINOv2-reg query-frame ranking + FPS query points feeding the VGGT track head
-(see US-13.5).
+**Excluded:** the official fine tracker stages B/C (LightGlue matching/refinement) and
+non-visible track completion. Tracking stage A is shipped: DINOv2-reg query-frame ranking
+plus the official ALIKED-n16 + SuperPoint query extractors (weight-free FPS remains an
+opt-out) feeding the VGGT track head (see US-13.5).
 
 ### US-13.4: VGGT CLI run surface (exports + tracking)
 As a user, I can run `lux3d run vggt` with the full VGGT option surface: preprocess mode,
@@ -586,9 +586,11 @@ clouds, explicit or automatic tracking, and the demo-style GLB scene.
   x/y in [0, 518); parse: `parse_vggt_track_queries`) + `--track-output` (default
   `<source-stem>_tracks.json`) + `--track-iters` (default 4) →
   `run_with_tracks` + `{"coords", "visibility", "confidence", "query_frames"}` JSON ✅
-- `--track-auto` + `--query-frame-num` (default 8) + `--max-query-pts` (default 4096) —
-  tracking stage A (`runtime/vggt_auto_query.rs`: DINOv2-reg frame ranking + FPS query
-  points, confidence gate, query-frame rotation) ✅
+- `--track-auto` + `--query-frame-num` (default 8) + `--max-query-pts` (default 4096) +
+  `--track-keypoints aliked-sp|fps` (default `aliked-sp`) — tracking stage A
+  (`runtime/vggt_auto_query.rs`: DINOv2-reg frame ranking, ALIKED-n16 + SuperPoint query
+  points (official default) or the weight-free FPS grid, confidence gate, query-frame
+  rotation) ✅
 - `--track-points-ply` — one colored vertex per query (frame-0 world point at the
   query pixel) ✅
 - `--glb` + `--glb-conf-percentile` (default 50) + `--glb-show-cam` +
@@ -598,11 +600,11 @@ clouds, explicit or automatic tracking, and the demo-style GLB scene.
 - Single-image `--source` accepted for `vggt` ✅
 
 **Guards:** `--track-queries` and `--track-auto` are mutually exclusive;
-`--query-frame-num`/`--max-query-pts` require `--track-auto`; tracking rejects
-`--batch-size > 1`; `--colmap-mode track` requires `--colmap-dir` and `--track-auto`;
-`--vis-thresh`/`--max-reproj-error`/`--shared-camera`/`--colmap-min-inlier-per-frame`
-require track mode; `--glb-*` modifiers require `--glb`; the confidence percentile must be
-finite in `[0, 100]`.
+`--query-frame-num`/`--max-query-pts`/`--track-keypoints fps` require `--track-auto`;
+tracking rejects `--batch-size > 1`; `--colmap-mode track` requires `--colmap-dir` and
+`--track-auto`; `--vis-thresh`/`--max-reproj-error`/`--shared-camera`/
+`--colmap-min-inlier-per-frame` require track mode; `--glb-*` modifiers require `--glb`;
+the confidence percentile must be finite in `[0, 100]`.
 
 **Tests:** `tests/run_args.rs` (`run_vggt_parses_vggt_flags`,
 `run_vggt_flags_default_to_historical_behavior`,
@@ -620,9 +622,16 @@ track reconstruction for external bundle adjustment.
 
 **Functions:**
 - `runtime/vggt_auto_query.rs:VggtAutoQueryOptions` / `VggtAutoTrackResult` —
-  query-frame ranking (`Dinov2RegRanker::rank_frames`), FPS query points
-  (`fps_query_points`), confidence pruning (`prune_query_points_by_confidence`) and
-  frame rotation (`calculate_index_mappings` / `switch_tensor_order`) ✅
+  query-frame ranking (`Dinov2RegRanker::rank_frames`), per-frame query points
+  (official ALIKED-n16 + SuperPoint default, weight-free `fps_query_points` opt-out),
+  confidence pruning (`prune_query_points_by_confidence`) and frame rotation
+  (`calculate_index_mappings` / `switch_tensor_order`) ✅
+- `runtime/aliked.rs:AlikedDetector` — LightGlue ALIKED-n16 port (DCN blocks, DKD
+  sub-pixel detection, SDDH descriptors); `runtime/superpoint.rs:SuperPointDetector` —
+  LightGlue SuperPoint port; `runtime/vggt_keypoints.rs` resolves both converted
+  safetensors (`LUX3D_ALIKED_WEIGHTS` / `LUX3D_SUPERPOINT_WEIGHTS` or
+  `models/aliked-superpoint/`), loads them before the VGGT forward, and concatenates
+  ALIKED then SuperPoint query points exactly like `extract_keypoints` ✅
 - DINOv2 ViT-B/14-with-registers encoder (`Dinov2RegEncoder`) resolved from
   `models/dinov2_reg4/model.safetensors` or `LUX3D_DINOV2_REG_MODEL_PATH` ✅
 - `export/colmap.rs:write_track_colmap()` — `batch_np_matrix_to_pycolmap` semantics:
@@ -633,20 +642,34 @@ track reconstruction for external bundle adjustment.
   source, `Pointmap` = point head) ✅
 - CLI `--colmap-mode track --vis-thresh 0.2 --max-reproj-error 8.0
   --colmap-min-inlier-per-frame 64 --shared-camera` ✅
+- CLI `--colmap-ba` (track mode + `--colmap-dir` only): runs the external
+  `colmap bundle_adjuster --input_path <dir> --output_path <fresh temp dir>`
+  (binary from `LUX3D_COLMAP_BIN` or `PATH`, no shell), then replaces
+  `cameras.bin`/`images.bin`/`points3D.bin` (plus `rigs.bin`/`frames.bin` when
+  the installed COLMAP writes them) in place and preserves the other export
+  files ✅
 
 **Explicit cut lines:**
-- **No bundle adjustment.** Upstream `--use_ba` needs pycolmap/C++; this repository
-  writes the COLMAP-ready reconstruction and leaves BA to external COLMAP/gsplat.
+- **Bundle adjustment is opt-in.** Upstream `--use_ba` requires pycolmap/C++, so
+  the default track export still writes the COLMAP-ready reconstruction and
+  leaves BA to external COLMAP/gsplat. `--colmap-ba` shells out to the external
+  COLMAP binary; it does not link pycolmap, and its output is only as good as the
+  installed COLMAP version.
 - **Stage-A-only tracking quality.** The official BA input uses VGGSfM v2 fine
-  tracking with ALIKED/SuperPoint queries; stage A here uses DINO/FPS queries + the
-  VGGT track head, so tracks are coarser and the official default
-  `min_inlier_per_frame = 64` can reject a stage-A export. Stages B/C (VG6/VG8) are
-  not shipped.
+  tracking (stages B/C) with ALIKED/SuperPoint queries; Lux3D now uses the same official
+  ALIKED-n16 + SuperPoint query extractors by default, but feeds them to the VGGT track
+  head without LightGlue refinement. Tracks can therefore still be coarser than the
+  official input, and the official default `min_inlier_per_frame = 64` can reject a
+  stage-A export. `--track-keypoints fps` keeps the earlier weight-free grid source.
+  Stages B/C (VG6/VG8) are not shipped.
 - **No pycolmap reconstruction round-trip.** The `.bin` writer is the only COLMAP
   surface; `points.ply` is the accompanying visualization cloud.
 
 **Tests:** `vggt_auto_query` unit tests (DINO ranking, FPS, confidence pruning,
-index mappings), `vggt_track` tensor-name/query validation, `export::colmap`
+index mappings), `runtime::aliked` official LightGlue golden (735/735 keypoints, exact
+order; max score error 6.2e-6), `runtime::superpoint` official golden (415/415;
+resize 882/882), `runtime::vggt_keypoints` ALIKED+SuperPoint composition (gated on the
+converted checkpoints), `vggt_track` tensor-name/query validation, `export::colmap`
 unit tests (feedforward write + parse-back, seeded point limiting, track gates,
 `>= 2` observations, 3000-coordinate gate) ✅
 
@@ -934,14 +957,15 @@ As a user, I get the upstream `to_glb` mesh remesh/cleanup before export.
   `min_component_area` (1e-5), `remesh` (true), `remesh_band` (1), `remesh_project` (0) —
   the defaults match the shipped entry points `example.py:43` / `app.py:503` ✅
 - `geometry/trellis2.rs:postprocess_decoded_mesh()` — shared `fill_holes` pre-pass then
-  one of two branches (`postprocess.py:108-186`): the narrow-band dual-contouring remesh
-  (`geometry/remesh_dc.rs:remesh_narrow_band_dc`) on the canonical `[-0.5, 0.5]^3` frame
-  with `resolution = mesh.resolution`, `center = 0`, `scale = (resolution + 3 * band) /
-  resolution` (`geometry/remesh_dc.rs:narrow_band_grid_scale`, remesh quads split into
-  triangles), followed by a single `simplify(decimation_target)` pass; or
-  `geometry/mesh_ops.rs:postprocess_mesh()` — simplify -> duplicate-face / non-manifold
-  repair -> small-component removal -> fill holes -> simplify -> cleanup -> fill holes ->
-  orientation unification -> vertex compaction ✅
+  one of two branches (`postprocess.py:108-186`): the official CuMesh narrow-band
+  dual-contouring remesh (`geometry/remesh_dc.rs:remesh_narrow_band_dc`) on the canonical
+  `[-0.5, 0.5]^3` frame with `resolution = mesh.resolution`, `center = 0`, `scale =
+  (resolution + 3 * band) / resolution` (`geometry/remesh_dc.rs:narrow_band_grid_scale`,
+  triangles emitted directly with the official adaptive diagonal), followed by a single
+  `simplify(decimation_target)` pass; or `geometry/mesh_ops.rs:postprocess_mesh()` —
+  simplify -> duplicate-face / non-manifold repair -> small-component removal -> fill
+  holes -> simplify -> cleanup -> fill holes -> orientation unification -> vertex
+  compaction ✅
 - `geometry/mesh_ops.rs:simplify_mesh()` — deterministic meshopt quadric
   simplifier with `Permissive` collapses (required for the non-manifold
   O-Voxel dual-grid topology; without it meshopt stalls above the target);
@@ -954,16 +978,22 @@ As a user, I get the upstream `to_glb` mesh remesh/cleanup before export.
 - `export/glb_textured.rs:TexturedGlbMesh::double_sided` — `false` on remeshed exports,
   `true` on the non-remeshed/pass-through paths (`postprocess.py:303`) ✅
 
-**Tests:** `geometry::trellis2` remesh branch tests (watertight topology rebuild,
-remesh decimation target, pre-attached-color rejection, byte-identical `--no-remesh`
-cleanup path), `mesh_ops` unit suite (26 tests), `pipeline_trellis2`
+**Tests:** `geometry::remesh_dc` unit suite (sphere/box closed shells and volumes,
+resolution/band/project-back/determinism, official split tables) plus the official CuMesh
+goldens (`cumesh_remesh_goldens_are_intact` and `official_cumesh_goldens_match`: exact
+vertex/face counts for cube/sphere at resolutions 32/64, vertex sets within 1e-4,
+volume within 1e-4), `geometry::trellis2` remesh branch tests (watertight
+topology rebuild, remesh decimation target, pre-attached-color rejection, byte-identical
+`--no-remesh` cleanup path), `mesh_ops` unit suite (26 tests), `pipeline_trellis2`
 (`pipeline_golden_mesh_postprocess_options` covers remesh + cleanup + both decimation
 paths), CLI/server postprocess mapping tests ✅
 
-**Caveat:** the remesh is a clean-room narrow-band dual-contouring port (BVH closest-point
-distance + ray-parity sign + QEF placement), and cleanup/decimation are clean-room ports
-driven by the meshopt simplifier, not cumesh; topology changes can differ from the
-reference.
+**Caveat:** the remesh is a direct port of the official CuMesh narrow-band dual-contouring
+algorithm (UDF−eps level set, base resolution halved to 32 then adaptive octree expansion,
+mean edge intersections without QEF, official adaptive diagonal), validated against
+official CuMesh golden meshes. Hole fill/cleanup/decimation remain clean-room ports driven
+by the meshopt simplifier, so the post-remesh simplification can differ from the reference
+cumesh pipeline.
 
 ### US-16.6: Resident stage mode (`--no-low-vram`)
 As a user, I can keep every loaded TRELLIS.2 stage resident instead of the default
@@ -1275,14 +1305,15 @@ Also touched: `crates/lux3d-core/tests/vggt_export.rs` (fixture gains empty `pos
   quantized canonical-GGUF layout). A package with neither fails with a clear error.
 - **TRELLIS.2 `1536_cascade`:** variant dispatch and token-budget math are tested; no
   real-weight end-to-end run is recorded.
-- **TRELLIS.2 remesh branch:** implemented as a clean-room narrow-band dual-contouring
-  port (`geometry/remesh_dc.rs`) and enabled by default, matching the shipped entry
-  points; `--no-remesh` / `remesh = false` restores the previous cleanup chain. The
-  default decodes on fresh topology, so mesh vertex/face counts differ from the
-  pre-remesh pipeline by design.
-- **TRELLIS.2 approximations:** narrow-band DC remesh vs cumesh; meshopt
-  simplification/cleanup vs cumesh; xatlas vs cumesh unwrap; TELEA-approximation inpaint
-  vs `cv2.inpaint`; synthesized occupancy guides vs upstream sparse caches.
+- **TRELLIS.2 remesh branch:** the remesher is a direct port of the official CuMesh
+  narrow-band dual-contouring algorithm (`geometry/remesh_dc.rs`) and is enabled by
+  default, matching the shipped entry points; `--no-remesh` / `remesh = false` restores
+  the previous cleanup chain. The default decodes on fresh topology, so mesh vertex/face
+  counts differ from the pre-remesh pipeline by design.
+- **TRELLIS.2 approximations:** meshopt simplification/cleanup vs cumesh; xatlas vs
+  cumesh unwrap; TELEA-approximation inpaint vs `cv2.inpaint`; synthesized occupancy
+  guides vs upstream sparse caches. The narrow-band remesh itself matches the official
+  CuMesh goldens; post-remesh simplification does not.
 - **TRELLIS.2 backend throughput:** one sampler step on q8\_0 (512, geometry only) takes
   22.0 s on CUDA, 55.9 s on Vulkan and 97.6 s on WGPU. Vulkan's residual gap is WDDM
   submission/fence latency: the shape VAE and DiTs issue tens of thousands of small
@@ -1303,11 +1334,14 @@ Also touched: `crates/lux3d-core/tests/vggt_export.rs` (fixture gains empty `pos
   including the K-quant Q8K dispatch limit). Reduced-precision coop-matrix is not used
   for TRELLIS.2 because its O-Voxel occupancy is discrete and f16/TF32 drift changes the
   exported topology.
-- **VGGT tracking:** stage A is shipped (DINOv2-reg query-frame ranking + FPS query
-  points, confidence gate, query-frame rotation); the official fine tracker stages B/C
-  (ALIKED/SuperPoint keypoint extractors, LightGlue-style refinement) and non-visible
-  track completion are not implemented. Stage-A tracks are coarser and can fail the
-  official `min_inlier_per_frame = 64` gate.
+- **VGGT tracking:** stage A uses DINOv2-reg query-frame ranking plus the official
+  ALIKED-n16 + SuperPoint query extractors (weight-free FPS is the `--track-keypoints
+  fps` opt-out), confidence gate and query-frame rotation. The official fine tracker
+  stages B/C (LightGlue matching/refinement) and non-visible track completion are not
+  implemented, so stage-A tracks can be coarser and fail the official
+  `min_inlier_per_frame = 64` gate. Detectors run on the model-resolution prepared frame,
+  not the demo's 1024 px loaded images, and the reference `torch.randperm` query shuffle
+  is omitted (deterministic query order).
 - **VGGT contract drift:** the static contract has no `track_head` entry (the
   `NeuralSpec::track_head` field deserializes to `None`) and still lists the
   `vggt_track_head` exclusion while `runtime/vggt_track.rs` implements the head;
@@ -1318,10 +1352,11 @@ Also touched: `crates/lux3d-core/tests/vggt_export.rs` (fixture gains empty `pos
   point-head `world_points`. `--colmap-seed` gives a random point cap
   (distribution-equivalent to numpy, not bit-identical); without it the cap is a
   deterministic evenly-spaced subsample.
-- **VGGT BA / pycolmap:** no bundle adjustment and no pycolmap reconstruction
-  round-trip. `--colmap-mode track` writes the `batch_np_matrix_to_pycolmap`
-  reconstruction (SIMPLE_PINHOLE, tracks, no BA) as COLMAP-ready input for external
-  BA/gsplat. Upstream's `--use_ba` path needs pycolmap/C++ and is an explicit cut line.
+- **VGGT BA / pycolmap:** no pycolmap reconstruction round-trip. `--colmap-mode track`
+  writes the `batch_np_matrix_to_pycolmap` reconstruction (SIMPLE_PINHOLE, tracks).
+  Bundle adjustment is off by default (matching upstream `--use_ba` default False);
+  `--colmap-ba` runs the external `colmap bundle_adjuster` and replaces the three
+  sparse-model files in place. Upstream's in-process pycolmap path remains a cut line.
 - **VGGT GLB:** the demo's `mask_sky` filter is not ported (it needs onnxruntime + the
   SkySeg ONNX model); the black/white background masks exist as core options but are not
   CLI flags, and the "Show Points from Frame" selector is not exposed.
