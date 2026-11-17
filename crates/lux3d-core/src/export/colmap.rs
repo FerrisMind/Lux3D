@@ -5,7 +5,10 @@
 //! a confidence mask `depth_conf >= conf_threshold`, at most 100000 3D points,
 //! pixel-grid 2D associations with track length 1, one PINHOLE camera per
 //! image, and camera/point rescaling back to the original image resolution
-//! through the per-frame [`VggtOriginalCoords`].
+//! through the per-frame [`VggtOriginalCoords`]. Crop-mode rescaling is the
+//! exact inverse of the `load_fn.py:162-175` recipe (per-axis
+//! `width / 518` and `height / resized_height`, adding `crop_start_y` back on
+//! the y axis); pad and square paths keep their existing mappings.
 //!
 //! It also implements the track-based reconstruction path
 //! [`write_track_colmap`] (upstream `batch_np_matrix_to_pycolmap`,
@@ -49,13 +52,13 @@ use std::{fs, path::Path};
 
 use candle_core::{Device, Tensor};
 
-use super::point_cloud::{write_ply, PointCloudView};
+use super::point_cloud::{PointCloudView, write_ply};
 use crate::{
+    Result,
     error::Lux3dError,
     geometry::{rescale_intrinsics_to_original, shift_point2d_to_original},
     preprocess::{VggtOriginalCoords, VggtPreparedInputs, VggtPreprocessMode},
     runtime::{VggtAutoTrackResult, VggtInferenceOutput},
-    Result,
 };
 
 /// COLMAP camera model id for `PINHOLE` (params: fx, fy, cx, cy).
@@ -1653,6 +1656,8 @@ mod tests {
                     offset_y: 2,
                     content_width: 4,
                     content_height: 4,
+                    crop_start_y: 0,
+                    resized_height: 4,
                     mode: VggtPreprocessMode::Crop,
                     square: None,
                 },
@@ -1663,6 +1668,8 @@ mod tests {
                     offset_y: 0,
                     content_width: 4,
                     content_height: 4,
+                    crop_start_y: 0,
+                    resized_height: 4,
                     mode: VggtPreprocessMode::Crop,
                     square: None,
                 },
@@ -1725,8 +1732,8 @@ mod tests {
 
         // --- cameras: PINHOLE, original resolution, rescaled params ---
         assert_eq!(cameras.len(), 2);
-        let ratio0 = fixture.prepared.original_coords[0].resize_ratio(fixture.img_size);
-        let ratio1 = fixture.prepared.original_coords[1].resize_ratio(fixture.img_size);
+        let (scale_x0, scale_y0) = fixture.prepared.original_coords[0].axis_scales_to_original();
+        let (scale_x1, scale_y1) = fixture.prepared.original_coords[1].axis_scales_to_original();
         assert_eq!(
             cameras[0],
             reader::TestCamera {
@@ -1734,7 +1741,7 @@ mod tests {
                 model_id: 1,
                 width: 1024,
                 height: 768,
-                params: vec![50.0 * ratio0, 60.0 * ratio0, 512.0, 384.0],
+                params: vec![50.0 * scale_x0, 60.0 * scale_y0, 512.0, 384.0],
             }
         );
         assert_eq!(
@@ -1744,7 +1751,7 @@ mod tests {
                 model_id: 1,
                 width: 500,
                 height: 500,
-                params: vec![50.0 * ratio1, 60.0 * ratio1, 250.0, 250.0],
+                params: vec![50.0 * scale_x1, 60.0 * scale_y1, 250.0, 250.0],
             }
         );
 
@@ -2225,6 +2232,8 @@ mod tests {
                     offset_y: 0,
                     content_width: 4,
                     content_height: 4,
+                    crop_start_y: 0,
+                    resized_height: 4,
                     mode: VggtPreprocessMode::Crop,
                     square: None,
                 })
@@ -2329,6 +2338,8 @@ mod tests {
             offset_y: 0,
             content_width: width,
             content_height: height,
+            crop_start_y: 0,
+            resized_height: height,
             mode: VggtPreprocessMode::Square,
             square: Some(crate::preprocess::VggtSquareOriginalCoords {
                 x1,
@@ -2402,10 +2413,12 @@ mod tests {
         );
         assert_eq!(images[2].points2d[0].point3d_id, 1);
         // Masked-out tracks never appear in images.bin.
-        assert!(images.iter().all(|image| image
-            .points2d
-            .iter()
-            .all(|point| point.point3d_id != 4 && point.point3d_id != 5)));
+        assert!(images.iter().all(|image| {
+            image
+                .points2d
+                .iter()
+                .all(|point| point.point3d_id != 4 && point.point3d_id != 5)
+        }));
         assert_eq!(images[0].name, "image_1");
         assert_eq!(images[0].camera_id, 1);
 
@@ -2533,9 +2546,11 @@ mod tests {
             reader::parse_points3d(&fs::read(dir.join("points3D.bin")).expect("points3D.bin"));
         assert!(points[0].track.is_empty(), "gated point has an empty track");
         let images = reader::parse_images(&fs::read(dir.join("images.bin")).expect("images.bin"));
-        assert!(images
-            .iter()
-            .all(|image| image.points2d.iter().all(|point| point.point3d_id != 1)));
+        assert!(
+            images
+                .iter()
+                .all(|image| image.points2d.iter().all(|point| point.point3d_id != 1))
+        );
         let _ = fs::remove_dir_all(&dir);
 
         // Track-mode defaults match the official demo/builder arguments.
@@ -2633,6 +2648,86 @@ mod tests {
         assert_eq!(images[0].points2d[0].x, 512.0);
         assert_eq!(images[0].points2d[0].y, 512.0);
         assert_eq!(images[0].points2d[1].x, 768.0);
+        assert_eq!(images[0].points2d[1].y, 512.0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Crop-mode portrait track export: the synthetic 4x4 grid stands in for a
+    /// 518-pixel model window over a 768x1024 original with a 1-row crop start
+    /// (pre-crop resized height 6). Model pixel (2, 2) must map to original
+    /// (384, 512) with the corrected inverse
+    /// `x * 768/4`, `(y - 0 + 1) * 1024/6`; the old uniform-ratio /
+    /// subtract-the-crop formula gives a different, wrong point. The
+    /// SIMPLE_PINHOLE parameters use the same per-axis scales.
+    #[test]
+    fn vggt_track_colmap_crop_portrait_maps_to_original_resolution() {
+        let TrackFixture {
+            output,
+            mut prepared,
+        } = track_fixture();
+        prepared.original_coords = (0..3)
+            .map(|_| VggtOriginalCoords {
+                width: 768,
+                height: 1024,
+                offset_x: 0,
+                offset_y: 0,
+                content_width: 4,
+                content_height: 4,
+                crop_start_y: 1,
+                resized_height: 6,
+                mode: VggtPreprocessMode::Crop,
+                square: None,
+            })
+            .collect();
+
+        let points3d = vec![0.0f32, 0.0, 1.0, 0.1, 0.0, 1.0];
+        let points_rgb = vec![1u8, 2, 3, 4, 5, 6];
+        let mut tracks = vec![0.0f32; 3 * 2 * 2];
+        let visibility = vec![1.0f32; 3 * 2];
+        for frame in 0..3 {
+            tracks[(frame * 2) * 2] = 2.0;
+            tracks[(frame * 2) * 2 + 1] = 2.0;
+            tracks[(frame * 2 + 1) * 2] = 3.0;
+            tracks[(frame * 2 + 1) * 2 + 1] = 2.0;
+        }
+        let pack = VggtTrackPack {
+            points3d: &points3d,
+            points_rgb: &points_rgb,
+            tracks: &tracks,
+            visibility: &visibility,
+        };
+        let dir = temp_dir("track-crop-portrait");
+        let stats = write_track_colmap(
+            &dir,
+            &output,
+            &prepared,
+            &[],
+            &pack,
+            &VggtTrackColmapOptions {
+                min_inlier_per_frame: 1,
+                ..VggtTrackColmapOptions::default()
+            },
+        )
+        .expect("write crop portrait track colmap");
+        assert_eq!(stats.point3d_count, 2);
+        assert_eq!(stats.point2d_count, 6);
+
+        let cameras =
+            reader::parse_track_cameras(&fs::read(dir.join("cameras.bin")).expect("cameras.bin"));
+        assert_eq!(cameras.len(), 3);
+        // fx = 10 * 768/4 = 1920, fy = 10 * 1024/6, f = (fx + fy) / 2.
+        let fx = 10.0 * 768.0 / 4.0;
+        let fy = 10.0 * 1024.0 / 6.0;
+        assert!((cameras[0].params[0] - (fx + fy) / 2.0).abs() < 1e-9);
+        assert!((cameras[0].params[1] - 384.0).abs() < 1e-9);
+        assert!((cameras[0].params[2] - 512.0).abs() < 1e-9);
+        assert_eq!(cameras[0].width, 768);
+        assert_eq!(cameras[0].height, 1024);
+
+        let images = reader::parse_images(&fs::read(dir.join("images.bin")).expect("images.bin"));
+        assert_eq!(images[0].points2d[0].x, 384.0);
+        assert_eq!(images[0].points2d[0].y, 512.0);
+        assert_eq!(images[0].points2d[1].x, 576.0);
         assert_eq!(images[0].points2d[1].y, 512.0);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2907,9 +3002,11 @@ mod tests {
         assert_eq!(images.len(), prepared.original_coords.len());
         assert_eq!(points.len(), stats.point3d_count);
         assert!(points.iter().any(|point| point.track.len() >= 2));
-        assert!(cameras
-            .iter()
-            .all(|camera| camera.model_id == COLMAP_CAMERA_MODEL_SIMPLE_PINHOLE));
+        assert!(
+            cameras
+                .iter()
+                .all(|camera| camera.model_id == COLMAP_CAMERA_MODEL_SIMPLE_PINHOLE)
+        );
         eprintln!("[vg5-e2e] sparse model at {}", dir.display());
         // Leave the artifact in place for inspection; it is under the OS temp
         // directory, not the repository.

@@ -38,8 +38,12 @@
 //! The ranker needs `dinov2_vitb14_reg4_pretrain.pth` converted to
 //! `model.safetensors` (tensor names unchanged). The location is resolved in
 //! this order: [`VggtAutoQueryOptions::dino_weights`],
-//! `LUX3D_DINOV2_REG_MODEL_PATH`, `models/dinov2_reg4/model.safetensors`
-//! under the current directory, then the same path under the workspace root.
+//! `LUX3D_DINOV2_REG_MODEL_PATH` (or its `LUX3D_VGGT_DINO_WEIGHTS` alias),
+//! `models/dinov2_reg4/model.safetensors` under the current directory, then
+//! the same path under the workspace root. A set-but-invalid environment path
+//! is an error (it never silently falls back to another checkpoint), and
+//! [`VggtPipeline::run_with_auto_tracks`] resolves and loads the ranker before
+//! the expensive VGGT forward starts.
 //! The official torch.hub URL is
 //! `https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_reg4_pretrain.pth`
 //! (`_make_dinov2_model_name` + `_DINOV2_BASE_URL` in
@@ -53,12 +57,12 @@ use std::{
 #[cfg(test)]
 use std::collections::HashMap;
 
-use candle_core::{DType, Device, IndexOp, Module, Result as CandleResult, Tensor, D};
-use candle_nn::{layer_norm, ops::softmax, Conv2d, Conv2dConfig, LayerNorm, Linear, VarBuilder};
+use candle_core::{D, DType, Device, IndexOp, Module, Result as CandleResult, Tensor};
+use candle_nn::{Conv2d, Conv2dConfig, LayerNorm, Linear, VarBuilder, layer_norm, ops::softmax};
 
 use super::vggt_track::{VggtTrackHead, VggtTrackQuery, VggtTrackResult};
 use super::vision_preproc::{IMAGENET_MEAN, IMAGENET_STD};
-use crate::{error::Lux3dError, Result};
+use crate::{Result, error::Lux3dError};
 
 /// Official demo default `--query_frame_num` (`demo_colmap.py:54`).
 pub const DEFAULT_QUERY_FRAME_NUM: usize = 8;
@@ -83,6 +87,9 @@ const QUERY_CONF_MIN_POINTS: usize = 512;
 
 /// Environment variable overriding the DINOv2-reg safetensors path.
 pub const DINOV2_REG_WEIGHTS_ENV: &str = "LUX3D_DINOV2_REG_MODEL_PATH";
+/// Accepted alias for [`DINOV2_REG_WEIGHTS_ENV`]. Both names are validated
+/// strictly: a set-but-invalid path is an error, never a silent fallback.
+pub const DINOV2_REG_WEIGHTS_ENV_ALIAS: &str = "LUX3D_VGGT_DINO_WEIGHTS";
 /// Default location relative to the workspace root.
 pub const DINOV2_REG_DEFAULT_RELATIVE_PATH: &str = "models/dinov2_reg4/model.safetensors";
 
@@ -791,6 +798,12 @@ fn bicubic_antialias_resize(
 // ---------------------------------------------------------------------------
 
 /// Resolve the DINOv2-reg safetensors path (explicit, env, cwd, workspace).
+///
+/// If an environment variable is set but names no existing candidate, this
+/// returns [`Lux3dError::CanonicalWeightsValidation`] instead of falling
+/// through to the cwd/workspace defaults: an explicit local-weights
+/// misconfiguration must be reported, not silently replaced by a different
+/// checkpoint (or by "weights not found" only after the VGGT forward).
 pub fn resolve_dino_weights_path(explicit: Option<&Path>) -> Result<PathBuf> {
     let candidates = |path: PathBuf| -> Vec<PathBuf> {
         if path.is_dir() {
@@ -815,12 +828,24 @@ pub fn resolve_dino_weights_path(explicit: Option<&Path>) -> Result<PathBuf> {
             ),
         });
     }
-    if let Some(path) = std::env::var_os(DINOV2_REG_WEIGHTS_ENV) {
-        for candidate in candidates(PathBuf::from(path)) {
+    for variable in [DINOV2_REG_WEIGHTS_ENV, DINOV2_REG_WEIGHTS_ENV_ALIAS] {
+        let Some(value) = std::env::var_os(variable) else {
+            continue;
+        };
+        let path = PathBuf::from(value);
+        for candidate in candidates(path.clone()) {
             if candidate.is_file() {
                 return Ok(candidate);
             }
         }
+        return Err(Lux3dError::CanonicalWeightsValidation {
+            message: format!(
+                "VGGT auto query: {variable} points to {}, but it contains no readable \
+                 `model.safetensors` or `dinov2_vitb14_reg4_pretrain.safetensors`; fix the \
+                 path or unset {variable} (the resolver does not silently fall back)",
+                path.display()
+            ),
+        });
     }
     let mut candidates = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
@@ -845,6 +870,21 @@ pub fn resolve_dino_weights_path(explicit: Option<&Path>) -> Result<PathBuf> {
              `{DINOV2_REG_DEFAULT_RELATIVE_PATH}` (or set {DINOV2_REG_WEIGHTS_ENV})"
         ),
     })
+}
+
+/// Preflight DINOv2-reg weights for `--track-auto` before the VGGT forward.
+///
+/// Resolves the configured path (explicit option, environment, defaults),
+/// loads the ranker on `device`, and returns it for reuse by
+/// [`run_auto_tracking`]. A missing, unreadable, corrupt, or wrong-tensor-name
+/// checkpoint therefore fails before the aggregator/camera/depth/point forward
+/// instead of after it.
+pub(crate) fn preflight_dino_weights(
+    options: &VggtAutoQueryOptions,
+    device: &Device,
+) -> Result<Dinov2RegRanker> {
+    let path = resolve_dino_weights_path(options.dino_weights.as_deref())?;
+    Dinov2RegRanker::load(&path, device, DINO_IMAGE_SIZE)
 }
 
 /// DINOv2-reg CLS-token ranker.
@@ -1003,10 +1043,13 @@ fn conf_plane(conf: &Tensor, frame: usize) -> Result<Vec<Vec<f32>>> {
 ///
 /// `frames` is the `[1, S, 3, H, W]` normalized model input, `rgb_frames`
 /// the `[S, 3, H, W]` `[0, 1]` frames used by DINO, and `conf` the
-/// `[S, H, W]` depth-confidence map used by the query gate.
+/// `[S, H, W]` depth-confidence map used by the query gate. `ranker` is the
+/// preflighted DINOv2-reg ranker (loaded before the VGGT forward by
+/// [`preflight_dino_weights`]) and is reused here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_auto_tracking(
     track_head: &VggtTrackHead,
+    ranker: &Dinov2RegRanker,
     cached_layers: &[Tensor],
     frames: &Tensor,
     rgb_frames: &Tensor,
@@ -1014,7 +1057,6 @@ pub(crate) fn run_auto_tracking(
     patch_start_idx: usize,
     options: &VggtAutoQueryOptions,
     chunk_size: usize,
-    device: &Device,
 ) -> Result<VggtAutoTrackResult> {
     if options.query_frame_num == 0 {
         return Err(Lux3dError::InvalidInput(
@@ -1064,10 +1106,13 @@ pub(crate) fn run_auto_tracking(
         });
     }
 
-    let weights = resolve_dino_weights_path(options.dino_weights.as_deref())?;
-    let ranker = Dinov2RegRanker::load(&weights, device, DINO_IMAGE_SIZE)?;
     let ranked = ranker.rank_frames(rgb_frames, options.query_frame_num)?;
     let ranked_query_frames = order_query_frames(&ranked);
+
+    // The FPS spread over the model grid is deterministic and independent of
+    // the query frame; only the confidence gate below is per frame. Compute
+    // it once and reuse the pruned subsets.
+    let query_points_base = fps_query_points(height, width, options.max_query_pts);
 
     let mut coords = Vec::with_capacity(ranked_query_frames.len());
     let mut visibility = Vec::with_capacity(ranked_query_frames.len());
@@ -1079,10 +1124,9 @@ pub(crate) fn run_auto_tracking(
     let mut reorder_indices = Vec::with_capacity(ranked_query_frames.len());
 
     for query_frame in &ranked_query_frames {
-        let points = fps_query_points(height, width, options.max_query_pts);
         let conf = conf_plane(conf, *query_frame)?;
         let (points, pruned) = prune_query_points_by_confidence(
-            &points,
+            &query_points_base,
             &conf,
             width,
             QUERY_CONF_THRESHOLD,
@@ -1438,12 +1482,112 @@ mod tests {
         assert!(ranked.iter().all(|index| *index < 2));
     }
 
+    /// Serializes tests that mutate/read the DINO weight environment
+    /// variables (`std::env::set_var` is process-global).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A set-but-invalid environment path must be a hard error, never a silent
+    /// fallback to the cwd/workspace defaults (or to the other env alias).
     #[test]
-    fn dinov2_reg_matches_torch_reference_when_weights_are_local() {
-        let Ok(path) = resolve_dino_weights_path(None) else {
-            eprintln!("skipping DINOv2-reg reference test: local weights not found");
-            return;
+    fn invalid_dino_weights_env_path_is_an_error() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let saved = [DINOV2_REG_WEIGHTS_ENV, DINOV2_REG_WEIGHTS_ENV_ALIAS]
+            .map(|name| (name, std::env::var_os(name)));
+        for (name, _) in &saved {
+            // Safety: all tests in this module that touch these variables hold
+            // ENV_LOCK, so no concurrent reader observes the temporary state.
+            unsafe { std::env::remove_var(*name) };
+        }
+        let missing = std::env::temp_dir().join(format!(
+            "lux3d-missing-dino-weights-{}-{}.safetensors",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        unsafe { std::env::set_var(DINOV2_REG_WEIGHTS_ENV_ALIAS, &missing) };
+        let result = resolve_dino_weights_path(None);
+        for (name, value) in saved {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        let error = result
+            .expect_err("an invalid env DINO weights path must not fall back")
+            .to_string();
+        assert!(
+            error.contains(DINOV2_REG_WEIGHTS_ENV_ALIAS),
+            "error must name the offending env variable: {error}"
+        );
+        assert!(
+            error.contains("does not silently fall back"),
+            "error must explain the strict behavior: {error}"
+        );
+    }
+
+    /// Preflight rejects a missing explicit path and a corrupt safetensors
+    /// file before the VGGT forward is reached.
+    #[test]
+    fn preflight_rejects_missing_or_corrupt_dino_weights() {
+        let missing = std::env::temp_dir().join(format!(
+            "lux3d-missing-preflight-dino-{}-{}.safetensors",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let options = VggtAutoQueryOptions {
+            dino_weights: Some(missing.clone()),
+            ..VggtAutoQueryOptions::default()
         };
+        let error = preflight_dino_weights(&options, &Device::Cpu)
+            .expect_err("missing explicit weights must fail preflight")
+            .to_string();
+        assert!(
+            error.contains("DINOv2-reg weights not found"),
+            "unexpected missing-weights error: {error}"
+        );
+
+        let corrupt = std::env::temp_dir().join(format!(
+            "lux3d-corrupt-preflight-dino-{}-{}.safetensors",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::write(&corrupt, b"not a safetensors archive").expect("write corrupt fixture");
+        let options = VggtAutoQueryOptions {
+            dino_weights: Some(corrupt.clone()),
+            ..VggtAutoQueryOptions::default()
+        };
+        let error = preflight_dino_weights(&options, &Device::Cpu)
+            .expect_err("corrupt weights must fail preflight")
+            .to_string();
+        let _ = std::fs::remove_file(&corrupt);
+        assert!(
+            error.contains("failed to load DINOv2-reg weights"),
+            "unexpected corrupt-weights error: {error}"
+        );
+    }
+
+    /// Numeric parity against the recorded PyTorch reference. Ignored by
+    /// default because it needs the local DINOv2-reg safetensors; when run
+    /// explicitly (`--ignored`) absent weights are a hard failure, never a
+    /// silent pass.
+    #[test]
+    #[ignore = "requires local DINOv2-reg safetensors (models/dinov2_reg4/model.safetensors or LUX3D_DINOV2_REG_MODEL_PATH); run explicitly with --ignored"]
+    fn dinov2_reg_matches_torch_reference_when_weights_are_local() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let path = resolve_dino_weights_path(None).expect(
+            "this ignored parity test requires local DINOv2-reg weights; set \
+             LUX3D_DINOV2_REG_MODEL_PATH or place models/dinov2_reg4/model.safetensors",
+        );
         let device = Device::Cpu;
         let ranker = Dinov2RegRanker::load(&path, &device, 336).expect("ranker");
         // Deterministic image used by the Python reference dump:

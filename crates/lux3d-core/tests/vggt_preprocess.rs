@@ -131,12 +131,16 @@ fn target_size_for_matches_reference_pre_crop_formula() {
         SpatialSize::new(518, 252)
     );
 
-    assert!(stage
-        .target_size_for(SpatialSize::new(0, 512), 518)
-        .is_err());
-    assert!(stage
-        .target_size_for(SpatialSize::new(512, 512), 0)
-        .is_err());
+    assert!(
+        stage
+            .target_size_for(SpatialSize::new(0, 512), 518)
+            .is_err()
+    );
+    assert!(
+        stage
+            .target_size_for(SpatialSize::new(512, 512), 0)
+            .is_err()
+    );
 }
 
 #[test]
@@ -154,9 +158,11 @@ fn preprocess_stage_fills_vggt_prepared_batch() {
     assert_eq!(batch.interval, 2);
     assert_eq!(batch.pixel_range, RgbRange::ZeroToOne);
 
-    assert!(stage
-        .preprocess(VggtRawInput::directory(5, 512, 512, 0))
-        .is_err());
+    assert!(
+        stage
+            .preprocess(VggtRawInput::directory(5, 512, 512, 0))
+            .is_err()
+    );
 }
 
 fn normalize_rgb(rgb: [f32; 3]) -> [f32; 3] {
@@ -376,6 +382,8 @@ fn pad_mode_landscape_matches_reference_recipe_and_crop_content() {
             offset_y: 63,
             content_width: 518,
             content_height: 392,
+            crop_start_y: 0,
+            resized_height: 392,
             mode: VggtPreprocessMode::Pad,
             square: None,
         }
@@ -452,6 +460,8 @@ fn pad_mode_composites_alpha_and_rounds_shorter_side() {
             offset_y: 133,
             content_width: 518,
             content_height: 252,
+            crop_start_y: 0,
+            resized_height: 252,
             mode: VggtPreprocessMode::Pad,
             square: None,
         }
@@ -515,6 +525,8 @@ fn single_image_file_is_accepted_directly() {
             offset_y: 63,
             content_width: 518,
             content_height: 392,
+            crop_start_y: 0,
+            resized_height: 392,
             mode: VggtPreprocessMode::Pad,
             square: None,
         }

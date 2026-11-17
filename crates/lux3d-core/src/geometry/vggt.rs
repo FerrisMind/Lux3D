@@ -1,11 +1,11 @@
-use candle_core::{DType, Device, IndexOp, Tensor, D};
+use candle_core::{D, DType, Device, IndexOp, Tensor};
 
 use crate::{
+    Result,
     contracts::{GeometryStage, ModelFamily, VggtPointCloud, VggtSceneCode},
     error::Lux3dError,
     preprocess::{VggtOriginalCoords, VggtPreprocessMode},
     runtime::VggtInferenceOutput,
-    Result,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -133,17 +133,28 @@ fn squeeze_leading_batch(tensor: &Tensor) -> candle_core::Result<Tensor> {
 /// intrinsics from the reconstruction (prepared-frame) pixel space back to the
 /// original image resolution.
 ///
-/// * Crop mode (upstream, bit-identical): `resize_ratio =
-///   max(real_w, real_h) / img_size`, all nine intrinsic entries are
-///   multiplied by the ratio, the principal point is replaced by the original
+/// * Crop mode (exact per-axis inverse of the `load_fn.py:162-175` recipe):
+///   row 0 is scaled by `real_w / 518` and row 1 by
+///   `real_h / resized_height`, where `resized_height` is the height of the
+///   `/14`-rounded resized image *before* the center crop (686 for a
+///   768x1024 portrait frame). The principal point is replaced by the original
 ///   image centre `(real_w / 2, real_h / 2)` and the homogeneous row is
-///   restored to `[0, 0, 1]`. `img_size` is the reconstruction resolution (the
-///   maximum prepared width/height).
-/// * Pad mode (exact per-axis): row 0 is scaled by `real_w / content_w` and
-///   row 1 by `real_h / content_h` (the actual resize factors — pad mode
-///   preserves the aspect ratio, so they differ only by the `/14` rounding of
-///   the shorter side); the principal point and homogeneous row follow the
-///   reference replacement.
+///   restored to `[0, 0, 1]`. Derivation: preprocessing resizes the original
+///   to `518 x resized_height` (`new_width = 518`,
+///   `new_height = round(h * 518 / w / 14) * 14`), keeps rows
+///   `[crop_start_y, crop_start_y + 518)`, then adds the batch white pad; the
+///   inverse pixel transform is `x_orig = (x_p - pad_x) * w / 518` and
+///   `y_orig = (y_p - pad_y + crop_start_y) * h / resized_height`, and the
+///   camera matrix must transform camera-normalized coordinates with that same
+///   per-axis scale (`fx' = fx * w / 518`, `fy' = fy * h / resized_height`).
+///   For frames whose resized height was not cropped this reduces to
+///   `h / content_height`; the two differ only when a portrait frame was
+///   height-cropped.
+/// * Pad mode (exact per-axis, unchanged): row 0 is scaled by
+///   `real_w / content_w` and row 1 by `real_h / content_h` (the actual resize
+///   factors — pad mode preserves the aspect ratio, so they differ only by the
+///   `/14` rounding of the shorter side); the principal point and homogeneous
+///   row follow the reference replacement.
 /// * Square mode (official COLMAP chain): model-input intrinsics (518 space)
 ///   are first rescaled by `load_size / model_size` (the official
 ///   `intrinsic[:, :2, :] *= 1024 / 518` step, `demo_colmap.py:168-169`) and
@@ -190,17 +201,12 @@ fn rescale_intrinsics_to_original_inner(
         .zip(original_coords)
         .map(|(values, coords)| -> candle_core::Result<[[f64; 3]; 3]> {
             let mut k = match coords.mode {
-                VggtPreprocessMode::Crop => {
-                    let ratio = coords.resize_ratio(img_size);
-                    [
-                        [values[0] * ratio, values[1] * ratio, values[2] * ratio],
-                        [values[3] * ratio, values[4] * ratio, values[5] * ratio],
-                        [values[6] * ratio, values[7] * ratio, values[8] * ratio],
-                    ]
-                }
-                // Pad mode: exact per-axis scales. Row 0 is the u axis, row 1
-                // the v axis; the principal point is replaced below anyway.
-                VggtPreprocessMode::Pad => {
+                // Crop and pad both use the exact per-axis inverse scales.
+                // Crop's scale_y denominator is the pre-crop `resized_height`
+                // (a height-cropped portrait frame must not scale by the
+                // 518-row window); pad has no crop, so its resized height is
+                // `content_height`.
+                VggtPreprocessMode::Crop | VggtPreprocessMode::Pad => {
                     let (scale_x, scale_y) = coords.axis_scales_to_original();
                     [
                         [
@@ -255,8 +261,12 @@ fn rescale_intrinsics_to_original_inner(
 /// the content top-left offset and scale it back to the original image,
 /// mapping a prepared-frame pixel to the original image.
 ///
-/// * Crop mode (upstream, bit-identical): uniform ratio
-///   `max(real_w, real_h) / img_size` on both axes.
+/// * Crop mode (exact inverse of the `load_fn.py:162-175` recipe):
+///   `x_orig = (x - offset_x) * real_w / content_w` and
+///   `y_orig = (y - offset_y + crop_start_y) * real_h / resized_height`.
+///   `offset_y` is only the batch white-pad offset; the upstream row crop
+///   `crop_start_y` is added back (subtracting it, or folding it into
+///   `offset_y`, mirrors the portrait-frame sign error this formula fixes).
 /// * Pad mode (exact per-axis): `(x - offset_x) * real_w / content_w`,
 ///   `(y - offset_y) * real_h / content_h`.
 /// * Square mode (official COLMAP chain): the model-input pixel is first
@@ -273,8 +283,11 @@ pub fn shift_point2d_to_original(
     let (top_left_x, top_left_y) = coords.top_left();
     match coords.mode {
         VggtPreprocessMode::Crop => {
-            let ratio = coords.resize_ratio(img_size);
-            ((x - top_left_x) * ratio, (y - top_left_y) * ratio)
+            let (scale_x, scale_y) = coords.axis_scales_to_original();
+            (
+                (x - top_left_x) * scale_x,
+                (y - f64::from(coords.offset_y) + f64::from(coords.crop_start_y)) * scale_y,
+            )
         }
         VggtPreprocessMode::Pad => {
             let (scale_x, scale_y) = coords.axis_scales_to_original();
@@ -290,7 +303,7 @@ pub fn shift_point2d_to_original(
                 )
             } else {
                 // Hand-built coords without the official payload: fall back to
-                // the crop-formula mapping (preprocessing always fills it).
+                // the reference-style shift (preprocessing always fills it).
                 let ratio = coords.resize_ratio(img_size);
                 ((x - top_left_x) * ratio, (y - top_left_y) * ratio)
             }
@@ -568,19 +581,25 @@ mod geometry_tests {
         assert!((actual[2] - (-1.0)).abs() < 1e-6);
     }
 
-    /// Task-parity unit test: 518x518 prepared frame, original 1024x768
-    /// (ratio 1024/518 analog via img_size), non-zero crop offset.
+    /// Crop-mode inverse mapping for a landscape frame whose resized height
+    /// was not cropped: 1024x768 -> 518x392, then the single-frame batch is
+    /// white-padded to 518 rows (`offset_y = 63`). The exact inverse of
+    /// `load_fn.py:162-175` is per-axis (`x * 1024/518`,
+    /// `(y - 63) * 768/392`), and the intrinsics use the same per-axis scales
+    /// with the principal point replaced by the original centre.
     #[test]
-    fn rescale_intrinsics_and_shift_point2d_follow_reference_formula() {
+    fn rescale_intrinsics_and_shift_point2d_follow_crop_reference_formula() {
         let device = Device::Cpu;
         let img_size = 518.0f64;
         let coords = VggtOriginalCoords {
             width: 1024,
             height: 768,
-            offset_x: 12,
+            offset_x: 0,
             offset_y: 63,
             content_width: 518,
             content_height: 392,
+            crop_start_y: 0,
+            resized_height: 392,
             mode: VggtPreprocessMode::Crop,
             square: None,
         };
@@ -598,23 +617,92 @@ mod geometry_tests {
         let rescaled =
             rescale_intrinsics_to_original(&intrinsics, &[coords], img_size).expect("rescale");
         assert_eq!(rescaled.len(), 1);
-        let ratio = 1024.0f64 / 518.0;
+        let scale_x = 1024.0f64 / 518.0;
+        let scale_y = 768.0f64 / 392.0;
         let k = rescaled[0];
-        assert!((k[0][0] - 361.0 * ratio).abs() < 1e-9);
-        assert!((k[1][1] - 361.0 * ratio).abs() < 1e-9);
+        assert!((k[0][0] - 361.0 * scale_x).abs() < 1e-9);
+        assert!((k[1][1] - 361.0 * scale_y).abs() < 1e-9);
         assert!((k[0][2] - 512.0).abs() < 1e-9, "cx must be real_w / 2");
         assert!((k[1][2] - 384.0).abs() < 1e-9, "cy must be real_h / 2");
         assert_eq!(k[2], [0.0, 0.0, 1.0]);
 
-        // Point2D shift: (xy - top_left) * resize_ratio.
+        // Point2D shift: `(x - offset_x) * scale_x`,
+        // `(y - batch_pad_y + crop_start_y) * scale_y` (crop_start_y = 0).
         let (sx, sy) = shift_point2d_to_original(270.0, 300.0, &coords, img_size);
-        assert!((sx - (270.0 - 12.0) * ratio).abs() < 1e-9);
-        assert!((sy - (300.0 - 63.0) * ratio).abs() < 1e-9);
+        assert!((sx - 270.0 * scale_x).abs() < 1e-9);
+        assert!((sy - (300.0 - 63.0) * scale_y).abs() < 1e-9);
+    }
+
+    /// Portrait 768x1024 crop regression: the official recipe resizes to
+    /// 518x686 (`round(1024 * 518 / 768 / 14) * 14 = 686`) and keeps rows
+    /// `[84, 84 + 518)`. The prepared centre (259, 259) is therefore resized
+    /// row 343 and must map to original (384, 512); the old uniform-ratio,
+    /// subtract-the-crop formula produced (512, 346). Verifies an off-centre
+    /// pixel and the intrinsics with the same per-axis scales.
+    #[test]
+    fn portrait_crop_maps_center_and_off_center_to_original_resolution() {
+        let device = Device::Cpu;
+        let coords = VggtOriginalCoords {
+            width: 768,
+            height: 1024,
+            offset_x: 0,
+            offset_y: 0,
+            content_width: 518,
+            content_height: 518,
+            crop_start_y: 84,
+            resized_height: 686,
+            mode: VggtPreprocessMode::Crop,
+            square: None,
+        };
+        let scale_x = 768.0f64 / 518.0;
+        let scale_y = 1024.0f64 / 686.0;
+        // The resized image is 518x686, so the prepared-frame centre is
+        // resized pixel (259, 259 + 84) = (259, 343) -> (384, 512).
+        assert_eq!(coords.axis_scales_to_original(), (scale_x, scale_y));
+        let (sx, sy) = shift_point2d_to_original(259.0, 259.0, &coords, 518.0);
+        assert!((sx - 384.0).abs() < 1e-9, "portrait centre x: {sx}");
+        assert!((sy - 512.0).abs() < 1e-9, "portrait centre y: {sy}");
+        // Off-centre pixel (100, 300) -> resized row 384.
+        let (ox, oy) = shift_point2d_to_original(100.0, 300.0, &coords, 518.0);
+        assert!((ox - 100.0 * scale_x).abs() < 1e-9, "off-centre x: {ox}");
+        assert!(
+            (oy - 384.0 * scale_y).abs() < 1e-9,
+            "off-centre y must add crop_start_y: {oy}"
+        );
+
+        // Intrinsics use the same per-axis factors; the principal point is
+        // the original image centre.
+        let intrinsics = Tensor::from_vec(
+            vec![
+                361.0f32, 0.0, 259.0, //
+                0.0, 361.0, 259.0, //
+                0.0, 0.0, 1.0,
+            ],
+            (1, 1, 3, 3),
+            &device,
+        )
+        .expect("intrinsics");
+        let rescaled =
+            rescale_intrinsics_to_original(&intrinsics, &[coords], 518.0).expect("rescale");
+        let k = rescaled[0];
+        assert!(
+            (k[0][0] - 361.0 * scale_x).abs() < 1e-9,
+            "fx must scale by width / 518: {}",
+            k[0][0]
+        );
+        assert!(
+            (k[1][1] - 361.0 * scale_y).abs() < 1e-9,
+            "fy must scale by height / resized_height: {}",
+            k[1][1]
+        );
+        assert!((k[0][2] - 384.0).abs() < 1e-9, "cx must be real_w / 2");
+        assert!((k[1][2] - 512.0).abs() < 1e-9, "cy must be real_h / 2");
+        assert_eq!(k[2], [0.0, 0.0, 1.0]);
     }
 
     /// Pad mode uses the exact per-axis scales (`real / content`) instead of
-    /// the crop-mode uniform ratio; the principal point still moves to the
-    /// original image centre.
+    /// any uniform ratio; the principal point still moves to the original
+    /// image centre.
     #[test]
     fn rescale_intrinsics_and_shift_point2d_use_per_axis_scales_in_pad_mode() {
         let device = Device::Cpu;
@@ -626,6 +714,8 @@ mod geometry_tests {
             offset_y: 63,
             content_width: 518,
             content_height: 392,
+            crop_start_y: 0,
+            resized_height: 392,
             mode: VggtPreprocessMode::Pad,
             square: None,
         };
@@ -689,6 +779,8 @@ mod geometry_tests {
             offset_y: 0,
             content_width: 518,
             content_height: 518,
+            crop_start_y: 0,
+            resized_height: 518,
             mode: VggtPreprocessMode::Square,
             square: Some(square),
         };
@@ -757,6 +849,8 @@ mod geometry_tests {
             offset_y: 0,
             content_width: 518,
             content_height: 518,
+            crop_start_y: 0,
+            resized_height: 518,
             mode: VggtPreprocessMode::Square,
             square: Some(square),
         };

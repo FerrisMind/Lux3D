@@ -41,28 +41,28 @@ use std::{path::Path, sync::Arc};
 
 use super::nn_blocks::Linear;
 use crate::weights::VarBuilder;
-use candle_core::{DType, Device, IndexOp, Module, Result as CandleResult, Tensor, D};
-use candle_nn::{layer_norm, LayerNorm};
+use candle_core::{D, DType, Device, IndexOp, Module, Result as CandleResult, Tensor};
+use candle_nn::{LayerNorm, layer_norm};
 
 use super::{
     attention_math::{
-        apply_layernorm_rope, apply_rope, exact_query_chunked_sdpa, position_getter, Rope2d,
-        RopeEmbeddings,
+        Rope2d, RopeEmbeddings, apply_layernorm_rope, apply_rope, exact_query_chunked_sdpa,
+        position_getter,
     },
-    nn_blocks::{linear, linear_fwd, LayerScale, Mlp},
+    nn_blocks::{LayerScale, Mlp, linear, linear_fwd},
     vggt_auto_query::{VggtAutoQueryOptions, VggtAutoTrackResult},
     vggt_dpt::{VggtDptActivation, VggtDptHead},
-    vggt_track::{VggtTrackHead, VggtTrackQuery, VggtTrackResult, TRACK_DEFAULT_ITERS},
+    vggt_track::{TRACK_DEFAULT_ITERS, VggtTrackHead, VggtTrackQuery, VggtTrackResult},
 };
 use crate::{
+    CanonicalWeightSetPaths, ModelAssetOptions, ModelFamily, Result,
     error::Lux3dError,
     export::{PointCloudFormat, VggtExportStage},
     geometry::VggtGeometryStage,
     load_canonical_weights,
     neural::VggtNeuralStage,
     preprocess::VggtPreprocessStage,
-    runtime::{pi3_encoder::load_pi3_encoder, pi3_encoder::Pi3DinoEncoder, DeviceLocalCache},
-    CanonicalWeightSetPaths, ModelAssetOptions, ModelFamily, Result,
+    runtime::{DeviceLocalCache, pi3_encoder::Pi3DinoEncoder, pi3_encoder::load_pi3_encoder},
 };
 
 pub use crate::preprocess::VggtPreparedInputs;
@@ -143,9 +143,11 @@ enum VggtTrackPlan<'a> {
         iters: usize,
     },
     /// Stage-A automatic query selection (DINO frame ranking + FPS points +
-    /// confidence gate), tracking once per ranked query frame.
+    /// confidence gate), tracking once per ranked query frame. The ranker is
+    /// preflighted before the shared forward so its weights fail fast.
     Auto {
         options: &'a VggtAutoQueryOptions,
+        ranker: &'a super::vggt_auto_query::Dinov2RegRanker,
     },
 }
 
@@ -1090,8 +1092,24 @@ impl VggtPipeline {
                 "`--track-iters` must be at least 1",
             ));
         }
-        let (output, _, track) =
-            self.run_forward_inner(prepared, false, VggtTrackPlan::Auto { options })?;
+        // Preflight (resolve + load) the DINOv2-reg ranker before the
+        // aggregator/heads touch the (much larger) VGGT weights or run any
+        // forward pass. This turns a set-but-invalid
+        // `LUX3D_DINOV2_REG_MODEL_PATH` / `LUX3D_VGGT_DINO_WEIGHTS`, a missing
+        // file, or a corrupt/wrong checkpoint into a clear early error instead
+        // of a late failure or a silent fallback to different weights.
+        let ranker = super::vggt_auto_query::preflight_dino_weights(
+            options,
+            prepared.normalized_frames.device(),
+        )?;
+        let (output, _, track) = self.run_forward_inner(
+            prepared,
+            false,
+            VggtTrackPlan::Auto {
+                options,
+                ranker: &ranker,
+            },
+        )?;
         match track {
             Some(VggtTrackRun::Auto(track)) => Ok((output, track)),
             _ => Err(Lux3dError::CanonicalWeightsValidation {
@@ -1272,7 +1290,7 @@ impl VggtPipeline {
                     chunk_size,
                 )?))
             }
-            VggtTrackPlan::Auto { options } => {
+            VggtTrackPlan::Auto { options, ranker } => {
                 let track_head = self.track_head_for(&device)?;
                 // `depth_conf` is `[1, S, H, W]`; the confidence gate samples
                 // the query frame's `[H, W]` plane.
@@ -1280,6 +1298,7 @@ impl VggtPipeline {
                 Some(VggtTrackRun::Auto(
                     super::vggt_auto_query::run_auto_tracking(
                         &track_head,
+                        ranker,
                         &cached_layers,
                         &normalized_frames,
                         &prepared.rgb_frames,
@@ -1287,7 +1306,6 @@ impl VggtPipeline {
                         VGGT_PATCH_START_IDX,
                         options,
                         chunk_size,
-                        &device,
                     )?,
                 ))
             }
@@ -1893,6 +1911,8 @@ mod tests {
                     offset_y: 63,
                     content_width: 518,
                     content_height: 392,
+                    crop_start_y: 0,
+                    resized_height: 392,
                     mode: VggtPreprocessMode::Pad,
                     square: None,
                 })

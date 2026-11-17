@@ -30,16 +30,29 @@
 //!
 //! # Original-coordinate mapping
 //!
-//! Upstream `mode="pad"` does not return original coordinates, so this module
-//! defines the mapping itself (see [`VggtOriginalCoords`]): the resized
-//! original content occupies the centered `content_width x content_height`
-//! rectangle inside the prepared 518x518 frame, and per-axis scales follow the
-//! actual resize factors. Crop mode keeps the upstream uniform
-//! `max(w, h) / img_size` ratio in [`crate::geometry`] helpers for bit-parity.
-//! Square mode uses the official 1024-loaded tuple: model pixels are first
-//! rescaled by `load_size / model_size` (the official `1024 / 518` step) and
-//! the loaded-space tuple then feeds the stock
-//! `max(w, h) / load_size` ratio and `(xy - x1, y1)` shift.
+//! Upstream crop/pad modes do not return original coordinates, so this module
+//! defines the mapping itself (see [`VggtOriginalCoords`]) as the exact inverse
+//! of the preprocessing arithmetic:
+//!
+//! * Crop: the resized image is `518 x resized_height` (height rounded to a
+//!   multiple of 14, `load_fn.py:162-166`) and its rows
+//!   `[crop_start_y, crop_start_y + content_height)` are kept
+//!   (`load_fn.py:172-175`), then centered white-padded to the batch maximum.
+//!   A prepared pixel therefore maps back with
+//!   `x_orig = (x_p - pad_x) * width / 518` and
+//!   `y_orig = (y_p - pad_y + crop_start_y) * height / resized_height`.
+//!   `crop_start_y` and the batch white-pad offset are stored separately
+//!   ([`VggtOriginalCoords::crop_start_y`] vs
+//!   [`VggtOriginalCoords::offset_y`]) so a height crop is never mistaken for
+//!   padding.
+//! * Pad: the resized content occupies the centered
+//!   `content_width x content_height` rectangle inside the prepared 518x518
+//!   frame, and per-axis scales are `width / content_width` and
+//!   `height / content_height`.
+//! * Square: the official 1024-loaded tuple; model pixels are first rescaled
+//!   by `load_size / model_size` (the official `1024 / 518` step) and the
+//!   loaded-space tuple then feeds the stock `max(w, h) / load_size` ratio and
+//!   `(xy - x1, y1)` shift.
 //!
 //! # Sources
 //!
@@ -63,11 +76,11 @@ use candle_core::{Device, Tensor};
 use image::{Rgb, RgbImage};
 
 use crate::{
+    Result,
     contracts::{
         ModelFamily, PreprocessStage, RgbRange, SpatialSize, VggtPreparedBatch, VggtRawInput,
     },
     error::Lux3dError,
-    Result,
 };
 
 const TARGET_WIDTH: u32 = 518;
@@ -179,49 +192,64 @@ impl VggtSquareOriginalCoords {
 }
 
 /// Per-frame mapping from the prepared (padded) VGGT frame back to the original
-/// image, for both preprocess modes (see [`VggtPreprocessMode`]).
+/// image, for every preprocess mode (see [`VggtPreprocessMode`]).
 ///
-/// The resized original content occupies the rectangle
-/// `[offset_x, offset_x + content_width) x [offset_y, offset_y + content_height)`
-/// inside the prepared frame. A prepared-frame pixel `(x_p, y_p)` inside the
-/// content rectangle maps back to the original pixel `(u, v)` with
-/// `u = (x_p - offset_x) * width / content_width` and
-/// `v = (y_p - offset_y) * height / content_height` (exact for
-/// [`VggtPreprocessMode::Pad`], and for crop frames whose height was not
-/// center-cropped).
+/// The resized original image is located relative to the prepared frame as
+/// follows:
 ///
-/// The reference COLMAP rescale instead uses the uniform ratio
-/// `max(width, height) / reconstruction_size` (see
-/// `rename_colmap_recons_and_rescale_camera`); both mappings are exposed —
-/// [`VggtOriginalCoords::resize_ratio`] stays the crop-formula compatibility
-/// helper, while [`VggtOriginalCoords::axis_scales_to_original`] gives the
-/// exact per-axis factors and matches what the crop recipe actually does per
-/// axis.
+/// * Crop: the kept content rectangle is
+///   `[offset_x, offset_x + content_width) x [offset_y, offset_y + content_height)`,
+///   where `offset_y` is *only* the batch white-pad offset. The upstream crop
+///   start [`Self::crop_start_y`] is stored separately; the resized image's
+///   row 0 sits at prepared row `offset_y - crop_start_y` (negative, i.e.
+///   above the frame, for height-cropped frames). A prepared pixel maps back
+///   with `u = (x_p - offset_x) * width / content_width` and
+///   `v = (y_p - offset_y + crop_start_y) * height / resized_height`.
+/// * Pad: the resized content occupies the centered
+///   `[offset_x, offset_x + content_width) x [offset_y, offset_y + content_height)`
+///   rectangle and maps with `u = (x_p - offset_x) * width / content_width`,
+///   `v = (y_p - offset_y) * height / content_height`. No cropping ever
+///   happens, so `crop_start_y == 0` and `resized_height == content_height`.
+/// * Square: the official loaded-space `[x1, y1, x2, y2, width, height]` tuple
+///   (`self.square`) drives the mapping.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VggtOriginalCoords {
     /// Original image width in pixels.
     pub width: u32,
     /// Original image height in pixels.
     pub height: u32,
-    /// Left edge of the resized original content inside the prepared frame.
-    /// Non-zero only when white padding was applied (pad mode, or crop mode
-    /// batch padding for narrower frames).
+    /// Left edge of the kept resized content inside the prepared frame
+    /// (batch white pad; zero for crop/square, the centered white pad for pad
+    /// mode).
     pub offset_x: u32,
-    /// Top edge of the resized original content inside the prepared frame.
-    /// Combines the height center-crop offset (`start_y`) and the white pad.
+    /// Top edge of the kept resized content inside the prepared frame. This is
+    /// *only* the batch white-pad offset (`max_height - content_height) / 2`,
+    /// or the centered white pad for pad mode; the crop-mode row crop is
+    /// recorded separately in [`Self::crop_start_y`] and must not be conflated
+    /// with padding.
     pub offset_y: u32,
     /// Width of the resized original content in prepared-frame pixels
     /// (`target_width` in crop mode; the `/14`-rounded resized width in pad
     /// mode).
     pub content_width: u32,
-    /// Height of the resized original content in prepared-frame pixels (the
-    /// crop-mode frame height before batch padding; the `/14`-rounded resized
-    /// height in pad mode).
+    /// Height of the kept resized content in prepared-frame pixels (the
+    /// crop-mode `target_width`-row window; the `/14`-rounded resized height in
+    /// pad mode).
     pub content_height: u32,
+    /// Crop-mode start row `start_y` of the kept window inside the resized
+    /// image: `(resized_height - content_height) // 2` when the resized height
+    /// exceeds the target (`load_fn.py:174`), otherwise 0. Zero for pad and
+    /// square modes.
+    pub crop_start_y: u32,
+    /// Height of the resized original image *before* the crop-mode row crop:
+    /// `round(height * 518 / width / 14) * 14` (`load_fn.py:166`). Equals
+    /// `content_height` for pad and square modes (no crop). This is the
+    /// vertical inverse-scale denominator, so it must not be replaced by the
+    /// cropped `content_height`.
+    pub resized_height: u32,
     /// Preprocess mode that produced this frame. The upstream pad recipe does
     /// not report original coordinates, so this discriminator lets the
-    /// geometry helpers pick the exact per-axis mapping (pad) or the reference
-    /// uniform ratio (crop).
+    /// geometry helpers pick the exact mapping of each mode.
     pub mode: VggtPreprocessMode,
     /// Official square-mode `[x1, y1, x2, y2, width, height]` payload; `Some`
     /// exactly when `mode == VggtPreprocessMode::Square` (see
@@ -233,9 +261,10 @@ impl VggtOriginalCoords {
     /// Reference `rename_colmap_recons_and_rescale_camera` ratio:
     /// `max(real_width, real_height) / img_size`.
     ///
-    /// This is the *crop-formula* compatibility helper: upstream applies it to
-    /// both axes even in crop mode where the vertical scale actually differs.
-    /// For the exact per-axis factors use [`VggtOriginalCoords::axis_scales_to_original`].
+    /// This is the official square-path ratio. Crop/pad mapping no longer uses
+    /// it: crop has per-axis scales (`width / 518`,
+    /// `height / resized_height`) and pad uses `width / content_width`,
+    /// `height / content_height` (see [`Self::axis_scales_to_original`]).
     /// Square mode returns the official loaded-space ratio
     /// `max(width, height) / load_size` (the caller's `img_size` is the model
     /// input size, which the square helpers bridge with
@@ -250,16 +279,18 @@ impl VggtOriginalCoords {
         f64::from(self.width.max(self.height)) / img_size
     }
 
-    /// Exact per-axis prepared→original scale factors
-    /// `(width / content_width, height / content_height)`.
+    /// Exact per-axis prepared→original scale factors `(scale_x, scale_y)`.
     ///
-    /// Exact for pad mode (no cropping ever happens) and for crop frames whose
-    /// resized height was not center-cropped; crop frames with a height crop
-    /// keep the uniform reference ratio instead (see [`Self::resize_ratio`]).
-    /// Square mode returns the loaded-space factors
-    /// `width / (x2 - x1), height / (y2 - y1)`.
-    /// A degenerate zero content dimension yields `0.0` on that axis rather
-    /// than a division by zero.
+    /// * Crop: `width / content_width` (= `width / 518`) and
+    ///   `height / resized_height` (the pre-crop resized height, so a
+    ///   height-cropped portrait frame scales by `height / 686`, not by
+    ///   `height / 518`).
+    /// * Pad: `width / content_width`, `height / content_height`.
+    /// * Square: the loaded-space factors `width / (x2 - x1)`,
+    ///   `height / (y2 - y1)`.
+    ///
+    /// A degenerate zero denominator yields `0.0` on that axis rather than a
+    /// division by zero.
     pub fn axis_scales_to_original(&self) -> (f64, f64) {
         if let (VggtPreprocessMode::Square, Some(square)) = (self.mode, self.square.as_ref()) {
             return square.axis_scales_to_original();
@@ -269,15 +300,23 @@ impl VggtOriginalCoords {
         } else {
             f64::from(self.width) / f64::from(self.content_width)
         };
-        let scale_y = if self.content_height == 0 {
+        let source_height = match self.mode {
+            VggtPreprocessMode::Crop => self.resized_height,
+            VggtPreprocessMode::Pad | VggtPreprocessMode::Square => self.content_height,
+        };
+        let scale_y = if source_height == 0 {
             0.0
         } else {
-            f64::from(self.height) / f64::from(self.content_height)
+            f64::from(self.height) / f64::from(source_height)
         };
         (scale_x, scale_y)
     }
 
-    /// Top-left corner of the original content inside the prepared frame.
+    /// Top-left corner of the kept resized content inside the prepared frame.
+    ///
+    /// Crop mode returns the batch white-pad offset (`offset_x`, `offset_y`);
+    /// the resized image's row 0 sits at `offset_y - crop_start_y`, which is
+    /// negative for height-cropped frames (see [`Self::crop_start_y`]).
     /// Square mode returns the official `(x1, y1)` tuple entries (loaded-space
     /// pixels); crop/pad modes return the integer prepared-frame offsets.
     pub fn top_left(&self) -> (f64, f64) {
@@ -367,34 +406,48 @@ impl VggtPreprocessStage {
         let mut frames = Vec::with_capacity(sampled_paths.len());
         let mut original_dims = Vec::with_capacity(sampled_paths.len());
         // Content top-left inside the per-frame tensor *before* the batch
-        // maximum white padding: `(0, crop_start_y)` in crop mode, the
-        // centered white-pad offsets in pad mode.
+        // maximum white padding: (0, 0) in crop mode (the crop start is stored
+        // separately), the centered white-pad offsets in pad mode.
         let mut content_offsets = Vec::with_capacity(sampled_paths.len());
         // Size of the resized original content (equals `shape` in crop mode;
         // smaller than the 518x518 frame in pad mode).
         let mut content_sizes = Vec::with_capacity(sampled_paths.len());
+        // Crop start row inside the resized image and the pre-crop resized
+        // height (`(0, content_height)` for pad/square; the crop recipe's
+        // `start_y` and `/14`-rounded resized height for crop).
+        let mut crop_offsets = Vec::with_capacity(sampled_paths.len());
         // Official square-mode coordinate payload (`None` for crop/pad).
         let mut squares = Vec::with_capacity(sampled_paths.len());
         for path in sampled_paths {
             let image = load_rgb_frame(path)?;
             original_dims.push(image.dimensions());
-            let (shape, offset, content, chw, square) = match mode {
+            let (shape, offset, content, chw, crop_start_y, resized_height, square) = match mode {
                 VggtPreprocessMode::Crop => {
-                    let (shape, crop_start_y, chw) = self.resize_and_crop_frame(&image)?;
-                    (shape, (0, crop_start_y), shape, chw, None)
+                    let (shape, crop_start_y, resized_height, chw) =
+                        self.resize_and_crop_frame(&image)?;
+                    (
+                        shape,
+                        (0, 0),
+                        shape,
+                        chw,
+                        crop_start_y,
+                        resized_height,
+                        None,
+                    )
                 }
                 VggtPreprocessMode::Pad => {
                     let (shape, offset, content, chw) = self.resize_and_pad_frame(&image)?;
-                    (shape, offset, content, chw, None)
+                    (shape, offset, content, chw, 0, content.height, None)
                 }
                 VggtPreprocessMode::Square => {
                     let (shape, chw, square) = self.resize_square_frame(&image)?;
-                    (shape, (0, 0), shape, chw, Some(square))
+                    (shape, (0, 0), shape, chw, 0, shape.height, Some(square))
                 }
             };
             shapes.push(shape);
             content_offsets.push(offset);
             content_sizes.push(content);
+            crop_offsets.push((crop_start_y, resized_height));
             frames.push(chw);
             squares.push(square);
         }
@@ -407,28 +460,32 @@ impl VggtPreprocessStage {
             ));
         }
 
-        // Per-frame top-left of the resized original content inside the padded
-        // frame: the per-mode content offset plus the batch white pad.
-        let original_coords = shapes
-            .iter()
-            .zip(&original_dims)
-            .zip(&content_offsets)
-            .zip(&content_sizes)
-            .zip(&squares)
-            .map(
-                |((((shape, (width, height)), &(offset_x, offset_y)), content), square)| {
-                    VggtOriginalCoords {
-                        width: *width,
-                        height: *height,
-                        offset_x: offset_x + (max_width - shape.width) / 2,
-                        offset_y: offset_y + (max_height - shape.height) / 2,
-                        content_width: content.width,
-                        content_height: content.height,
-                        mode,
-                        square: *square,
-                    }
-                },
-            )
+        // Per-frame prepared->original metadata: the batch white-pad offset
+        // plus the mode-specific crop start and pre-crop resized height.
+        let original_coords = (0..shapes.len())
+            .map(|index| {
+                let shape = shapes[index];
+                let (width, height) = original_dims[index];
+                let (offset_x, offset_y) = content_offsets[index];
+                let content = content_sizes[index];
+                let (crop_start_y, resized_height) = crop_offsets[index];
+                VggtOriginalCoords {
+                    width,
+                    height,
+                    // `offset_*` is only the batch white pad; crop mode keeps
+                    // its row crop in `crop_start_y` (this must not be
+                    // conflated, or portrait frames map with a negative
+                    // offset).
+                    offset_x: offset_x + (max_width - shape.width) / 2,
+                    offset_y: offset_y + (max_height - shape.height) / 2,
+                    content_width: content.width,
+                    content_height: content.height,
+                    crop_start_y,
+                    resized_height,
+                    mode,
+                    square: squares[index],
+                }
+            })
             .collect();
 
         let plane = (max_height as usize) * (max_width as usize);
@@ -519,11 +576,13 @@ impl VggtPreprocessStage {
         }
     }
 
-    /// Returns `(frame size, crop offset, CHW pixels)`. The crop offset is the
-    /// row index inside the resized image from which the kept rows start
-    /// (non-zero only when the resized height exceeds `target_width`); it is
-    /// needed to map prepared pixels back to the original image.
-    fn resize_and_crop_frame(&self, image: &RgbImage) -> Result<(SpatialSize, u32, Vec<f32>)> {
+    /// Returns `(frame size, crop offset, pre-crop resized height, CHW
+    /// pixels)`. The crop offset is the row index inside the resized image
+    /// from which the kept rows start (non-zero only when the resized height
+    /// exceeds `target_width`); both the offset and the pre-crop resized
+    /// height are needed to map prepared pixels back to the original image
+    /// (`y_orig = (y_p - pad_y + start_y) * height / resized_height`).
+    fn resize_and_crop_frame(&self, image: &RgbImage) -> Result<(SpatialSize, u32, u32, Vec<f32>)> {
         let (width, height) = image.dimensions();
         let target = scaled_crop_size(width, height, self.target_width, self.patch_multiple)?;
         let resized = resize_bicubic_pillow(image, target.width, target.height);
@@ -550,6 +609,7 @@ impl VggtPreprocessStage {
         Ok((
             SpatialSize::new(self.target_width, out_height),
             start_y,
+            resized.height(),
             chw,
         ))
     }
@@ -1278,9 +1338,11 @@ mod tests {
                 width: 1024,
                 height: 768,
                 offset_x: 0,
-                offset_y: 63, // (518 - 392) / 2 white-pad rows
+                offset_y: 63, // (518 - 392) / 2 batch white-pad rows
                 content_width: 518,
                 content_height: 392,
+                crop_start_y: 0,
+                resized_height: 392,
                 mode: VggtPreprocessMode::Crop,
                 square: None,
             }
@@ -1291,21 +1353,81 @@ mod tests {
                 width: 1024,
                 height: 2048,
                 offset_x: 0,
-                offset_y: 259, // height center-crop start row
+                // The batch is already 518 rows tall, so this frame has no
+                // white pad; the 259-row crop start is stored separately and
+                // must not be folded into `offset_y`.
+                offset_y: 0,
                 content_width: 518,
                 content_height: 518,
+                crop_start_y: 259,
+                resized_height: 1036,
                 mode: VggtPreprocessMode::Crop,
                 square: None,
             }
         );
 
-        // Mapping prepared pixels back: the frame-a content rectangle starts
-        // at row 63, so prepared row 63 is original row 0 and prepared row 454
-        // is original row 391 * 768 / 392.
+        // Mapping prepared pixels back: the frame-a content starts after the
+        // 63-row batch white pad (crop_start_y is 0), so prepared row 63 is
+        // original row 0 and prepared row 454 is original row
+        // 391 * 768 / 392.
         let coords = &prepared.original_coords[0];
-        let v = (454.0 - f64::from(coords.offset_y)) * f64::from(coords.height)
-            / f64::from(coords.content_height);
+        let (_, scale_y) = coords.axis_scales_to_original();
+        let v = (454.0 - f64::from(coords.offset_y) + f64::from(coords.crop_start_y)) * scale_y;
         assert!((v - 391.0 * 768.0 / 392.0).abs() < 1e-9);
+    }
+
+    /// Portrait crop metadata: 768x1024 resizes to 518x686 and keeps rows
+    /// `[84, 602)`; `crop_start_y` must be stored separately from the batch
+    /// white pad (`offset_y = 0` for a full-height 518-row window) and the
+    /// per-axis inverse scale must use the pre-crop 686 rows.
+    #[test]
+    fn portrait_crop_records_pre_crop_height_and_start() {
+        let dir = std::env::temp_dir().join(format!(
+            "lux3d-vggt-portrait-crop-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create frame dir");
+        RgbImage::from_fn(768, 1024, |x, y| {
+            Rgb([(x % 256) as u8, (y % 256) as u8, 11u8])
+        })
+        .save(dir.join("a.png"))
+        .expect("save portrait frame");
+
+        let stage = VggtPreprocessStage::default();
+        let prepared = stage
+            .prepare_inputs_from_path(&dir, Some(1), &Device::Cpu)
+            .expect("prepare portrait crop inputs");
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(prepared.original_size, SpatialSize::new(768, 1024));
+        assert_eq!(prepared.target_size, SpatialSize::new(518, 518));
+        assert_eq!(prepared.rgb_frames.dims(), &[1, 3, 518, 518]);
+        assert_eq!(
+            prepared.original_coords[0],
+            VggtOriginalCoords {
+                width: 768,
+                height: 1024,
+                offset_x: 0,
+                offset_y: 0,
+                content_width: 518,
+                content_height: 518,
+                // (686 - 518) // 2 == 84.
+                crop_start_y: 84,
+                resized_height: 686,
+                mode: VggtPreprocessMode::Crop,
+                square: None,
+            }
+        );
+        let (scale_x, scale_y) = prepared.original_coords[0].axis_scales_to_original();
+        assert!((scale_x - 768.0 / 518.0).abs() < 1e-12);
+        assert!(
+            (scale_y - 1024.0 / 686.0).abs() < 1e-12,
+            "scale_y must divide by the pre-crop resized height"
+        );
     }
 
     #[test]
@@ -1371,9 +1493,11 @@ mod tests {
                 .expect("square portrait target"),
             SpatialSize::new(518, 518)
         );
-        assert!(stage
-            .target_size_for_mode(SpatialSize::new(0, 8), 518, VggtPreprocessMode::Square)
-            .is_err());
+        assert!(
+            stage
+                .target_size_for_mode(SpatialSize::new(0, 8), 518, VggtPreprocessMode::Square)
+                .is_err()
+        );
     }
 
     /// Pad-mode golden values for 1024x768: content 518x392, centered with 63
@@ -1420,6 +1544,8 @@ mod tests {
                 offset_y: 63,
                 content_width: 518,
                 content_height: 392,
+                crop_start_y: 0,
+                resized_height: 392,
                 mode: VggtPreprocessMode::Pad,
                 square: None,
             }
@@ -1495,6 +1621,8 @@ mod tests {
                 offset_y: 0,
                 content_width: 392,
                 content_height: 518,
+                crop_start_y: 0,
+                resized_height: 518,
                 mode: VggtPreprocessMode::Pad,
                 square: None,
             }
@@ -1577,6 +1705,8 @@ mod tests {
                 offset_y: 0,
                 content_width: 518,
                 content_height: 392,
+                crop_start_y: 0,
+                resized_height: 392,
                 mode: VggtPreprocessMode::Crop,
                 square: None,
             }
