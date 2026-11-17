@@ -9,17 +9,22 @@ mod trellis2;
 mod triposg;
 mod triposr;
 mod vggt;
+pub mod vggt_glb;
 
 pub use colmap::{
-    ColmapExportStats, DEFAULT_CONF_THRESHOLD, DEFAULT_MAX_POINTS, VggtColmapOptions,
-    write_feedforward_colmap,
+    write_feedforward_colmap, ColmapExportStats, VggtColmapOptions, DEFAULT_CONF_THRESHOLD,
+    DEFAULT_MAX_POINTS,
 };
-pub use glb_textured::{TexturedAlphaMode, TexturedGlbMesh, write_textured_glb};
-pub use import::{ImportedMesh, load_mesh, read_glb, read_obj, read_ply, read_stl};
-pub use mesh::{MeshFormat, MeshView, ObjStyle, write_mesh, write_obj};
+pub use glb_textured::{write_textured_glb, TexturedAlphaMode, TexturedGlbMesh};
+pub use import::{load_mesh, read_glb, read_obj, read_ply, read_stl, ImportedMesh};
+pub use mesh::{write_mesh, write_obj, MeshFormat, MeshView, ObjStyle};
 pub use pi3::Pi3ExportStage;
-pub use point_cloud::{PointCloudFormat, PointCloudView, write_point_cloud};
-pub use trellis2::{Trellis2ExportStage, pbrvox, to_glb_axes};
+pub use point_cloud::{write_point_cloud, PointCloudFormat, PointCloudView};
+pub use trellis2::{pbrvox, to_glb_axes, Trellis2ExportStage};
 pub use triposg::TripoSgExportStage;
 pub use triposr::TripoExportStage;
 pub use vggt::VggtExportStage;
+pub use vggt_glb::{
+    build_vggt_glb_scene, write_vggt_glb, VggtGlbCameraMesh, VggtGlbOptions, VggtGlbPredictions,
+    VggtGlbScene, DEFAULT_GLB_CONF_PERCENTILE,
+};

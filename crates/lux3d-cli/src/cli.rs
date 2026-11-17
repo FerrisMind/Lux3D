@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 use lux3d_core::export::{
-    load_mesh, write_feedforward_colmap, VggtColmapOptions, DEFAULT_CONF_THRESHOLD,
+    build_vggt_glb_scene, load_mesh, write_feedforward_colmap, write_vggt_glb, VggtColmapOptions,
+    VggtGlbOptions, VggtGlbPredictions, DEFAULT_CONF_THRESHOLD, DEFAULT_GLB_CONF_PERCENTILE,
     DEFAULT_MAX_POINTS,
 };
 use lux3d_core::geometry::VggtPointCloudCpu;
@@ -557,6 +558,19 @@ impl From<VggtColmapPointSourceKind> for lux3d_core::export::colmap::VggtColmapP
     }
 }
 
+/// VGGT GLB point source (`--glb-point-source`): the official demo's
+/// "Pointmap Branch" vs "Depthmap and Camera Branch" selector
+/// (`visual_util.py:68-80`, `demo_gradio.py:466-472`).
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum, PartialEq, Eq)]
+pub enum VggtGlbPointSourceKind {
+    /// Depth-unprojected `world_points_from_depth` + `depth_conf`, the Gradio
+    /// UI's default branch (`demo_gradio.py:469`).
+    #[default]
+    Depth,
+    /// Point-head `world_points` + `world_points_conf`.
+    Pointmap,
+}
+
 /// VGGT-only run flags (flattened into [`RunArgs`]). Every flag is rejected
 /// for the other families; the defaults keep the historical `vggt` behavior:
 /// F32 weights, crop preprocessing, one forward pass over all frames, and a
@@ -663,6 +677,33 @@ pub struct VggtRunArgs {
         help = "VGGT query-point PLY path (vggt only, requires --track-queries): writes one colored vertex per query - the frame-0 world point sampled at the query pixel (nearest) with its RGB color."
     )]
     pub track_points_ply: Option<PathBuf>,
+
+    #[arg(
+        long,
+        help = "VGGT downloadable GLB scene path (vggt only): writes the demo-gradio artifact (`predictions_to_glb`, visual_util.py:18-215) - the confidence-filtered colored point cloud plus, with --glb-show-cam, one camera-cone mesh per frame, all aligned to the first camera with the official OpenGL +/-y/z convention."
+    )]
+    pub glb: Option<PathBuf>,
+
+    #[arg(
+        long,
+        default_value_t = DEFAULT_GLB_CONF_PERCENTILE,
+        help = "VGGT GLB confidence percentile in [0, 100] (vggt only, official demo slider default 50): drop this percentage of the lowest-confidence points (`np.percentile`); `0` disables the percentile gate and keeps every `conf > 1e-5` point. Modifies --glb."
+    )]
+    pub glb_conf_percentile: f64,
+
+    #[arg(
+        long,
+        help = "Include the per-frame camera-cone meshes in the VGGT GLB scene (vggt only, requires --glb): the official demo shows them by default; this CLI opts in."
+    )]
+    pub glb_show_cam: bool,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = VggtGlbPointSourceKind::Depth,
+        help = "VGGT GLB point source (vggt only, requires --glb): `depth` unprojects the depth maps (`world_points_from_depth` + `depth_conf`, the Gradio UI default branch) or `pointmap` uses the point-head world_points + world_points_conf. Modifies --glb."
+    )]
+    pub glb_point_source: VggtGlbPointSourceKind,
 }
 
 impl Default for VggtRunArgs {
@@ -683,6 +724,10 @@ impl Default for VggtRunArgs {
             track_output: None,
             track_iters: 4,
             track_points_ply: None,
+            glb: None,
+            glb_conf_percentile: DEFAULT_GLB_CONF_PERCENTILE,
+            glb_show_cam: false,
+            glb_point_source: VggtGlbPointSourceKind::Depth,
         }
     }
 }
@@ -1289,7 +1334,7 @@ fn reject_unsupported_vggt_options(args: &RunArgs) -> anyhow::Result<()> {
 /// `--preprocess-mode crop` on another family is accepted as a no-op.
 fn reject_vggt_only_options(args: &RunArgs, family: Family) -> anyhow::Result<()> {
     let vggt = &args.vggt;
-    let set: [(&str, bool); 15] = [
+    let set: [(&str, bool); 19] = [
         (
             "--preprocess-mode",
             vggt.preprocess_mode != VggtPreprocessKind::Crop,
@@ -1320,6 +1365,16 @@ fn reject_vggt_only_options(args: &RunArgs, family: Family) -> anyhow::Result<()
         ("--track-output", vggt.track_output.is_some()),
         ("--track-iters", vggt.track_iters != 4),
         ("--track-points-ply", vggt.track_points_ply.is_some()),
+        ("--glb", vggt.glb.is_some()),
+        (
+            "--glb-conf-percentile",
+            vggt.glb_conf_percentile != DEFAULT_GLB_CONF_PERCENTILE,
+        ),
+        ("--glb-show-cam", vggt.glb_show_cam),
+        (
+            "--glb-point-source",
+            vggt.glb_point_source != VggtGlbPointSourceKind::Depth,
+        ),
     ];
     for (flag, is_set) in set {
         if is_set {
@@ -1932,6 +1987,106 @@ fn vggt_colmap_options_from_args(vggt: &VggtRunArgs) -> VggtColmapOptions {
     }
 }
 
+/// Map the GLB export flags onto [`VggtGlbOptions`], validating the
+/// `--glb-*` modifiers fail-fast before any weights are loaded.
+fn vggt_glb_options_from_args(vggt: &VggtRunArgs) -> anyhow::Result<VggtGlbOptions> {
+    let percentile = vggt.glb_conf_percentile;
+    if !percentile.is_finite() || !(0.0..=100.0).contains(&percentile) {
+        anyhow::bail!(
+            "`--glb-conf-percentile` must be a finite percentage in [0, 100], got {percentile}"
+        );
+    }
+    if vggt.glb.is_none() {
+        if vggt.glb_show_cam {
+            anyhow::bail!("`--glb-show-cam` requires `--glb`");
+        }
+        if vggt.glb_point_source != VggtGlbPointSourceKind::Depth {
+            anyhow::bail!("`--glb-point-source` requires `--glb`");
+        }
+        if percentile != DEFAULT_GLB_CONF_PERCENTILE {
+            anyhow::bail!("`--glb-conf-percentile` requires `--glb`");
+        }
+    }
+    Ok(VggtGlbOptions {
+        conf_percentile: percentile,
+        show_cam: vggt.glb_show_cam,
+        // The demo's optional background masks are ported in the core scene
+        // builder but stay off here: the CLI surface is the documented
+        // `--glb` / `--glb-conf-percentile` / `--glb-show-cam` set.
+        mask_black_bg: false,
+        mask_white_bg: false,
+    })
+}
+
+/// CPU copies of the GLB prediction arrays in the batch-squeezed demo layouts.
+struct VggtGlbCpuTensors {
+    points: Vec<f32>,
+    confidences: Vec<f32>,
+    images: Vec<f32>,
+    extrinsics: Vec<f32>,
+    frames: usize,
+    height: usize,
+    width: usize,
+}
+
+/// Stage the selected VGGT prediction branch (`depth` = the official
+/// `world_points_from_depth` + `depth_conf`, `pointmap` = `world_points` +
+/// `world_points_conf`, `visual_util.py:68-80`) as CPU f32 arrays.
+fn vggt_glb_cpu_tensors(
+    output: &VggtInferenceOutput,
+    source: VggtGlbPointSourceKind,
+) -> anyhow::Result<VggtGlbCpuTensors> {
+    let (points_tensor, confidences_tensor) = match source {
+        VggtGlbPointSourceKind::Depth => (
+            output
+                .world_points_from_depth()
+                .map_err(anyhow::Error::from)?,
+            output.depth_conf.clone(),
+        ),
+        VggtGlbPointSourceKind::Pointmap => (
+            output.world_points.clone(),
+            output.world_points_conf.clone(),
+        ),
+    };
+    let point_dims = points_tensor.dims().to_vec();
+    let (frames, height, width) = match point_dims.as_slice() {
+        [1, frames, height, width, 3] => (*frames, *height, *width),
+        [frames, height, width, 3] => (*frames, *height, *width),
+        _ => anyhow::bail!(
+            "VGGT GLB world points shape {point_dims:?} must be [1,S,H,W,3] or [S,H,W,3]"
+        ),
+    };
+    let confidences_tensor = vggt_squeeze_batch(&confidences_tensor, "point confidences")?;
+    let confidence_dims = confidences_tensor.dims().to_vec();
+    if confidence_dims != [frames, height, width] {
+        anyhow::bail!(
+            "VGGT GLB confidence shape {confidence_dims:?} does not match the {frames}x{height}x{width} point grid"
+        );
+    }
+    let extrinsics_tensor = vggt_squeeze_batch(&output.extrinsics, "extrinsics")?;
+    let extrinsic_dims = extrinsics_tensor.dims().to_vec();
+    if extrinsic_dims != [frames, 3, 4] {
+        anyhow::bail!(
+            "VGGT GLB extrinsics shape {extrinsic_dims:?} does not match {frames} frames as [S,3,4]"
+        );
+    }
+    let image_dims = output.rgb_frames.dims().to_vec();
+    if image_dims != [frames, 3, height, width] {
+        anyhow::bail!(
+            "VGGT GLB images shape {image_dims:?} does not match [S,3,H,W] = [{frames},3,{height},{width}]"
+        );
+    }
+    Ok(VggtGlbCpuTensors {
+        points: vggt_cpu_f32(&points_tensor, "world points")?,
+        confidences: vggt_cpu_f32(&confidences_tensor, "world point confidences")?,
+        images: vggt_cpu_f32(&output.rgb_frames, "rgb frames")?,
+        extrinsics: vggt_cpu_f32(&extrinsics_tensor, "extrinsics")?,
+        frames,
+        height,
+        width,
+    })
+}
+
 /// Highest valid query coordinate: prepared VGGT frames are at most 518x518,
 /// so pixel coordinates live in `[0, 518)`.
 const VGGT_QUERY_COORD_LIMIT: f32 = 518.0;
@@ -2261,6 +2416,7 @@ fn run_vggt(
     let source = required_source(args, "vggt")?;
     let vggt = &args.vggt;
     let options = vggt_run_options_from_args(args)?;
+    let glb_options = vggt_glb_options_from_args(vggt)?;
     let track_queries = match vggt.track_queries.as_deref() {
         Some(json) => Some(parse_vggt_track_queries(json)?),
         None => None,
@@ -2384,6 +2540,27 @@ fn run_vggt(
             "[track-points] {} query points -> {}",
             point_cloud.vertex_count,
             query_ply.display()
+        );
+    }
+    if let Some(glb_path) = vggt.glb.as_deref() {
+        let tensors = vggt_glb_cpu_tensors(&inference, vggt.glb_point_source)?;
+        let predictions = VggtGlbPredictions {
+            world_points: &tensors.points,
+            world_points_conf: &tensors.confidences,
+            images: &tensors.images,
+            extrinsics: &tensors.extrinsics,
+            frames: tensors.frames,
+            height: tensors.height,
+            width: tensors.width,
+        };
+        let scene =
+            build_vggt_glb_scene(&predictions, &glb_options).map_err(anyhow::Error::from)?;
+        write_vggt_glb(&scene, glb_path).map_err(anyhow::Error::from)?;
+        eprintln!(
+            "[glb] points={} cameras={} -> {}",
+            scene.point_count(),
+            scene.camera_count(),
+            glb_path.display()
         );
     }
     pipeline.export_point_cloud_with_threshold(
@@ -3106,6 +3283,105 @@ mod tests {
         assert_eq!(None, colmap.confidence);
         assert_eq!(defaults.point_source, colmap.point_source);
         assert_eq!(None, colmap.seed);
+
+        // GLB export is opt-in; the confidence percentile keeps the official
+        // demo default and the camera cones stay off unless requested.
+        assert_eq!(None, args.vggt.glb);
+        assert_eq!(
+            lux3d_core::export::DEFAULT_GLB_CONF_PERCENTILE,
+            args.vggt.glb_conf_percentile
+        );
+        assert!(!args.vggt.glb_show_cam);
+        assert_eq!(
+            super::VggtGlbPointSourceKind::Depth,
+            args.vggt.glb_point_source
+        );
+        let glb = super::vggt_glb_options_from_args(&args.vggt).expect("glb options");
+        assert_eq!(50.0, glb.conf_percentile);
+        assert!(!glb.show_cam);
+    }
+
+    /// The GLB flags parse and map onto [`VggtGlbOptions`].
+    #[test]
+    fn vggt_glb_flags_parse_and_map() {
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "vggt",
+            "--source",
+            "frames",
+            "--glb",
+            "scene.glb",
+            "--glb-conf-percentile",
+            "30",
+            "--glb-show-cam",
+            "--glb-point-source",
+            "pointmap",
+            "--output",
+            "out.ply",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(Some(PathBuf::from("scene.glb")), args.vggt.glb);
+        assert_eq!(30.0, args.vggt.glb_conf_percentile);
+        assert!(args.vggt.glb_show_cam);
+        assert_eq!(
+            super::VggtGlbPointSourceKind::Pointmap,
+            args.vggt.glb_point_source
+        );
+        let glb = super::vggt_glb_options_from_args(&args.vggt).expect("glb options");
+        assert_eq!(30.0, glb.conf_percentile);
+        assert!(glb.show_cam);
+        assert!(!glb.mask_black_bg);
+        assert!(!glb.mask_white_bg);
+    }
+
+    /// The confidence percentile must stay in `[0, 100]`, and the `--glb-*`
+    /// modifiers require `--glb` rather than being silent no-ops.
+    #[test]
+    fn vggt_glb_flags_validate_ranges_and_requirements() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "lux3d", "run", "vggt", "--source", "frames", "--output", "out.ply",
+            ];
+            argv.extend_from_slice(extra);
+            let cli = Cli::parse_from(argv);
+            let Command::Run(args) = cli.command else {
+                panic!("expected run command");
+            };
+            args
+        };
+
+        for argument in ["--glb-conf-percentile=100.5", "--glb-conf-percentile=-1"] {
+            let args = parse(&["--glb", "scene.glb", argument]);
+            let error = super::vggt_glb_options_from_args(&args.vggt)
+                .expect_err("out-of-range percentile must be rejected");
+            assert!(
+                error.to_string().contains("in [0, 100]"),
+                "unexpected message for {argument}: {error}"
+            );
+        }
+
+        for (extra, expected) in [
+            (vec!["--glb-show-cam"], "`--glb-show-cam` requires `--glb`"),
+            (
+                vec!["--glb-point-source", "pointmap"],
+                "`--glb-point-source` requires `--glb`",
+            ),
+            (
+                vec!["--glb-conf-percentile", "30"],
+                "`--glb-conf-percentile` requires `--glb`",
+            ),
+        ] {
+            let args = parse(&extra);
+            let error = super::vggt_glb_options_from_args(&args.vggt)
+                .expect_err("GLB modifiers without --glb must be rejected");
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected message for {extra:?}: {error}"
+            );
+        }
     }
 
     /// `--batch-size 0` is rejected before any weights are touched.
@@ -3321,7 +3597,7 @@ mod tests {
     /// the other families instead of being silently ignored.
     #[test]
     fn vggt_only_flags_rejected_for_other_families() {
-        let flag_options: [(&str, &[&str]); 15] = [
+        let flag_options: [(&str, &[&str]); 19] = [
             ("--preprocess-mode", &["--preprocess-mode", "pad"]),
             ("--vggt-dtype", &["--vggt-dtype", "f16"]),
             ("--batch-size", &["--batch-size", "4"]),
@@ -3352,6 +3628,10 @@ mod tests {
             ("--track-output", &["--track-output", "tracks.json"]),
             ("--track-iters", &["--track-iters", "6"]),
             ("--track-points-ply", &["--track-points-ply", "queries.ply"]),
+            ("--glb", &["--glb", "scene.glb"]),
+            ("--glb-conf-percentile", &["--glb-conf-percentile", "30"]),
+            ("--glb-show-cam", &["--glb-show-cam"]),
+            ("--glb-point-source", &["--glb-point-source", "pointmap"]),
         ];
         for family in ["pi3", "pi3x", "triposr", "triposg", "trellis2"] {
             for (flag, extra) in flag_options {
