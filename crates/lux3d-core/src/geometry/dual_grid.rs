@@ -839,7 +839,11 @@ fn boundry_qef(
         let mut visited = vec![current];
         loop {
             let axis = if t_max[0] < t_max[1] {
-                if t_max[0] < t_max[2] { 0 } else { 2 }
+                if t_max[0] < t_max[2] {
+                    0
+                } else {
+                    2
+                }
             } else if t_max[1] < t_max[2] {
                 1
             } else {
@@ -933,120 +937,135 @@ fn solve_dual_vertices(
             }
         }
         let q = q4_from_sym(&q_sym);
+        let v_new = solve_qef_cell(&q, min_c, max_c);
 
-        // Unconstrained minimizer of v^T Q v (upstream: colPivHouseholderQr
-        // on the top-left 3x3 with b = -Q(0:3, 3); here: f64 symmetric
-        // eigen pseudo-inverse).
-        let a3 = [
-            [q[0][0], q[0][1], q[0][2]],
-            [q[1][0], q[1][1], q[1][2]],
-            [q[2][0], q[2][1], q[2][2]],
-        ];
-        let b3 = [-q[0][3], -q[1][3], -q[2][3]];
-        let mut v_new = solve_sym3_pinv(&a3, &b3);
+        dual_vertices.push([v_new[0] as f32, v_new[1] as f32, v_new[2] as f32]);
+    }
+    dual_vertices
+}
 
-        let inside = (0..3).all(|axis| v_new[axis] >= min_c[axis] && v_new[axis] <= max_c[axis]);
-        if !inside {
-            let mut best = f64::INFINITY;
+/// Minimizes the homogeneous quadratic `v^T Q v` for `v = (x, y, z, 1)` and
+/// clamps the result into the box `[min_c, max_c]`.
+///
+/// Shared by the flexible dual-grid voxelizer above and the narrow-band
+/// dual-contouring remesher (`geometry::remesh_dc`): both place one vertex
+/// per cell and clamp it into the cell bounds. The code is the per-voxel
+/// solve extracted verbatim from [`solve_dual_vertices`] (unconstrained
+/// `f64` symmetric pseudo-inverse minimizer, then exhaustive
+/// 1/2/3-axis-constrained candidates in exactly the upstream order; strict
+/// `<` keeps the first best candidate).
+pub(crate) fn solve_qef_cell(q: &[[f64; 4]; 4], min_c: [f64; 3], max_c: [f64; 3]) -> [f64; 3] {
+    // Unconstrained minimizer of v^T Q v (upstream: colPivHouseholderQr
+    // on the top-left 3x3 with b = -Q(0:3, 3); here: f64 symmetric
+    // eigen pseudo-inverse).
+    let a3 = [
+        [q[0][0], q[0][1], q[0][2]],
+        [q[1][0], q[1][1], q[1][2]],
+        [q[2][0], q[2][1], q[2][2]],
+    ];
+    let b3 = [-q[0][3], -q[1][3], -q[2][3]];
+    let mut v_new = solve_sym3_pinv(&a3, &b3);
 
-            // Single-constraint candidates (fix one axis at a cell bound).
-            for fixed in 0..3 {
-                let ax1 = (fixed + 1) % 3;
-                let ax2 = (fixed + 2) % 3;
-                let a2 = [[q[ax1][ax1], q[ax1][ax2]], [q[ax2][ax1], q[ax2][ax2]]];
-                let fixed_col = [q[ax1][fixed], q[ax2][fixed]];
-                let const_col = [q[ax1][3], q[ax2][3]];
-                for &bound in &[min_c[fixed], max_c[fixed]] {
-                    let b2 = [
-                        -(fixed_col[0] * bound + const_col[0]),
-                        -(fixed_col[1] * bound + const_col[1]),
-                    ];
-                    let x = solve_sym2_pinv(&a2, &b2);
-                    if x[0] >= min_c[ax1]
-                        && x[0] <= max_c[ax1]
-                        && x[1] >= min_c[ax2]
-                        && x[1] <= max_c[ax2]
-                    {
-                        let mut p = [0.0f64; 4];
-                        p[fixed] = bound;
-                        p[ax1] = x[0];
-                        p[ax2] = x[1];
-                        p[3] = 1.0;
-                        let err = qef_err(&q, p);
-                        if err < best {
-                            best = err;
-                            v_new = [p[0], p[1], p[2]];
-                        }
-                    }
-                }
-            }
+    let inside = (0..3).all(|axis| v_new[axis] >= min_c[axis] && v_new[axis] <= max_c[axis]);
+    if !inside {
+        let mut best = f64::INFINITY;
 
-            // Two-constraint candidates (free one axis, both others fixed).
-            for free in 0..3 {
-                let ax1 = (free + 1) % 3;
-                let ax2 = (free + 2) % 3;
-                let a = q[free][free];
-                if a == 0.0 {
-                    // Upstream divides and relies on the range check to drop
-                    // the inf/NaN candidates; skipping is equivalent.
-                    continue;
-                }
-                let b3 = [q[free][ax1], q[free][ax2], q[free][3]];
-                let bounds1 = [min_c[ax1], min_c[ax1], max_c[ax1], max_c[ax1]];
-                let bounds2 = [min_c[ax2], max_c[ax2], min_c[ax2], max_c[ax2]];
-                for combo in 0..4 {
-                    let qv = [bounds1[combo], bounds2[combo], 1.0];
-                    let x = -(b3[0] * qv[0] + b3[1] * qv[1] + b3[2] * qv[2]) / a;
-                    if x >= min_c[free] && x <= max_c[free] {
-                        let mut p = [0.0f64; 4];
-                        p[free] = x;
-                        p[ax1] = bounds1[combo];
-                        p[ax2] = bounds2[combo];
-                        p[3] = 1.0;
-                        let err = qef_err(&q, p);
-                        if err < best {
-                            best = err;
-                            v_new = [p[0], p[1], p[2]];
-                        }
-                    }
-                }
-            }
-
-            // Three-constraint candidates (the 8 cell corners).
-            for x_constraint in 0..2 {
-                for y_constraint in 0..2 {
-                    for z_constraint in 0..2 {
-                        let p = [
-                            if x_constraint == 0 {
-                                max_c[0]
-                            } else {
-                                min_c[0]
-                            },
-                            if y_constraint == 0 {
-                                max_c[1]
-                            } else {
-                                min_c[1]
-                            },
-                            if z_constraint == 0 {
-                                max_c[2]
-                            } else {
-                                min_c[2]
-                            },
-                            1.0,
-                        ];
-                        let err = qef_err(&q, p);
-                        if err < best {
-                            best = err;
-                            v_new = [p[0], p[1], p[2]];
-                        }
+        // Single-constraint candidates (fix one axis at a cell bound).
+        for fixed in 0..3 {
+            let ax1 = (fixed + 1) % 3;
+            let ax2 = (fixed + 2) % 3;
+            let a2 = [[q[ax1][ax1], q[ax1][ax2]], [q[ax2][ax1], q[ax2][ax2]]];
+            let fixed_col = [q[ax1][fixed], q[ax2][fixed]];
+            let const_col = [q[ax1][3], q[ax2][3]];
+            for &bound in &[min_c[fixed], max_c[fixed]] {
+                let b2 = [
+                    -(fixed_col[0] * bound + const_col[0]),
+                    -(fixed_col[1] * bound + const_col[1]),
+                ];
+                let x = solve_sym2_pinv(&a2, &b2);
+                if x[0] >= min_c[ax1]
+                    && x[0] <= max_c[ax1]
+                    && x[1] >= min_c[ax2]
+                    && x[1] <= max_c[ax2]
+                {
+                    let mut p = [0.0f64; 4];
+                    p[fixed] = bound;
+                    p[ax1] = x[0];
+                    p[ax2] = x[1];
+                    p[3] = 1.0;
+                    let err = qef_err(q, p);
+                    if err < best {
+                        best = err;
+                        v_new = [p[0], p[1], p[2]];
                     }
                 }
             }
         }
 
-        dual_vertices.push([v_new[0] as f32, v_new[1] as f32, v_new[2] as f32]);
+        // Two-constraint candidates (free one axis, both others fixed).
+        for free in 0..3 {
+            let ax1 = (free + 1) % 3;
+            let ax2 = (free + 2) % 3;
+            let a = q[free][free];
+            if a == 0.0 {
+                // Upstream divides and relies on the range check to drop
+                // the inf/NaN candidates; skipping is equivalent.
+                continue;
+            }
+            let b3 = [q[free][ax1], q[free][ax2], q[free][3]];
+            let bounds1 = [min_c[ax1], min_c[ax1], max_c[ax1], max_c[ax1]];
+            let bounds2 = [min_c[ax2], max_c[ax2], min_c[ax2], max_c[ax2]];
+            for combo in 0..4 {
+                let qv = [bounds1[combo], bounds2[combo], 1.0];
+                let x = -(b3[0] * qv[0] + b3[1] * qv[1] + b3[2] * qv[2]) / a;
+                if x >= min_c[free] && x <= max_c[free] {
+                    let mut p = [0.0f64; 4];
+                    p[free] = x;
+                    p[ax1] = bounds1[combo];
+                    p[ax2] = bounds2[combo];
+                    p[3] = 1.0;
+                    let err = qef_err(q, p);
+                    if err < best {
+                        best = err;
+                        v_new = [p[0], p[1], p[2]];
+                    }
+                }
+            }
+        }
+
+        // Three-constraint candidates (the 8 cell corners).
+        for x_constraint in 0..2 {
+            for y_constraint in 0..2 {
+                for z_constraint in 0..2 {
+                    let p = [
+                        if x_constraint == 0 {
+                            max_c[0]
+                        } else {
+                            min_c[0]
+                        },
+                        if y_constraint == 0 {
+                            max_c[1]
+                        } else {
+                            min_c[1]
+                        },
+                        if z_constraint == 0 {
+                            max_c[2]
+                        } else {
+                            min_c[2]
+                        },
+                        1.0,
+                    ];
+                    let err = qef_err(q, p);
+                    if err < best {
+                        best = err;
+                        v_new = [p[0], p[1], p[2]];
+                    }
+                }
+            }
+        }
     }
-    dual_vertices
+
+    v_new
 }
 
 /// Symmetric 3x3 solve. Positive-definite systems (always the case when
@@ -1156,7 +1175,7 @@ fn qef_err(q: &[[f64; 4]; 4], p: [f64; 4]) -> f64 {
 
 /// Widens the stored symmetric upper triangle into a full 4x4 f64 matrix.
 #[inline]
-fn q4_from_sym(sym: &[f32; 10]) -> [[f64; 4]; 4] {
+pub(crate) fn q4_from_sym(sym: &[f32; 10]) -> [[f64; 4]; 4] {
     let mut q = [[0.0f64; 4]; 4];
     for i in 0..4 {
         for j in 0..4 {
@@ -1223,7 +1242,7 @@ fn normalize3(n: [f32; 3]) -> [f32; 3] {
 
 /// Homogeneous plane QEF: `(n, d) (n, d)^T` upper triangle.
 #[inline]
-fn plane_q(n: [f32; 3], d: f32) -> [f32; 10] {
+pub(crate) fn plane_q(n: [f32; 3], d: f32) -> [f32; 10] {
     [
         n[0] * n[0],
         n[0] * n[1],
