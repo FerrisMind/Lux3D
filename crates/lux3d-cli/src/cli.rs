@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 
 use clap::{Args, Parser, Subcommand};
 use lux3d_core::export::{
@@ -15,8 +16,9 @@ use lux3d_core::runtime::{
     Pi3xVoPipeline, Trellis2MeshPostprocessOptions, Trellis2Pipeline, Trellis2RunOptions,
     Trellis2SamplerOverrides, Trellis2TextureExportOptions, Trellis2TexturingOptions,
     TripoSgPipeline, TripoSgRunOptions, TripoSgScribblePipeline, TripoSgScribbleRunOptions,
-    TripoSrPipeline, VggtAutoQueryOptions, VggtInferenceOutput, VggtPipeline, VggtRunOptions,
-    VggtTrackQuery, VggtTrackResult, DEFAULT_MAX_QUERY_PTS, DEFAULT_QUERY_FRAME_NUM,
+    TripoSrPipeline, VggtAutoQueryOptions, VggtInferenceOutput, VggtKeypointSource,
+    VggtPipeline, VggtRunOptions, VggtTrackQuery, VggtTrackResult, DEFAULT_MAX_QUERY_PTS,
+    DEFAULT_QUERY_FRAME_NUM,
 };
 use lux3d_core::{
     dtype_from_name, ensure_canonical_weights, quantize_auxiliary_checkpoint, quantize_checkpoint,
@@ -869,6 +871,28 @@ impl From<VggtColmapModeKind> for VggtColmapMode {
     }
 }
 
+/// VGGT stage-A query-point source (`--track-keypoints`).
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum, PartialEq, Eq)]
+pub enum VggtKeypointSourceKind {
+    /// Official `keypoint_extractor="aliked+sp"` (ALIKED-n16 then SuperPoint,
+    /// concatenated and confidence-gated).
+    #[default]
+    #[value(name = "aliked-sp")]
+    AlikedSp,
+    /// Deterministic FPS grid over the model-resolution pixels; requires no
+    /// detector checkpoints (previous behavior and explicit opt-out).
+    Fps,
+}
+
+impl From<VggtKeypointSourceKind> for VggtKeypointSource {
+    fn from(kind: VggtKeypointSourceKind) -> Self {
+        match kind {
+            VggtKeypointSourceKind::AlikedSp => Self::AlikedSuperPoint,
+            VggtKeypointSourceKind::Fps => Self::Fps,
+        }
+    }
+}
+
 /// VGGT GLB point source (`--glb-point-source`): the official demo's
 /// "Pointmap Branch" vs "Depthmap and Camera Branch" selector
 /// (`visual_util.py:68-80`, `demo_gradio.py:466-472`).
@@ -954,9 +978,15 @@ pub struct VggtRunArgs {
         long,
         value_enum,
         default_value_t = VggtColmapModeKind::Feedforward,
-        help = "VGGT COLMAP export mode (vggt only): `feedforward` (default) writes the depth-confidence-gated single-observation model (`batch_np_matrix_to_pycolmap_wo_track`, one PINHOLE camera per image); `track` writes the track-based reconstruction (`batch_np_matrix_to_pycolmap` semantics, SIMPLE_PINHOLE cameras, multi-frame tracks) WITHOUT bundle adjustment - a COLMAP-ready reconstruction for external BA. `track` requires --colmap-dir and --track-auto. Modifies --colmap-dir."
+        help = "VGGT COLMAP export mode (vggt only): `feedforward` (default) writes the depth-confidence-gated single-observation model (`batch_np_matrix_to_pycolmap_wo_track`, one PINHOLE camera per image); `track` writes the track-based reconstruction (`batch_np_matrix_to_pycolmap` semantics, SIMPLE_PINHOLE cameras, multi-frame tracks) WITHOUT bundle adjustment by default - a COLMAP-ready reconstruction for external BA. `track` requires --colmap-dir and --track-auto; add --colmap-ba to run the external `colmap bundle_adjuster` in the same run. Modifies --colmap-dir."
     )]
     pub colmap_mode: VggtColmapModeKind,
+
+    #[arg(
+        long,
+        help = "VGGT COLMAP track-mode bundle adjustment (vggt only; upstream demo `--use_ba` default is false). After writing the track reconstruction, runs the external `colmap bundle_adjuster --input_path <dir> --output_path <fresh temp dir>` and atomically replaces cameras.bin/images.bin/points3D.bin (plus rigs.bin/frames.bin when the installed COLMAP writes them) in --colmap-dir with the adjusted model; other files (points.ply) are preserved. The binary comes from LUX3D_COLMAP_BIN or PATH. Requires --colmap-mode track and --colmap-dir (the track export must run first); on failure the unadjusted model is left untouched. Modifies --colmap-dir."
+    )]
+    pub colmap_ba: bool,
 
     #[arg(
         long,
@@ -1007,9 +1037,17 @@ pub struct VggtRunArgs {
 
     #[arg(
         long,
-        help = "VGGT automatic query selection (vggt only, tracking stage A): ranks frames with DINOv2 ViT-B/14-with-registers CLS similarity + FPS (official --query-frame-num), picks up to --max-query-pts FPS-spread points per query frame (the official ALIKED/SuperPoint keypoint extractors are not part of stage A), confidence-gates them like track_predict.py (conf > 1.2 when more than 512 survive), rotates each query frame to position 0 for the track head, then rotates the tracks back. Requires the DINOv2-reg safetensors at models/dinov2_reg4/model.safetensors or LUX3D_DINOV2_REG_MODEL_PATH. Mutually exclusive with --track-queries. Rejected for other families."
+        help = "VGGT automatic query selection (vggt only, tracking stage A): ranks frames with DINOv2 ViT-B/14-with-registers CLS similarity + FPS (official --query-frame-num), picks query points per query frame with ALIKED-n16 + SuperPoint (official `keypoint_extractor=\"aliked+sp\"`, `--track-keypoints fps` selects the weight-free FPS grid instead), confidence-gates them like track_predict.py (conf > 1.2 when more than 512 survive), rotates each query frame to position 0 for the track head, then rotates the tracks back. Requires the DINOv2-reg safetensors at models/dinov2_reg4/model.safetensors or LUX3D_DINOV2_REG_MODEL_PATH, and the detector safetensors at models/aliked-superpoint/ (override with LUX3D_ALIKED_WEIGHTS / LUX3D_SUPERPOINT_WEIGHTS) unless `--track-keypoints fps`. Mutually exclusive with --track-queries. Rejected for other families."
     )]
     pub track_auto: bool,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = VggtKeypointSourceKind::AlikedSp,
+        help = "VGGT stage-A query points (vggt only, requires --track-auto): `aliked-sp` (default, official `keypoint_extractor=\"aliked+sp\"`: ALIKED-n16 + SuperPoint keypoints concatenated in that order) or `fps` (deterministic farthest-point grid over the model-resolution pixels; no detector checkpoints, previous behavior)."
+    )]
+    pub track_keypoints: VggtKeypointSourceKind,
 
     #[arg(
         long,
@@ -1021,7 +1059,7 @@ pub struct VggtRunArgs {
     #[arg(
         long,
         default_value_t = DEFAULT_MAX_QUERY_PTS,
-        help = "VGGT automatic per-frame query-point cap (vggt only, requires --track-auto; official demo default 4096): points are selected by farthest-point sampling over the model-resolution pixel grid, then confidence-gated."
+        help = "VGGT automatic per-frame query-point cap (vggt only, requires --track-auto; official demo default 4096): passed to each detector as `max_num_keypoints` for `--track-keypoints aliked-sp` (so ALIKED+SuperPoint may contribute up to 2x this before confidence gating), or the FPS target for `--track-keypoints fps`."
     )]
     pub max_query_pts: usize,
 
@@ -1085,6 +1123,7 @@ impl Default for VggtRunArgs {
             colmap_seed: None,
             colmap_world_conf_threshold: None,
             colmap_mode: VggtColmapModeKind::Feedforward,
+            colmap_ba: false,
             vis_thresh: DEFAULT_VIS_THRESHOLD,
             max_reproj_error: DEFAULT_MAX_REPROJ_ERROR,
             shared_camera: false,
@@ -1093,6 +1132,7 @@ impl Default for VggtRunArgs {
             depth_conf_threshold: 1.0,
             track_queries: None,
             track_auto: false,
+            track_keypoints: VggtKeypointSourceKind::AlikedSp,
             query_frame_num: DEFAULT_QUERY_FRAME_NUM,
             max_query_pts: DEFAULT_MAX_QUERY_PTS,
             track_output: None,
@@ -1892,7 +1932,7 @@ fn reject_unsupported_vggt_options(args: &RunArgs) -> anyhow::Result<()> {
 /// `--preprocess-mode crop` on another family is accepted as a no-op.
 fn reject_vggt_only_options(args: &RunArgs, family: Family) -> anyhow::Result<()> {
     let vggt = &args.vggt;
-    let set: [(&str, bool); 27] = [
+    let set: [(&str, bool); 29] = [
         (
             "--preprocess-mode",
             vggt.preprocess_mode != VggtPreprocessKind::Crop,
@@ -1921,6 +1961,7 @@ fn reject_vggt_only_options(args: &RunArgs, family: Family) -> anyhow::Result<()
             "--colmap-mode",
             vggt.colmap_mode != VggtColmapModeKind::Feedforward,
         ),
+        ("--colmap-ba", vggt.colmap_ba),
         ("--vis-thresh", vggt.vis_thresh != DEFAULT_VIS_THRESHOLD),
         (
             "--max-reproj-error",
@@ -1935,6 +1976,10 @@ fn reject_vggt_only_options(args: &RunArgs, family: Family) -> anyhow::Result<()
         ("--depth-conf-threshold", vggt.depth_conf_threshold != 1.0),
         ("--track-queries", vggt.track_queries.is_some()),
         ("--track-auto", vggt.track_auto),
+        (
+            "--track-keypoints",
+            vggt.track_keypoints != VggtKeypointSourceKind::AlikedSp,
+        ),
         (
             "--query-frame-num",
             vggt.query_frame_num != DEFAULT_QUERY_FRAME_NUM,
@@ -2761,6 +2806,207 @@ fn vggt_track_colmap_options_from_args(vggt: &VggtRunArgs) -> VggtTrackColmapOpt
     }
 }
 
+/// Sparse-model files replaced by `--colmap-ba`. Every other file in the
+/// export directory (for example `points.ply`) is preserved.
+const COLMAP_BA_MODEL_FILES: [&str; 3] = ["cameras.bin", "images.bin", "points3D.bin"];
+
+/// Newer COLMAP releases (`Reconstruction::WriteBinary`) also write the rig
+/// and frame tables. They are optional: older releases do not, and the
+/// three-file model remains readable, but dropping them would discard part of
+/// the adjusted reconstruction.
+const COLMAP_BA_OPTIONAL_MODEL_FILES: [&str; 2] = ["rigs.bin", "frames.bin"];
+
+/// Command line for the external bundle adjustment (`colmap bundle_adjuster`
+/// CLI spelling). Arguments are passed directly to `Command`, never through a
+/// shell, so paths with spaces or shell metacharacters stay single arguments.
+fn colmap_ba_args(input_dir: &Path, output_dir: &Path) -> Vec<std::ffi::OsString> {
+    vec![
+        "bundle_adjuster".into(),
+        "--input_path".into(),
+        input_dir.as_os_str().to_owned(),
+        "--output_path".into(),
+        output_dir.as_os_str().to_owned(),
+    ]
+}
+
+/// External BA binary: `LUX3D_COLMAP_BIN` when set and non-empty, else
+/// `colmap` resolved through `PATH`.
+fn resolve_colmap_program() -> PathBuf {
+    std::env::var_os("LUX3D_COLMAP_BIN")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("colmap"))
+}
+
+/// Fail-fast availability check for `--colmap-ba`, run before weights are
+/// loaded. An explicit path must exist; a bare name is searched on `PATH`
+/// (plus the current directory and `.exe` on Windows, matching
+/// `Command::new` process search).
+fn ensure_colmap_available(program: &Path) -> anyhow::Result<()> {
+    if program.is_absolute() || program.components().count() > 1 {
+        if program.is_file() {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "COLMAP binary `{}` does not exist or is not a file; set `LUX3D_COLMAP_BIN` to the \
+             COLMAP executable or add `colmap` to PATH (required by `--colmap-ba`)",
+            program.display()
+        );
+    }
+    let mut names = vec![program.to_path_buf()];
+    #[cfg(windows)]
+    {
+        names.push(program.with_extension("exe"));
+        // CreateProcess also searches the current directory.
+        if program.is_file() {
+            return Ok(());
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            for name in &names {
+                if dir.join(name).is_file() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    anyhow::bail!(
+        "COLMAP binary `{}` was not found on PATH; set `LUX3D_COLMAP_BIN` to the COLMAP \
+         executable or add `colmap` to PATH (required by `--colmap-ba`)",
+        program.display()
+    )
+}
+
+struct ColmapBaStagingDir(PathBuf);
+
+impl Drop for ColmapBaStagingDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Tail of captured process output for error messages.
+fn colmap_output_tail(bytes: &[u8]) -> String {
+    const MAX_TAIL_BYTES: usize = 4096;
+    let start = bytes.len().saturating_sub(MAX_TAIL_BYTES);
+    let tail = String::from_utf8_lossy(&bytes[start..]).trim().to_string();
+    if tail.is_empty() {
+        "<no stderr output>".to_string()
+    } else if start > 0 {
+        format!("...{tail}")
+    } else {
+        tail
+    }
+}
+
+/// Run `colmap bundle_adjuster` on the track export and atomically (per file)
+/// replace the sparse model.
+///
+/// The adjusted model is written to a staging directory inside `colmap_dir`
+/// (same filesystem, so the renames are atomic). A failed run leaves the
+/// original `cameras.bin` / `images.bin` / `points3D.bin` untouched; the
+/// staging directory is always removed. `rigs.bin` / `frames.bin` are copied
+/// too when the COLMAP release writes them.
+fn run_colmap_bundle_adjustment(colmap_dir: &Path, program: &Path) -> anyhow::Result<()> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let staging = colmap_dir.join(format!(".lux3d-colmap-ba-{}-{unique}", std::process::id()));
+    std::fs::create_dir_all(&staging).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to create the COLMAP BA staging directory `{}`: {error}",
+            staging.display()
+        )
+    })?;
+    let _cleanup = ColmapBaStagingDir(staging.clone());
+
+    let args = colmap_ba_args(colmap_dir, &staging);
+    let rendered = args
+        .iter()
+        .map(|argument| argument.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!("[colmap:ba] {} {rendered}", program.display());
+
+    let output = ProcessCommand::new(program)
+        .args(&args)
+        .output()
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to launch COLMAP bundle adjuster `{}`: {error}; set `LUX3D_COLMAP_BIN` \
+                 to the COLMAP executable or add `colmap` to PATH",
+                program.display()
+            )
+        })?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "`{} {rendered}` failed with status {}; stderr tail:\n{}\n\
+             the unadjusted model in `{}` was left untouched",
+            program.display(),
+            output.status,
+            colmap_output_tail(&output.stderr),
+            colmap_dir.display()
+        );
+    }
+    for name in COLMAP_BA_MODEL_FILES {
+        let path = staging.join(name);
+        if !path.is_file() {
+            anyhow::bail!(
+                "`{} {rendered}` exited successfully but did not write `{}`; \
+                 the unadjusted model in `{}` was left untouched",
+                program.display(),
+                path.display(),
+                colmap_dir.display()
+            );
+        }
+    }
+    install_colmap_ba_output(&staging, colmap_dir)?;
+    eprintln!(
+        "[colmap:ba] adjusted {} -> {}",
+        COLMAP_BA_MODEL_FILES.join("/"),
+        colmap_dir.display()
+    );
+    Ok(())
+}
+
+/// Replace the sparse model with the staged bundle-adjusted files.
+///
+/// All three required adjusted files are verified before the first rename, so
+/// an incomplete output leaves the original model untouched. Each rename is
+/// atomic on the export directory's filesystem; optional rig/frame tables are
+/// installed when the COLMAP release wrote them.
+fn install_colmap_ba_output(staging: &Path, colmap_dir: &Path) -> anyhow::Result<()> {
+    for name in COLMAP_BA_MODEL_FILES {
+        let source = staging.join(name);
+        if !source.is_file() {
+            anyhow::bail!(
+                "bundle-adjusted model is missing `{}`; the model in `{}` was left untouched",
+                source.display(),
+                colmap_dir.display()
+            );
+        }
+    }
+    for name in COLMAP_BA_MODEL_FILES
+        .into_iter()
+        .chain(COLMAP_BA_OPTIONAL_MODEL_FILES)
+    {
+        let source = staging.join(name);
+        if !source.is_file() {
+            continue;
+        }
+        let target = colmap_dir.join(name);
+        std::fs::rename(&source, &target).map_err(|error| {
+            anyhow::anyhow!(
+                "failed to replace `{}` with the bundle-adjusted model: {error}",
+                target.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 /// Map the GLB export flags onto [`VggtGlbOptions`], validating the
 /// `--glb-*` modifiers fail-fast before any weights are loaded.
 fn vggt_glb_options_from_args(vggt: &VggtRunArgs) -> anyhow::Result<VggtGlbOptions> {
@@ -3190,6 +3436,24 @@ fn vggt_query_point_cloud(
     Ok(cloud)
 }
 
+/// `--colmap-ba` is track-only: the feedforward export has no multi-view
+/// reconstruction, and the track export requires an explicit output directory.
+fn validate_vggt_colmap_ba(vggt: &VggtRunArgs) -> anyhow::Result<()> {
+    if !vggt.colmap_ba {
+        return Ok(());
+    }
+    if vggt.colmap_mode != VggtColmapModeKind::Track {
+        anyhow::bail!(
+            "`--colmap-ba` requires `--colmap-mode track`: the feedforward export has no \
+             multi-view reconstruction to bundle-adjust"
+        );
+    }
+    if vggt.colmap_dir.is_none() {
+        anyhow::bail!("`--colmap-ba` requires `--colmap-dir`");
+    }
+    Ok(())
+}
+
 /// VGGT run surface: point/depth/camera inference with optional COLMAP
 /// feedforward export (`--colmap-dir`), depth-unprojected point cloud
 /// (`--depth-points`) and explicit-query tracking (`--track-queries`, which
@@ -3227,6 +3491,9 @@ fn run_vggt(
         if vggt.max_query_pts != DEFAULT_MAX_QUERY_PTS {
             anyhow::bail!("`--max-query-pts` requires `--track-auto`");
         }
+        if vggt.track_keypoints != VggtKeypointSourceKind::AlikedSp {
+            anyhow::bail!("`--track-keypoints` requires `--track-auto`");
+        }
     }
     let tracking = track_queries.is_some() || vggt.track_auto;
     if tracking && vggt.track_iters == 0 {
@@ -3243,6 +3510,7 @@ fn run_vggt(
     if vggt.track_points_ply.is_some() && !tracking {
         anyhow::bail!("`--track-points-ply` requires `--track-queries` or `--track-auto`");
     }
+    validate_vggt_colmap_ba(vggt)?;
     if vggt.colmap_mode == VggtColmapModeKind::Track {
         if vggt.colmap_dir.is_none() {
             anyhow::bail!("`--colmap-mode track` requires `--colmap-dir`");
@@ -3267,6 +3535,14 @@ fn run_vggt(
         Some(path) => Some(path.clone()),
         None if tracking => Some(vggt_default_track_output(source)),
         None => None,
+    };
+    // Fail fast on a missing external binary before weights/inference run.
+    let colmap_ba_program = if vggt.colmap_ba {
+        let program = resolve_colmap_program();
+        ensure_colmap_available(&program)?;
+        Some(program)
+    } else {
+        None
     };
 
     let stage_time = std::env::var_os("LUX3D_STAGE_TIME").is_some();
@@ -3294,6 +3570,9 @@ fn run_vggt(
                 max_query_pts: vggt.max_query_pts,
                 track_iters: vggt.track_iters,
                 dino_weights: None,
+                keypoint_source: vggt.track_keypoints.into(),
+                aliked_weights: None,
+                superpoint_weights: None,
             };
             let (inference, auto) = pipeline.run_with_auto_tracks(&prepared, &auto_options)?;
             eprintln!(
@@ -3370,6 +3649,9 @@ fn run_vggt(
                     stats.min_inliers_per_frame,
                     colmap_dir.display()
                 );
+                if let Some(program) = colmap_ba_program.as_deref() {
+                    run_colmap_bundle_adjustment(colmap_dir, program)?;
+                }
             }
         }
     }
@@ -4051,6 +4333,19 @@ mod tests {
         let _ = fs::remove_dir_all(path);
     }
 
+    fn colmap_ba_temp_dir(tag: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("current time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "lux3d-colmap-ba-{tag}-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
     #[test]
     fn routes_inspect_pi3_family() {
         let cli = Cli::parse_from([
@@ -4145,6 +4440,230 @@ mod tests {
                 "unexpected message for {flag}: `{message}`"
             );
         }
+    }
+
+    #[test]
+    fn vggt_colmap_ba_defaults_off_and_parses() {
+        let cli = Cli::parse_from([
+            "lux3d", "run", "vggt", "--source", "frames", "--output", "out.ply",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(
+            !args.vggt.colmap_ba,
+            "bundle adjustment must stay opt-in (upstream --use_ba default false)"
+        );
+
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "vggt",
+            "--source",
+            "frames",
+            "--track-auto",
+            "--colmap-mode",
+            "track",
+            "--colmap-dir",
+            "sparse",
+            "--colmap-ba",
+            "--output",
+            "out.ply",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(args.vggt.colmap_ba);
+        super::validate_vggt_colmap_ba(&args.vggt).expect("track mode with a COLMAP directory");
+    }
+
+    #[test]
+    fn vggt_colmap_ba_requires_track_mode_and_colmap_dir() {
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "vggt",
+            "--source",
+            "frames",
+            "--colmap-ba",
+            "--output",
+            "out.ply",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        let error = super::validate_vggt_colmap_ba(&args.vggt)
+            .expect_err("feedforward mode must reject --colmap-ba");
+        assert!(
+            error.to_string().contains("`--colmap-mode track`"),
+            "unexpected message: `{error}`"
+        );
+
+        // Track mode implies an output directory, but keep the dedicated
+        // message testable independently of the rest of run_vggt.
+        let vggt = super::VggtRunArgs {
+            colmap_ba: true,
+            colmap_mode: super::VggtColmapModeKind::Track,
+            colmap_dir: None,
+            ..super::VggtRunArgs::default()
+        };
+        let error = super::validate_vggt_colmap_ba(&vggt)
+            .expect_err("track mode without --colmap-dir must reject --colmap-ba");
+        assert!(
+            error.to_string().contains("`--colmap-dir`"),
+            "unexpected message: `{error}`"
+        );
+    }
+
+    #[test]
+    fn colmap_ba_argument_construction_uses_the_colmap_cli() {
+        let arguments = super::colmap_ba_args(Path::new("sparse"), Path::new("sparse/tmp-ba"));
+        let rendered: Vec<String> = arguments
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            vec![
+                "bundle_adjuster",
+                "--input_path",
+                "sparse",
+                "--output_path",
+                "sparse/tmp-ba",
+            ],
+            rendered
+        );
+    }
+
+    #[test]
+    fn colmap_ba_missing_binary_fails_fast() {
+        let missing =
+            std::env::temp_dir().join(format!("lux3d-missing-colmap-{}", std::process::id()));
+        let error = super::ensure_colmap_available(&missing)
+            .expect_err("an explicit missing binary path must fail fast");
+        let message = error.to_string();
+        assert!(
+            message.contains("does not exist"),
+            "unexpected message: `{message}`"
+        );
+        assert!(
+            message.contains("LUX3D_COLMAP_BIN"),
+            "the error must name the override: `{message}`"
+        );
+    }
+
+    #[test]
+    fn colmap_ba_install_replaces_the_model_and_preserves_other_files() {
+        let dir = colmap_ba_temp_dir("install");
+        let staging = dir.join("staging");
+        fs::create_dir_all(&staging).expect("create staging");
+        for name in super::COLMAP_BA_MODEL_FILES {
+            fs::write(dir.join(name), b"original").expect("write original model");
+            fs::write(staging.join(name), b"adjusted").expect("write adjusted model");
+        }
+        // Newer COLMAP releases also write the rig/frame tables.
+        for name in super::COLMAP_BA_OPTIONAL_MODEL_FILES {
+            fs::write(dir.join(name), b"original").expect("write original rig/frame table");
+            fs::write(staging.join(name), b"adjusted").expect("write adjusted rig/frame table");
+        }
+        fs::write(dir.join("points.ply"), b"keep").expect("write sibling file");
+
+        super::install_colmap_ba_output(&staging, &dir).expect("install adjusted model");
+        for name in super::COLMAP_BA_MODEL_FILES
+            .into_iter()
+            .chain(super::COLMAP_BA_OPTIONAL_MODEL_FILES)
+        {
+            assert_eq!(
+                b"adjusted".as_slice(),
+                fs::read(dir.join(name)).expect("read adjusted model"),
+                "`{name}` must be replaced"
+            );
+        }
+        assert_eq!(
+            b"keep".as_slice(),
+            fs::read(dir.join("points.ply")).expect("read sibling file"),
+            "other files in the export directory must be preserved"
+        );
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn colmap_ba_install_refuses_an_incomplete_adjusted_model() {
+        let dir = colmap_ba_temp_dir("incomplete");
+        let staging = dir.join("staging");
+        fs::create_dir_all(&staging).expect("create staging");
+        for name in super::COLMAP_BA_MODEL_FILES {
+            fs::write(dir.join(name), b"original").expect("write original model");
+        }
+        fs::write(staging.join("cameras.bin"), b"adjusted").expect("write partial output");
+
+        let error = super::install_colmap_ba_output(&staging, &dir)
+            .expect_err("a missing adjusted file must fail");
+        assert!(
+            error.to_string().contains("cameras.bin")
+                || error.to_string().contains("images.bin")
+                || error.to_string().contains("points3D.bin"),
+            "unexpected message: `{error}`"
+        );
+        for name in super::COLMAP_BA_MODEL_FILES {
+            assert_eq!(
+                b"original".as_slice(),
+                fs::read(dir.join(name)).expect("read original model"),
+                "`{name}` must be untouched"
+            );
+        }
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn colmap_ba_failed_command_leaves_the_model_untouched_and_cleans_staging() {
+        let dir = colmap_ba_temp_dir("failure");
+        for name in super::COLMAP_BA_MODEL_FILES {
+            fs::write(dir.join(name), b"original").expect("write original model");
+        }
+        fs::write(dir.join("points.ply"), b"keep").expect("write sibling file");
+
+        // The test harness rejects the `bundle_adjuster` arguments with a
+        // non-zero status and a stderr message, exercising the failure path
+        // without requiring COLMAP.
+        let program = std::env::current_exe().expect("test executable");
+        let error = super::run_colmap_bundle_adjustment(&dir, &program)
+            .expect_err("the fake bundle adjuster must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("failed with status"),
+            "unexpected message: `{message}`"
+        );
+        assert!(
+            message.contains("stderr tail"),
+            "the error must include the captured stderr: `{message}`"
+        );
+        assert!(
+            message.contains("left untouched"),
+            "unexpected message: `{message}`"
+        );
+
+        for name in super::COLMAP_BA_MODEL_FILES {
+            assert_eq!(
+                b"original".as_slice(),
+                fs::read(dir.join(name)).expect("read original model"),
+                "`{name}` must be untouched after a failed BA"
+            );
+        }
+        assert_eq!(
+            b"keep".as_slice(),
+            fs::read(dir.join("points.ply")).expect("read sibling file")
+        );
+        let staging_leftovers: Vec<_> = fs::read_dir(&dir)
+            .expect("list export directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".lux3d-colmap-ba-"))
+            .collect();
+        assert!(
+            staging_leftovers.is_empty(),
+            "staging directories must be cleaned up: {staging_leftovers:?}"
+        );
+        cleanup_dir(&dir);
     }
 
     /// The VGGT-only flags parse, map onto `VggtRunOptions` / the COLMAP
@@ -4331,6 +4850,31 @@ mod tests {
         assert!(args.vggt.track_auto);
         assert_eq!(8, args.vggt.query_frame_num);
         assert_eq!(4096, args.vggt.max_query_pts);
+        assert_eq!(
+            super::VggtKeypointSourceKind::AlikedSp,
+            args.vggt.track_keypoints,
+            "the official aliked+sp source is the default"
+        );
+
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "vggt",
+            "--source",
+            "frames",
+            "--output",
+            "out.ply",
+            "--track-auto",
+            "--track-keypoints",
+            "fps",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(
+            super::VggtKeypointSourceKind::Fps,
+            args.vggt.track_keypoints
+        );
 
         let cli = Cli::parse_from([
             "lux3d",
@@ -4400,6 +4944,29 @@ mod tests {
         )
         .expect_err("--max-query-pts requires --track-auto");
         assert!(error.to_string().contains("requires `--track-auto`"));
+
+        // The non-default FPS query source requires --track-auto as well.
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "vggt",
+            "--source",
+            "frames",
+            "--output",
+            "out.ply",
+            "--track-keypoints",
+            "fps",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        let error = super::run_vggt(
+            super::ModelAssetOptions::default(),
+            &args,
+            &candle_core::Device::Cpu,
+        )
+        .expect_err("--track-keypoints fps requires --track-auto");
+        assert!(error.to_string().contains("requires `--track-auto`"));
     }
 
     /// Defaults keep the historical behavior: f32, crop mode, a single forward
@@ -4428,6 +4995,10 @@ mod tests {
         assert_eq!(None, args.vggt.depth_points);
         assert_eq!(1.0, args.vggt.depth_conf_threshold);
         assert_eq!(None, args.vggt.track_queries);
+        assert_eq!(
+            super::VggtKeypointSourceKind::AlikedSp,
+            args.vggt.track_keypoints
+        );
         assert_eq!(None, args.vggt.track_output);
         assert_eq!(4, args.vggt.track_iters);
         assert_eq!(None, args.vggt.track_points_ply);

@@ -52,6 +52,7 @@ use super::{
     nn_blocks::{LayerScale, Mlp, linear, linear_fwd},
     vggt_auto_query::{VggtAutoQueryOptions, VggtAutoTrackResult},
     vggt_dpt::{VggtDptActivation, VggtDptHead},
+    vggt_keypoints::{VggtKeypointDetectors, preflight_keypoint_detectors},
     vggt_track::{TRACK_DEFAULT_ITERS, VggtTrackHead, VggtTrackQuery, VggtTrackResult},
 };
 use crate::{
@@ -142,12 +143,14 @@ enum VggtTrackPlan<'a> {
         queries: &'a [VggtTrackQuery],
         iters: usize,
     },
-    /// Stage-A automatic query selection (DINO frame ranking + FPS points +
-    /// confidence gate), tracking once per ranked query frame. The ranker is
-    /// preflighted before the shared forward so its weights fail fast.
+    /// Stage-A automatic query selection (DINO frame ranking + ALIKED +
+    /// SuperPoint or FPS queries + confidence gate), tracking once per ranked
+    /// query frame. The ranker and detectors are preflighted before the
+    /// shared forward so their weights fail fast.
     Auto {
         options: &'a VggtAutoQueryOptions,
         ranker: &'a super::vggt_auto_query::Dinov2RegRanker,
+        detectors: Option<&'a VggtKeypointDetectors>,
     },
 }
 
@@ -1068,8 +1071,9 @@ impl VggtPipeline {
     ///
     /// The aggregator runs once. Query frames are ranked by
     /// [`super::vggt_auto_query`] (DINOv2-reg CLS similarity + FPS), query
-    /// points are FPS-spread and confidence-gated, and the existing track
-    /// head runs once per query frame with that frame rotated to index 0
+    /// points come from ALIKED + SuperPoint (official default) or the opt-in
+    /// FPS grid and are confidence-gated, and the existing track head runs
+    /// once per query frame with that frame rotated to index 0
     /// (`track_predict.py:205-224`); the frame axis is rotated back before
     /// the per-query-frame track sets are concatenated.
     pub fn run_with_auto_tracks(
@@ -1102,12 +1106,21 @@ impl VggtPipeline {
             options,
             prepared.normalized_frames.device(),
         )?;
+        // Same fail-fast rule for stage-A detectors: `Fps` loads nothing,
+        // while the official `aliked-sp` default resolves both checkpoints
+        // (explicit path, env override, or the model directory) before the
+        // VGGT forward.
+        let detectors = preflight_keypoint_detectors(
+            &options.keypoint_options(),
+            prepared.normalized_frames.device(),
+        )?;
         let (output, _, track) = self.run_forward_inner(
             prepared,
             false,
             VggtTrackPlan::Auto {
                 options,
                 ranker: &ranker,
+                detectors: detectors.as_ref(),
             },
         )?;
         match track {
@@ -1290,7 +1303,11 @@ impl VggtPipeline {
                     chunk_size,
                 )?))
             }
-            VggtTrackPlan::Auto { options, ranker } => {
+            VggtTrackPlan::Auto {
+                options,
+                ranker,
+                detectors,
+            } => {
                 let track_head = self.track_head_for(&device)?;
                 // `depth_conf` is `[1, S, H, W]`; the confidence gate samples
                 // the query frame's `[H, W]` plane.
@@ -1305,6 +1322,7 @@ impl VggtPipeline {
                         &depth_conf,
                         VGGT_PATCH_START_IDX,
                         options,
+                        detectors,
                         chunk_size,
                     )?,
                 ))

@@ -636,6 +636,7 @@ fn run_vggt_flags_default_to_historical_behavior() {
     assert_eq!(None, args.vggt.vggt_dtype);
     assert_eq!(1, args.vggt.batch_size);
     assert_eq!(None, args.vggt.colmap_dir);
+    assert!(!args.vggt.colmap_ba, "bundle adjustment stays opt-in");
     assert_eq!(5.0, args.vggt.colmap_conf_threshold);
     assert_eq!(100_000, args.vggt.colmap_max_points);
     assert_eq!(None, args.vggt.depth_points);

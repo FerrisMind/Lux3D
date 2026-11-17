@@ -26,12 +26,20 @@
 //! # Stage A query points
 //!
 //! The official query points come from ALIKED + SuperPoint keypoints
-//! (`track_predict.py:67-69, 172`). Those extractors are stages B/C (VG6/VG7)
-//! and are **not** part of stage A. Stage A therefore selects query points
-//! with a deterministic FPS spread over the model-resolution pixel grid
-//! ([`fps_query_points`], per-frame cap `--max-query-pts`), then applies the
-//! official confidence gate. This is the documented stage-A limitation: the
-//! query points are DINO/FPS based, not keypoint-detector based.
+//! (`track_predict.py:67-69,172`), concatenated in that extractor order and
+//! then confidence-gated. `VggtAutoQueryOptions::keypoint_source` defaults to
+//! that official composition. For each DINO-ranked query frame the prepared
+//! model-resolution RGB frame is passed to both detectors; the official demo
+//! instead detects on its 1024 px loaded images because its tracker is
+//! separate, while Lux3D's track head consumes aggregator features at model
+//! resolution. The keypoints are scaled back to the model frame, so they are
+//! directly usable as track-head queries.
+//!
+//! Unlike the reference `torch.randperm`, the concatenated keypoints keep the
+//! deterministic ALIKED-then-SuperPoint order (the reference shuffle only
+//! changes query ordering, not the selected set). [`fps_query_points`] remains
+//! as an explicit weight-free opt-out (`--track-keypoints fps`). The official
+//! confidence gate is applied to either source.
 //!
 //! # DINO weights
 //!
@@ -60,6 +68,7 @@ use std::collections::HashMap;
 use candle_core::{D, DType, Device, IndexOp, Module, Result as CandleResult, Tensor};
 use candle_nn::{Conv2d, Conv2dConfig, LayerNorm, Linear, VarBuilder, layer_norm, ops::softmax};
 
+use super::vggt_keypoints::{VggtKeypointDetectors, VggtKeypointOptions, VggtKeypointSource};
 use super::vggt_track::{VggtTrackHead, VggtTrackQuery, VggtTrackResult};
 use super::vision_preproc::{IMAGENET_MEAN, IMAGENET_STD};
 use crate::{Result, error::Lux3dError};
@@ -108,6 +117,32 @@ pub struct VggtAutoQueryOptions {
     /// Explicit DINOv2-reg safetensors path; `None` resolves the default
     /// location (see the module docs).
     pub dino_weights: Option<PathBuf>,
+    /// Stage-A keypoint source. The official `keypoint_extractor="aliked+sp"`
+    /// default is [`VggtKeypointSource::AlikedSuperPoint`]; `Fps` keeps the
+    /// previous weight-free grid selection as an explicit opt-out.
+    pub keypoint_source: VggtKeypointSource,
+    /// Explicit ALIKED safetensors path; `None` resolves
+    /// `LUX3D_ALIKED_WEIGHTS` or the default model directory.
+    pub aliked_weights: Option<PathBuf>,
+    /// Explicit SuperPoint safetensors path; `None` resolves
+    /// `LUX3D_SUPERPOINT_WEIGHTS` or the default model directory.
+    pub superpoint_weights: Option<PathBuf>,
+}
+
+impl VggtAutoQueryOptions {
+    /// Detector options derived from the demo-level caps: the official
+    /// `initialize_feature_extractors(max_query_pts)` passes the same cap to
+    /// both ALIKED and SuperPoint, and the tracker uses `det_thres=0.005` and
+    /// LightGlue's 1024 px long-side preprocessing.
+    pub fn keypoint_options(&self) -> VggtKeypointOptions {
+        VggtKeypointOptions {
+            source: self.keypoint_source,
+            max_keypoints: self.max_query_pts,
+            aliked_weights: self.aliked_weights.clone(),
+            superpoint_weights: self.superpoint_weights.clone(),
+            ..VggtKeypointOptions::default()
+        }
+    }
 }
 
 impl Default for VggtAutoQueryOptions {
@@ -117,6 +152,9 @@ impl Default for VggtAutoQueryOptions {
             max_query_pts: DEFAULT_MAX_QUERY_PTS,
             track_iters: super::vggt_track::TRACK_DEFAULT_ITERS,
             dino_weights: None,
+            keypoint_source: VggtKeypointSource::AlikedSuperPoint,
+            aliked_weights: None,
+            superpoint_weights: None,
         }
     }
 }
@@ -1042,10 +1080,12 @@ fn conf_plane(conf: &Tensor, frame: usize) -> Result<Vec<Vec<f32>>> {
 /// Run stage-A query selection and the existing explicit-query track head.
 ///
 /// `frames` is the `[1, S, 3, H, W]` normalized model input, `rgb_frames`
-/// the `[S, 3, H, W]` `[0, 1]` frames used by DINO, and `conf` the
-/// `[S, H, W]` depth-confidence map used by the query gate. `ranker` is the
-/// preflighted DINOv2-reg ranker (loaded before the VGGT forward by
-/// [`preflight_dino_weights`]) and is reused here.
+/// the `[S, 3, H, W]` `[0, 1]` frames used by DINO and the keypoint
+/// detectors, and `conf` the `[S, H, W]` depth-confidence map used by the
+/// query gate. `ranker` is the preflighted DINOv2-reg ranker (loaded before
+/// the VGGT forward by [`preflight_dino_weights`]) and is reused here.
+/// `detectors` is the preflighted ALIKED + SuperPoint pair, or `None` for the
+/// opt-in FPS grid source.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_auto_tracking(
     track_head: &VggtTrackHead,
@@ -1056,6 +1096,7 @@ pub(crate) fn run_auto_tracking(
     conf: &Tensor,
     patch_start_idx: usize,
     options: &VggtAutoQueryOptions,
+    detectors: Option<&VggtKeypointDetectors>,
     chunk_size: usize,
 ) -> Result<VggtAutoTrackResult> {
     if options.query_frame_num == 0 {
@@ -1110,9 +1151,14 @@ pub(crate) fn run_auto_tracking(
     let ranked_query_frames = order_query_frames(&ranked);
 
     // The FPS spread over the model grid is deterministic and independent of
-    // the query frame; only the confidence gate below is per frame. Compute
-    // it once and reuse the pruned subsets.
-    let query_points_base = fps_query_points(height, width, options.max_query_pts);
+    // the query frame; only the confidence gate below is per frame. It is
+    // computed once when the weight-free source is selected. ALIKED +
+    // SuperPoint runs per query frame exactly like `_forward_on_query`.
+    let query_points_base = if detectors.is_none() {
+        fps_query_points(height, width, options.max_query_pts)
+    } else {
+        Vec::new()
+    };
 
     let mut coords = Vec::with_capacity(ranked_query_frames.len());
     let mut visibility = Vec::with_capacity(ranked_query_frames.len());
@@ -1125,13 +1171,32 @@ pub(crate) fn run_auto_tracking(
 
     for query_frame in &ranked_query_frames {
         let conf = conf_plane(conf, *query_frame)?;
-        let (points, pruned) = prune_query_points_by_confidence(
-            &query_points_base,
-            &conf,
-            width,
-            QUERY_CONF_THRESHOLD,
-            QUERY_CONF_MIN_POINTS,
-        );
+        let (points, pruned) = if let Some(detectors) = detectors {
+            let frame = rgb_frames
+                .narrow(0, *query_frame, 1)
+                .and_then(|frame| frame.squeeze(0))
+                .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                    message: format!(
+                        "VGGT auto query: failed to select query frame {query_frame} for keypoint detection: {source}"
+                    ),
+                })?;
+            let keypoints = detectors.detect_query_points(&frame)?;
+            prune_query_points_by_confidence(
+                &keypoints.keypoints,
+                &conf,
+                width,
+                QUERY_CONF_THRESHOLD,
+                QUERY_CONF_MIN_POINTS,
+            )
+        } else {
+            prune_query_points_by_confidence(
+                &query_points_base,
+                &conf,
+                width,
+                QUERY_CONF_THRESHOLD,
+                QUERY_CONF_MIN_POINTS,
+            )
+        };
         if points.is_empty() {
             return Err(Lux3dError::InvalidInput(
                 "VGGT auto query: confidence gating removed every query point",
@@ -1660,5 +1725,32 @@ mod tests {
                 pos[0][1][index]
             );
         }
+    }
+
+    #[test]
+    fn keypoint_options_follow_the_demo_caps_and_source() {
+        let options = VggtAutoQueryOptions {
+            max_query_pts: 123,
+            keypoint_source: VggtKeypointSource::Fps,
+            ..VggtAutoQueryOptions::default()
+        };
+        let keypoints = options.keypoint_options();
+        assert_eq!(VggtKeypointSource::Fps, keypoints.source);
+        assert_eq!(123, keypoints.max_keypoints);
+        assert_eq!(0.005, keypoints.detection_threshold);
+        assert_eq!(Some(1024), keypoints.resize_long_side);
+        assert!(keypoints.aliked_weights.is_none());
+        assert!(keypoints.superpoint_weights.is_none());
+
+        let defaults = VggtAutoQueryOptions::default();
+        assert_eq!(
+            VggtKeypointSource::AlikedSuperPoint,
+            defaults.keypoint_source,
+            "the official aliked+sp composition is the default"
+        );
+        assert_eq!(
+            DEFAULT_MAX_QUERY_PTS,
+            defaults.keypoint_options().max_keypoints
+        );
     }
 }

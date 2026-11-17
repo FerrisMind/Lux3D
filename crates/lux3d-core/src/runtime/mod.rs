@@ -12,9 +12,13 @@ use candle_core::{DType, Device, DeviceLocation, Tensor};
 use image::DynamicImage;
 use image::imageops::FilterType;
 
+mod aliked;
 mod attention_math;
+mod keypoints;
 mod nn_blocks;
 mod npy;
+mod superpoint;
+mod vggt_keypoints;
 
 /// Re-exported so the weights module (and its tests) can reshape GGUF-stored
 /// rank>4 tensors without reaching into the private `nn_blocks` module.
@@ -204,6 +208,10 @@ pub use vggt::{
 };
 pub use vggt_auto_query::{
     VggtAutoQueryOptions, VggtAutoTrackResult, DEFAULT_MAX_QUERY_PTS, DEFAULT_QUERY_FRAME_NUM,
+};
+pub use vggt_keypoints::{
+    ALIKED_WEIGHTS_ENV, KEYPOINT_WEIGHTS_DIR, SUPERPOINT_WEIGHTS_ENV, VggtKeypointDetectors,
+    VggtKeypointOptions, VggtKeypointSource,
 };
 pub use vggt_track::{
     VggtTrackHead, VggtTrackQuery, VggtTrackResult, bilinear_sample_features,

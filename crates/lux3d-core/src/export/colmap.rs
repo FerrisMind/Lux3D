@@ -2868,6 +2868,7 @@ mod tests {
                     max_query_pts: 96,
                     track_iters: 4,
                     dino_weights: None,
+                    ..VggtAutoQueryOptions::default()
                 },
             )
             .expect("auto tracking");
