@@ -42,10 +42,10 @@
 
 use std::sync::OnceLock;
 
-use super::nn_blocks::{Linear, linear_dense as linear, linear_no_bias_dense as linear_no_bias};
+use super::nn_blocks::{linear_dense as linear, linear_no_bias_dense as linear_no_bias, Linear};
 use crate::weights::VarBuilder;
-use candle_core::{D, DType, Device, Result as CandleResult, Tensor};
-use candle_nn::{LayerNorm, Module, layer_norm};
+use candle_core::{DType, Device, Result as CandleResult, Tensor, D};
+use candle_nn::{layer_norm, LayerNorm, Module};
 
 use super::attention_math::{exact_query_chunked_sdpa, exact_sdpa_heads};
 
@@ -65,7 +65,11 @@ fn attn_chunk_size() -> usize {
 ///
 /// Defaults replicate `TripoSGDiTModel.__init__` (`num_attention_heads=16`,
 /// `width=2048`, `in_channels=64`, `num_layers=21`,
-/// `cross_attention_dim=1024`) plus the hardcoded `mlp_ratio=4.0`.
+/// `cross_attention_dim=1024`, `use_cross_attention_2=false`) plus the
+/// hardcoded `mlp_ratio=4.0`. The scribble checkpoint sets
+/// `use_cross_attention_2=true` with `cross_attention_dim=768` (CLIP text) and
+/// `cross_attention_2_dim=1024` (DINOv2 image); see
+/// `DiTBlock.forward` in `triposg/models/transformers/triposg_transformer.py`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TripoSgTransformerConfig {
     pub in_channels: usize,
@@ -73,6 +77,10 @@ pub struct TripoSgTransformerConfig {
     pub num_attention_heads: usize,
     pub num_layers: usize,
     pub cross_attention_dim: usize,
+    /// Second cross-attention branch (`attn2_2` in the reference block).
+    pub use_cross_attention_2: bool,
+    /// Encoder width of the second cross-attention branch.
+    pub cross_attention_2_dim: Option<usize>,
     pub mlp_ratio: f64,
 }
 
@@ -84,6 +92,8 @@ impl Default for TripoSgTransformerConfig {
             num_attention_heads: 16,
             num_layers: 21,
             cross_attention_dim: 1024,
+            use_cross_attention_2: false,
+            cross_attention_2_dim: None,
             mlp_ratio: 4.0,
         }
     }
@@ -108,6 +118,14 @@ impl TripoSgTransformerConfig {
             num_attention_heads: get_usize("num_attention_heads", 16),
             num_layers: get_usize("num_layers", 21),
             cross_attention_dim: get_usize("cross_attention_dim", 1024),
+            use_cross_attention_2: source
+                .get("use_cross_attention_2")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            cross_attention_2_dim: source
+                .get("cross_attention_2_dim")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize),
             mlp_ratio: source
                 .get("mlp_ratio")
                 .and_then(|v| v.as_f64())
@@ -126,6 +144,19 @@ impl TripoSgTransformerConfig {
                 self.width,
                 self.cross_attention_dim
             );
+        }
+        if self.use_cross_attention_2 {
+            match self.cross_attention_2_dim {
+                Some(dim) if dim > 0 => {}
+                Some(dim) => candle_core::bail!(
+                    "TripoSG DiT use_cross_attention_2 is set with \
+                     cross_attention_2_dim={dim}; it must be positive"
+                ),
+                None => candle_core::bail!(
+                    "TripoSG DiT use_cross_attention_2 is set but the config has no \
+                     cross_attention_2_dim"
+                ),
+            }
         }
         if self.num_attention_heads == 0 || self.width % self.num_attention_heads != 0 {
             candle_core::bail!(
@@ -224,6 +255,32 @@ impl TripoSgDiT {
     /// (e.g. 1000.0), `cond [B, S, cross_attention_dim]` (for CFG the batch
     /// already carries `[uncond, cond]`) -> velocity `[B, L, in_channels]`.
     pub fn forward(&self, latents: &Tensor, timestep: f32, cond: &Tensor) -> CandleResult<Tensor> {
+        self.forward_with_conditioning(latents, timestep, cond, None, 1.0, 1.0)
+    }
+
+    /// Forward with the optional SECOND cross-attention conditioning branch
+    /// and the per-branch output scales of the reference scribble pipeline.
+    ///
+    /// `encoder_hidden_states_2 = image_cond` feeds `attn2_2`;
+    /// `cross_attention_scale`/`cross_attention_2_scale` multiply the two
+    /// cross-attention outputs before they are added to the residual
+    /// (`pipeline_triposg_scribble.py:271-278` passes
+    /// `attention_kwargs={"cross_attention_scale": prompt_confidence,
+    /// "cross_attention_2_scale": scribble_confidence}`, consumed by
+    /// `DiTBlock.forward` at `triposg_transformer.py:300-301, 333-349`).
+    ///
+    /// The image (single-conditioning) path is `cond2 = None` with both
+    /// scales `1.0`, i.e. exactly the pre-existing behavior; the `1.0`
+    /// multiply is skipped so no extra kernel runs on that path.
+    pub fn forward_with_conditioning(
+        &self,
+        latents: &Tensor,
+        timestep: f32,
+        cond: &Tensor,
+        cond2: Option<&Tensor>,
+        cross_attention_scale: f32,
+        cross_attention_2_scale: f32,
+    ) -> CandleResult<Tensor> {
         let (batch, num_tokens, channels) = latents.dims3()?;
         if channels != self.cfg.in_channels {
             candle_core::bail!(
@@ -242,6 +299,41 @@ impl TripoSgDiT {
             candle_core::bail!(
                 "TripoSG DiT expects cross-attention dim {}, got {cond_dim}",
                 self.cfg.cross_attention_dim
+            );
+        }
+        match (self.cfg.use_cross_attention_2, cond2) {
+            (true, Some(cond2)) => {
+                let (cond2_batch, _cond2_seq, cond2_dim) = cond2.dims3()?;
+                if cond2_batch != batch {
+                    candle_core::bail!(
+                        "TripoSG DiT second condition batch {cond2_batch} does not match \
+                         latent batch {batch}"
+                    );
+                }
+                let expected = self
+                    .cfg
+                    .cross_attention_2_dim
+                    .expect("validated use_cross_attention_2 config");
+                if cond2_dim != expected {
+                    candle_core::bail!(
+                        "TripoSG DiT expects cross-attention_2 dim {expected}, got {cond2_dim}"
+                    );
+                }
+            }
+            (true, None) => candle_core::bail!(
+                "TripoSG DiT config has use_cross_attention_2 but no encoder_hidden_states_2 \
+                 was supplied"
+            ),
+            (false, Some(_)) => candle_core::bail!(
+                "TripoSG DiT received encoder_hidden_states_2 but the config does not use \
+                 cross_attention_2"
+            ),
+            (false, None) => {}
+        }
+        if !cross_attention_scale.is_finite() || !cross_attention_2_scale.is_finite() {
+            candle_core::bail!(
+                "TripoSG DiT cross-attention scales must be finite, got \
+                 ({cross_attention_scale}, {cross_attention_2_scale})"
             );
         }
 
@@ -271,7 +363,15 @@ impl TripoSgDiT {
                         .expect("TripoSG DiT skip stack underflow is a config bug"),
                 )
             };
-            hidden = block.forward(&hidden, cond, skip.as_ref(), self.attn_chunk)?;
+            hidden = block.forward(
+                &hidden,
+                cond,
+                cond2,
+                skip.as_ref(),
+                self.attn_chunk,
+                cross_attention_scale,
+                cross_attention_2_scale,
+            )?;
             if index < mid {
                 skips.push(hidden.clone());
             }
@@ -310,7 +410,14 @@ impl TripoSgDiT {
 }
 
 /// One HunyuanDiT-style block: (optional long skip) -> self-attn ->
-/// cross-attn -> FFN, all pre-normed, all residual.
+/// cross-attn(s) -> FFN, all pre-normed, all residual.
+///
+/// With `use_cross_attention_2` the block carries the reference `attn2_2`
+/// second cross-attention branch. Both cross-attentions read the SAME
+/// pre-cross-attention hidden state (upstream expression
+/// `hidden + attn2(norm2(hidden)) * s1 + attn2_2(norm2_2(hidden)) * s2`,
+/// `triposg_transformer.py:333-349`), and their outputs are scaled
+/// independently before the sum.
 #[derive(Debug)]
 struct DiTBlock {
     skip_norm: Option<LayerNorm>,
@@ -319,6 +426,8 @@ struct DiTBlock {
     attn1: DiTAttention,
     norm2: LayerNorm,
     attn2: DiTAttention,
+    norm2_2: Option<LayerNorm>,
+    attn2_2: Option<DiTAttention>,
     norm3: LayerNorm,
     ff_in: Linear,
     ff_out: Linear,
@@ -335,6 +444,17 @@ impl DiTBlock {
         } else {
             (None, None)
         };
+        let (norm2_2, attn2_2) = if cfg.use_cross_attention_2 {
+            let dim = cfg
+                .cross_attention_2_dim
+                .expect("validated use_cross_attention_2 config");
+            (
+                Some(layer_norm(cfg.width, 1e-5, vb.pp("norm2_2"))?),
+                Some(DiTAttention::load(vb.pp("attn2_2"), cfg, Some(dim))?),
+            )
+        } else {
+            (None, None)
+        };
         Ok(Self {
             skip_norm,
             skip_linear,
@@ -342,6 +462,8 @@ impl DiTBlock {
             attn1: DiTAttention::load(vb.pp("attn1"), cfg, None)?,
             norm2: layer_norm(cfg.width, 1e-5, vb.pp("norm2"))?,
             attn2: DiTAttention::load(vb.pp("attn2"), cfg, Some(cfg.cross_attention_dim))?,
+            norm2_2,
+            attn2_2,
             norm3: layer_norm(cfg.width, 1e-5, vb.pp("norm3"))?,
             ff_in: linear(
                 cfg.width,
@@ -352,12 +474,16 @@ impl DiTBlock {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         xs: &Tensor,
         cond: &Tensor,
+        cond2: Option<&Tensor>,
         skip: Option<&Tensor>,
         attn_chunk: usize,
+        cross_attention_scale: f32,
+        cross_attention_2_scale: f32,
     ) -> CandleResult<Tensor> {
         let mut hidden = match (self.skip_linear.as_ref(), self.skip_norm.as_ref(), skip) {
             (Some(skip_linear), Some(skip_norm), Some(skip)) => {
@@ -376,10 +502,33 @@ impl DiTBlock {
         hidden = (hidden + attn_out)?;
 
         // Cross-attention on the image embeds, reference scale 1.0.
-        let cross_out =
-            self.attn2
-                .forward(&self.norm2.forward(&hidden)?, Some(cond), attn_chunk)?;
-        hidden = (hidden + cross_out)?;
+        let cross_residual = hidden.clone();
+        let cross_out = self.attn2.forward(
+            &self.norm2.forward(&cross_residual)?,
+            Some(cond),
+            attn_chunk,
+        )?;
+        let cross_out = if cross_attention_scale == 1.0 {
+            cross_out
+        } else {
+            cross_out.affine(f64::from(cross_attention_scale), 0.0)?
+        };
+        hidden = (&cross_residual + cross_out)?;
+        if let (Some(norm2_2), Some(attn2_2), Some(cond2)) =
+            (self.norm2_2.as_ref(), self.attn2_2.as_ref(), cond2)
+        {
+            // The second branch reads the SAME residual as the first one
+            // (`triposg_transformer.py:343-348` applies `norm2_2` to the
+            // un-updated `hidden_states`).
+            let cross_out_2 =
+                attn2_2.forward(&norm2_2.forward(&cross_residual)?, Some(cond2), attn_chunk)?;
+            let cross_out_2 = if cross_attention_2_scale == 1.0 {
+                cross_out_2
+            } else {
+                cross_out_2.affine(f64::from(cross_attention_2_scale), 0.0)?
+            };
+            hidden = (hidden + cross_out_2)?;
+        }
 
         // FFN: exact GELU between the two projections.
         let ff = self.ff_out.forward(
@@ -698,4 +847,467 @@ pub fn denoise_with_schedule(
             .to_dtype(dtype)?;
     }
     latents.to_dtype(DType::F32)
+}
+
+/// Dual-controller denoise loop of the reference scribble pipeline
+/// (`TripoSGScribblePipeline.__call__`, `pipeline_triposg_scribble.py:258-291`).
+///
+/// Text (`encoder_hidden_states`) and scribble-image
+/// (`encoder_hidden_states_2`) conditioning feed the two cross-attention
+/// branches with independent output scales. Classifier-free guidance follows
+/// the reference `do_classifier_free_guidance = guidance_scale > 1` rule; the
+/// shipped scribble script passes `guidance_scale=0`, so the default path is a
+/// single batch with no uncond pass. The negative branches, when guidance is
+/// enabled, are `zeros_like` of the conditioning tensors exactly like
+/// `encode_text`/`encode_image` (`:146, :158`).
+///
+/// `latents_init [B, L, 64]`, `text_cond [B, 77, 768]`,
+/// `image_cond [B, 257, 1024]`; returns F32 latents.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_dual_with_schedule(
+    dit: &TripoSgDiT,
+    latents_init: &Tensor,
+    text_cond: &Tensor,
+    image_cond: &Tensor,
+    scheduler: &RectifiedFlowSchedule,
+    guidance: f32,
+    cross_attention_scale: f32,
+    cross_attention_2_scale: f32,
+    dtype: DType,
+) -> CandleResult<Tensor> {
+    if !guidance.is_finite() {
+        candle_core::bail!("TripoSG scribble guidance scale must be finite, got {guidance}");
+    }
+    let steps = scheduler.sigmas.len().saturating_sub(1);
+    let latents_init = latents_init.to_dtype(dtype)?;
+    let text_cond = text_cond.to_dtype(dtype)?;
+    let image_cond = image_cond.to_dtype(dtype)?;
+    let do_classifier_free_guidance = guidance > 1.0;
+
+    let (text_cond, image_cond) = if do_classifier_free_guidance {
+        (
+            Tensor::cat(&[&Tensor::zeros_like(&text_cond)?, &text_cond], 0)?,
+            Tensor::cat(&[&Tensor::zeros_like(&image_cond)?, &image_cond], 0)?,
+        )
+    } else {
+        (text_cond, image_cond)
+    };
+
+    let mut latents = latents_init;
+    for index in 0..steps {
+        let latent_model_input = if do_classifier_free_guidance {
+            Tensor::cat(&[&latents, &latents], 0)?
+        } else {
+            latents.clone()
+        };
+        let velocity = dit.forward_with_conditioning(
+            &latent_model_input,
+            scheduler.timestep(index),
+            &text_cond,
+            Some(&image_cond),
+            cross_attention_scale,
+            cross_attention_2_scale,
+        )?;
+        let velocity = if do_classifier_free_guidance {
+            let parts = velocity.chunk(2, 0)?;
+            // v = v_uncond + guidance * (v_cond - v_uncond), batch 0 = uncond.
+            (&parts[0] + (&parts[1] - &parts[0])?.affine(guidance as f64, 0.0)?)?
+        } else {
+            velocity
+        };
+        latents = scheduler
+            .step(index, &velocity, &latents)?
+            .to_dtype(dtype)?;
+    }
+    latents.to_dtype(DType::F32)
+}
+
+#[cfg(test)]
+mod dual_cross_attention_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Deterministic pseudo-random weights in `[-0.5, 0.5)` for structural
+    /// forward tests (no checkpoint needed).
+    fn next_weight(state: &mut u64) -> f32 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let unit = (*state >> 40) as f32 / (1u32 << 24) as f32;
+        unit - 0.5
+    }
+
+    fn tensor(shape: &[usize], state: &mut u64, device: &Device) -> Tensor {
+        let count: usize = shape.iter().product();
+        let values = (0..count).map(|_| next_weight(state)).collect::<Vec<_>>();
+        Tensor::from_vec(values, shape.to_vec(), device).expect("random tensor")
+    }
+
+    fn norm_tensor(size: usize, state: &mut u64, device: &Device) -> Tensor {
+        let values = (0..size)
+            .map(|_| 1.0 + next_weight(state) * 0.1)
+            .collect::<Vec<_>>();
+        Tensor::from_vec(values, size, device).expect("norm weight")
+    }
+
+    fn zeros(size: usize, device: &Device) -> Tensor {
+        Tensor::zeros(size, DType::F32, device).expect("zeros")
+    }
+
+    fn zero_tensor(shape: &[usize], device: &Device) -> Tensor {
+        Tensor::zeros(shape.to_vec(), DType::F32, device).expect("zero tensor")
+    }
+
+    fn insert_attention(
+        map: &mut HashMap<String, Tensor>,
+        prefix: &str,
+        width: usize,
+        kv_dim: usize,
+        head_dim: usize,
+        state: &mut u64,
+        device: &Device,
+    ) {
+        map.insert(
+            format!("{prefix}.to_q.weight"),
+            tensor(&[width, width], state, device),
+        );
+        map.insert(
+            format!("{prefix}.to_k.weight"),
+            tensor(&[width, kv_dim], state, device),
+        );
+        map.insert(
+            format!("{prefix}.to_v.weight"),
+            tensor(&[width, kv_dim], state, device),
+        );
+        map.insert(
+            format!("{prefix}.norm_q.weight"),
+            norm_tensor(head_dim, state, device),
+        );
+        map.insert(
+            format!("{prefix}.norm_k.weight"),
+            norm_tensor(head_dim, state, device),
+        );
+        map.insert(
+            format!("{prefix}.to_out.0.weight"),
+            tensor(&[width, width], state, device),
+        );
+        map.insert(format!("{prefix}.to_out.0.bias"), zeros(width, device));
+    }
+
+    fn insert_block(
+        map: &mut HashMap<String, Tensor>,
+        prefix: &str,
+        cfg: &TripoSgTransformerConfig,
+        state: &mut u64,
+        device: &Device,
+        zero_ff: bool,
+    ) {
+        let width = cfg.width;
+        let head_dim = cfg.head_dim();
+        for norm in ["norm1", "norm2", "norm3"] {
+            map.insert(
+                format!("{prefix}.{norm}.weight"),
+                norm_tensor(width, state, device),
+            );
+            map.insert(format!("{prefix}.{norm}.bias"), zeros(width, device));
+        }
+        insert_attention(
+            map,
+            &format!("{prefix}.attn1"),
+            width,
+            width,
+            head_dim,
+            state,
+            device,
+        );
+        insert_attention(
+            map,
+            &format!("{prefix}.attn2"),
+            width,
+            cfg.cross_attention_dim,
+            head_dim,
+            state,
+            device,
+        );
+        if cfg.use_cross_attention_2 {
+            map.insert(
+                format!("{prefix}.norm2_2.weight"),
+                norm_tensor(width, state, device),
+            );
+            map.insert(format!("{prefix}.norm2_2.bias"), zeros(width, device));
+            insert_attention(
+                map,
+                &format!("{prefix}.attn2_2"),
+                width,
+                cfg.cross_attention_2_dim.expect("dual config dim"),
+                head_dim,
+                state,
+                device,
+            );
+        }
+        let ff_inner = cfg.ff_inner_dim();
+        if zero_ff {
+            map.insert(
+                format!("{prefix}.ff.net.0.proj.weight"),
+                zero_tensor(&[ff_inner, width], device),
+            );
+            map.insert(
+                format!("{prefix}.ff.net.0.proj.bias"),
+                zeros(ff_inner, device),
+            );
+            map.insert(
+                format!("{prefix}.ff.net.2.weight"),
+                zero_tensor(&[width, ff_inner], device),
+            );
+            map.insert(format!("{prefix}.ff.net.2.bias"), zeros(width, device));
+        } else {
+            map.insert(
+                format!("{prefix}.ff.net.0.proj.weight"),
+                tensor(&[ff_inner, width], state, device),
+            );
+            map.insert(
+                format!("{prefix}.ff.net.0.proj.bias"),
+                zeros(ff_inner, device),
+            );
+            map.insert(
+                format!("{prefix}.ff.net.2.weight"),
+                tensor(&[width, ff_inner], state, device),
+            );
+            map.insert(format!("{prefix}.ff.net.2.bias"), zeros(width, device));
+        }
+    }
+
+    fn tiny_config(dual: bool) -> TripoSgTransformerConfig {
+        TripoSgTransformerConfig {
+            in_channels: 4,
+            width: 16,
+            num_attention_heads: 2,
+            num_layers: 3,
+            cross_attention_dim: 8,
+            use_cross_attention_2: dual,
+            cross_attention_2_dim: dual.then_some(12),
+            mlp_ratio: 4.0,
+        }
+    }
+
+    /// Build a one-block VarBuilder with the FFN zeroed so the block output is
+    /// exactly `hidden + cross_1 * s1 + cross_2 * s2` (no nonlinearity after
+    /// the scaled sum).
+    fn single_block_vars(
+        cfg: &TripoSgTransformerConfig,
+        device: &Device,
+    ) -> (VarBuilder<'static>, Tensor, Tensor, Tensor) {
+        let mut state = 42_u64;
+        let mut map = HashMap::new();
+        insert_block(&mut map, "blocks.0", cfg, &mut state, device, true);
+        let vb = VarBuilder::from_tensors(map, DType::F32, device);
+        let latents = tensor(&[1, 5, cfg.width], &mut state, device);
+        let text = tensor(&[1, 3, cfg.cross_attention_dim], &mut state, device);
+        let image = tensor(
+            &[1, 4, cfg.cross_attention_2_dim.expect("dual dim")],
+            &mut state,
+            device,
+        );
+        (vb, latents, text, image)
+    }
+
+    #[test]
+    fn per_branch_scales_are_applied_independently() {
+        let device = Device::Cpu;
+        let cfg = tiny_config(true);
+        let (vb, latents, text, image) = single_block_vars(&cfg, &device);
+        let block = DiTBlock::load(vb.pp("blocks").pp("0"), &cfg, 0).expect("dual block load");
+        let run = |scale1: f32, scale2: f32| {
+            block
+                .forward(&latents, &text, Some(&image), None, 16, scale1, scale2)
+                .expect("block forward")
+                .flatten_all()
+                .expect("flatten")
+                .to_vec1::<f32>()
+                .expect("vec")
+        };
+
+        let base = run(0.0, 0.0);
+        let branch1 = run(1.0, 0.0);
+        let branch2 = run(0.0, 1.0);
+        let half = run(0.5, 0.5);
+
+        let delta1 = branch1
+            .iter()
+            .zip(&base)
+            .map(|(a, b)| a - b)
+            .collect::<Vec<_>>();
+        let delta2 = branch2
+            .iter()
+            .zip(&base)
+            .map(|(a, b)| a - b)
+            .collect::<Vec<_>>();
+        assert!(
+            delta1.iter().any(|d| d.abs() > 1e-6),
+            "text cross-attention branch must influence the block output"
+        );
+        assert!(
+            delta2.iter().any(|d| d.abs() > 1e-6),
+            "second cross-attention branch must influence the block output"
+        );
+
+        // One block, zeroed FFN: out(s1, s2) = base + s1*delta1 + s2*delta2
+        // exactly (both branches read the same pre-cross-attention hidden
+        // state, matching triposg_transformer.py:333-349).
+        let mut max_error = 0.0_f32;
+        for index in 0..base.len() {
+            let expected = base[index] + 0.5 * delta1[index] + 0.5 * delta2[index];
+            max_error = max_error.max((half[index] - expected).abs());
+        }
+        assert!(
+            max_error <= 2e-5,
+            "per-branch scale linearity violated: max abs error {max_error:.3e}"
+        );
+    }
+
+    #[test]
+    fn single_cross_attention_path_is_unchanged() {
+        let device = Device::Cpu;
+        let single_cfg = tiny_config(false);
+        let mut state = 7_u64;
+        let mut map = HashMap::new();
+        insert_block(&mut map, "blocks.0", &single_cfg, &mut state, &device, true);
+        let vb = VarBuilder::from_tensors(map, DType::F32, &device);
+        let block =
+            DiTBlock::load(vb.pp("blocks").pp("0"), &single_cfg, 0).expect("single block load");
+        let latents = tensor(&[1, 5, single_cfg.width], &mut state, &device);
+        let text = tensor(&[1, 3, single_cfg.cross_attention_dim], &mut state, &device);
+        let output = block
+            .forward(&latents, &text, None, None, 16, 1.0, 1.0)
+            .expect("single forward");
+        assert_eq!(output.dims(), [1, 5, single_cfg.width]);
+        assert!(
+            output
+                .flatten_all()
+                .expect("flatten")
+                .to_vec1::<f32>()
+                .expect("vec")
+                .iter()
+                .all(|value| value.is_finite()),
+            "single-attention block output must be finite"
+        );
+    }
+
+    /// A full tiny DiT (3 blocks, skip on the last block) with deterministic
+    /// random weights.
+    fn build_tiny_dit(cfg: &TripoSgTransformerConfig, seed: u64) -> TripoSgDiT {
+        let device = Device::Cpu;
+        let mut state = seed;
+        let mut map = HashMap::new();
+        map.insert(
+            "proj_in.weight".to_string(),
+            tensor(&[cfg.width, cfg.in_channels], &mut state, &device),
+        );
+        map.insert("proj_in.bias".to_string(), zeros(cfg.width, &device));
+        map.insert(
+            "time_proj.linear_1.weight".to_string(),
+            tensor(&[cfg.time_embed_dim(), cfg.width], &mut state, &device),
+        );
+        map.insert(
+            "time_proj.linear_1.bias".to_string(),
+            zeros(cfg.time_embed_dim(), &device),
+        );
+        map.insert(
+            "time_proj.linear_2.weight".to_string(),
+            tensor(&[cfg.width, cfg.time_embed_dim()], &mut state, &device),
+        );
+        map.insert(
+            "time_proj.linear_2.bias".to_string(),
+            zeros(cfg.width, &device),
+        );
+        for index in 0..cfg.num_layers {
+            let prefix = format!("blocks.{index}");
+            insert_block(&mut map, &prefix, cfg, &mut state, &device, false);
+            if index > cfg.num_layers / 2 {
+                map.insert(
+                    format!("{prefix}.skip_norm.weight"),
+                    norm_tensor(cfg.width, &mut state, &device),
+                );
+                map.insert(
+                    format!("{prefix}.skip_norm.bias"),
+                    zeros(cfg.width, &device),
+                );
+                map.insert(
+                    format!("{prefix}.skip_linear.weight"),
+                    tensor(&[cfg.width, 2 * cfg.width], &mut state, &device),
+                );
+                map.insert(
+                    format!("{prefix}.skip_linear.bias"),
+                    zeros(cfg.width, &device),
+                );
+            }
+        }
+        map.insert(
+            "norm_out.weight".to_string(),
+            norm_tensor(cfg.width, &mut state, &device),
+        );
+        map.insert("norm_out.bias".to_string(), zeros(cfg.width, &device));
+        map.insert(
+            "proj_out.weight".to_string(),
+            tensor(&[cfg.in_channels, cfg.width], &mut state, &device),
+        );
+        map.insert("proj_out.bias".to_string(), zeros(cfg.in_channels, &device));
+        TripoSgDiT::load(VarBuilder::from_tensors(map, DType::F32, &device), cfg)
+            .expect("tiny DiT load")
+    }
+
+    /// Full 3-block DiT forward with random weights: dual conditioning
+    /// produces the latent shape, the image path still runs, and mismatched
+    /// conditioning is rejected.
+    #[test]
+    fn full_dit_dual_forward_shapes_and_guards() {
+        let device = Device::Cpu;
+        let cfg = tiny_config(true);
+        let dit = build_tiny_dit(&cfg, 99);
+        let mut state = 1234_u64;
+        let latents = tensor(&[1, 5, cfg.in_channels], &mut state, &device);
+        let text = tensor(&[1, 3, cfg.cross_attention_dim], &mut state, &device);
+        let image = tensor(
+            &[1, 4, cfg.cross_attention_2_dim.expect("dual dim")],
+            &mut state,
+            &device,
+        );
+
+        let dual = dit
+            .forward_with_conditioning(&latents, 500.0, &text, Some(&image), 0.4, 1.0)
+            .expect("dual forward");
+        assert_eq!(dual.dims(), [1, 5, cfg.in_channels]);
+        assert!(dual
+            .flatten_all()
+            .expect("flatten")
+            .to_vec1::<f32>()
+            .expect("vec")
+            .iter()
+            .all(|value| value.is_finite()));
+
+        let missing_second = dit.forward(&latents, 500.0, &text).unwrap_err();
+        assert!(
+            missing_second
+                .to_string()
+                .contains("no encoder_hidden_states_2"),
+            "missing second conditioning must be reported, got {missing_second}"
+        );
+
+        let single_cfg = tiny_config(false);
+        let single = build_tiny_dit(&single_cfg, 5);
+        let single_text = tensor(&[1, 3, single_cfg.cross_attention_dim], &mut state, &device);
+        let single_latents = tensor(&[1, 5, single_cfg.in_channels], &mut state, &device);
+        let output = single
+            .forward_with_conditioning(&single_latents, 500.0, &single_text, None, 1.0, 1.0)
+            .expect("single forward");
+        assert_eq!(output.dims(), [1, 5, single_cfg.in_channels]);
+
+        let rejected = single
+            .forward_with_conditioning(&single_latents, 500.0, &single_text, Some(&image), 1.0, 1.0)
+            .unwrap_err();
+        assert!(
+            rejected.to_string().contains("does not use"),
+            "unexpected second conditioning must be rejected, got {rejected}"
+        );
+    }
 }

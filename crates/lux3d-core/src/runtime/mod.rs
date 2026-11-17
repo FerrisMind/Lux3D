@@ -102,6 +102,7 @@ mod triposg_dino;
 mod triposg_dit;
 mod triposg_field;
 mod triposg_flash;
+mod triposg_text;
 mod triposg_vae;
 mod triposr;
 mod triposr_field;
@@ -169,19 +170,25 @@ pub use trellis2_vae::{
 };
 pub(crate) use triposg::TRIPOSG_LATENT_CHANNELS;
 pub use triposg::{
-    TripoSgInferenceOutput, TripoSgMeshBuffers, TripoSgPipeline, TripoSgPreparedInputs,
-    TripoSgRunOptions,
+    TRIPOSG_SCRIBBLE_CONFIDENCE, TRIPOSG_SCRIBBLE_DEFAULT_DIR,
+    TRIPOSG_SCRIBBLE_DENSE_OCTREE_DEPTH, TRIPOSG_SCRIBBLE_HIERARCHICAL_OCTREE_DEPTH,
+    TRIPOSG_SCRIBBLE_MODEL_DIR_ENV, TRIPOSG_SCRIBBLE_NUM_TOKENS,
+    TRIPOSG_SCRIBBLE_PROMPT_CONFIDENCE, TRIPOSG_SCRIBBLE_STEPS, TripoSgInferenceOutput,
+    TripoSgMeshBuffers, TripoSgPipeline, TripoSgPreparedInputs, TripoSgRunOptions,
+    TripoSgScribbleInferenceOutput, TripoSgScribblePipeline, TripoSgScribbleRunOptions,
+    resolve_triposg_scribble_model_dir,
 };
 pub use triposg_dino::TripoSgDinoEncoder;
 pub use triposg_dit::{
     RectifiedFlowSchedule, SCHEDULER_NUM_TRAIN_TIMESTEPS, SCHEDULER_SHIFT, TripoSgDiT,
-    TripoSgTransformerConfig, denoise, denoise_with_schedule,
+    TripoSgTransformerConfig, denoise, denoise_dual_with_schedule, denoise_with_schedule,
 };
 pub use triposg_field::{TripoSgSdfGrid, hierarchical_sdf_grid};
 pub use triposg_flash::{
     TripoSgDmcMesh, TripoSgFlashGrid, compact_dmc_mesh, flash_dual_marching_cubes,
     flash_resolutions, flash_sdf_grid,
 };
+pub use triposg_text::{ClipBpeTokenizer, TripoSgClipTextEncoder};
 pub use triposg_vae::{
     TripoSgLatentDistribution, TripoSgVaeConfig, TripoSgVaeDecoder, TripoSgVaeEncoder,
     sample_point_features, sample_point_features_with_indices,

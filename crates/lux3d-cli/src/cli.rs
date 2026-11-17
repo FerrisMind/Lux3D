@@ -9,9 +9,10 @@ use lux3d_core::export::{
 use lux3d_core::geometry::VggtPointCloudCpu;
 use lux3d_core::preprocess::VggtPreprocessMode;
 use lux3d_core::runtime::{
-    Pi3Pipeline, Pi3xInjectConditions, Pi3xPipeline, Pi3xVoPipeline,
-    Trellis2MeshPostprocessOptions, Trellis2Pipeline, Trellis2RunOptions, Trellis2SamplerOverrides,
-    Trellis2TextureExportOptions, Trellis2TexturingOptions, TripoSgPipeline, TripoSgRunOptions,
+    resolve_triposg_scribble_model_dir, Pi3Pipeline, Pi3xInjectConditions, Pi3xPipeline,
+    Pi3xVoPipeline, Trellis2MeshPostprocessOptions, Trellis2Pipeline, Trellis2RunOptions,
+    Trellis2SamplerOverrides, Trellis2TextureExportOptions, Trellis2TexturingOptions,
+    TripoSgPipeline, TripoSgRunOptions, TripoSgScribblePipeline, TripoSgScribbleRunOptions,
     TripoSrPipeline, VggtAutoQueryOptions, VggtInferenceOutput, VggtPipeline, VggtRunOptions,
     VggtTrackQuery, VggtTrackResult, DEFAULT_MAX_QUERY_PTS, DEFAULT_QUERY_FRAME_NUM,
 };
@@ -256,6 +257,32 @@ pub struct RunArgs {
     #[arg(
         long,
         value_enum,
+        default_value = "image",
+        help = "TripoSG mode: `image` (DINOv2 image-to-3D diffusion, default) or `scribble` (TripoSG-scribble: CLIP prompt + scribble-image dual conditioning; requires `--prompt` and the `VAST-AI/TripoSG-scribble` raw checkpoint)."
+    )]
+    pub mode: TriposgMode,
+
+    #[arg(
+        long,
+        help = "TripoSG-scribble text prompt (required with `--mode scribble`)."
+    )]
+    pub prompt: Option<String>,
+
+    #[arg(
+        long,
+        help = "TripoSG-scribble `cross_attention_2_scale` for the scribble-image branch (reference `--scribble-conf` default 0.4)."
+    )]
+    pub scribble_conf: Option<f32>,
+
+    #[arg(
+        long,
+        help = "TripoSG-scribble `cross_attention_scale` for the CLIP text branch (reference `--prompt-conf` default 1.0)."
+    )]
+    pub prompt_conf: Option<f32>,
+
+    #[arg(
+        long,
+        value_enum,
         help = "TRELLIS.2 pipeline type: `512`, `1024`, `1024_cascade` (reference default), or `1536_cascade`."
     )]
     pub pipeline_type: Option<Trellis2PipelineKind>,
@@ -457,7 +484,7 @@ pub struct RunArgs {
 
     #[arg(
         long,
-        help = "Path to a canonical package directory, a directory containing `model.gguf`, or a standalone `.gguf` file."
+        help = "Path to a canonical package directory, a directory containing `model.gguf`, or a standalone `.gguf` file. For `triposg --mode scribble` this is the raw `VAST-AI/TripoSG-scribble` checkpoint directory."
     )]
     pub model_path: Option<PathBuf>,
 
@@ -496,6 +523,14 @@ pub enum Family {
     /// TRELLIS.2-4B image-to-3D: preprocess -> DINOv3 -> SS flow -> shape SLAT
     /// (512 or 1024 cascade) -> texture SLAT -> dual-grid mesh + PBR sidecar.
     Trellis2,
+}
+
+/// TripoSG pipeline mode (`--mode`): the image-to-3D DiT (default) or the
+/// TripoSG-scribble dual-conditioning DiT.
+#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
+pub enum TriposgMode {
+    Image,
+    Scribble,
 }
 
 /// TRELLIS.2 pipeline variant (`--pipeline-type`); names mirror the reference
@@ -1144,28 +1179,64 @@ pub fn run_model(args: RunArgs) -> anyhow::Result<PathBuf> {
             reject_unsupported_triposg_options(&args)?;
             reject_vggt_only_options(&args, args.family)?;
             reject_trellis2_only_options(&args, args.family)?;
-            let options = triposg_run_options_from_args(&args)?;
-            let rmbg_model_path = resolve_rmbg_model_path(&args);
-            let dtype = args
-                .dtype
-                .map(candle_core::DType::from)
-                .unwrap_or(candle_core::DType::F32);
-            let input = match (args.source.as_deref(), args.surface_input.as_deref()) {
-                (_, Some(surface)) => TripoSgRunInput::Surface(surface),
-                (Some(source), None) => TripoSgRunInput::Image(source),
-                (None, None) => {
-                    anyhow::bail!("`--source` or `--surface-input` is required for `triposg`")
+            match args.mode {
+                TriposgMode::Scribble => {
+                    reject_scribble_mode_conflicts(&args)?;
+                    let prompt = args
+                        .prompt
+                        .clone()
+                        .filter(|prompt| !prompt.trim().is_empty())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("`--prompt` is required for `triposg --mode scribble`")
+                        })?;
+                    let options = triposg_scribble_run_options_from_args(&args)?;
+                    let model_dir = resolve_triposg_scribble_model_dir(args.model_path.as_deref())?;
+                    let rmbg_model_path = resolve_rmbg_model_path(&args);
+                    let dtype = args
+                        .dtype
+                        .map(candle_core::DType::from)
+                        .unwrap_or(candle_core::DType::F32);
+                    let source = args.source.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("`--source` is required for `triposg --mode scribble`")
+                    })?;
+                    run_triposg_scribble(
+                        model_dir,
+                        rmbg_model_path,
+                        source,
+                        &prompt,
+                        options,
+                        &args.output,
+                        &device,
+                        dtype,
+                    )?
                 }
-            };
-            run_triposg(
-                model_assets,
-                rmbg_model_path,
-                input,
-                options,
-                &args.output,
-                &device,
-                dtype,
-            )?
+                TriposgMode::Image => {
+                    let options = triposg_run_options_from_args(&args)?;
+                    let rmbg_model_path = resolve_rmbg_model_path(&args);
+                    let dtype = args
+                        .dtype
+                        .map(candle_core::DType::from)
+                        .unwrap_or(candle_core::DType::F32);
+                    let input = match (args.source.as_deref(), args.surface_input.as_deref()) {
+                        (_, Some(surface)) => TripoSgRunInput::Surface(surface),
+                        (Some(source), None) => TripoSgRunInput::Image(source),
+                        (None, None) => {
+                            anyhow::bail!(
+                                "`--source` or `--surface-input` is required for `triposg`"
+                            )
+                        }
+                    };
+                    run_triposg(
+                        model_assets,
+                        rmbg_model_path,
+                        input,
+                        options,
+                        &args.output,
+                        &device,
+                        dtype,
+                    )?
+                }
+            }
         }
         ModelFamily::Vggt => {
             reject_unsupported_vggt_options(&args)?;
@@ -1479,6 +1550,53 @@ fn reject_unsupported_triposg_options(args: &RunArgs) -> anyhow::Result<()> {
     if args.mc_threshold.is_some() {
         anyhow::bail!("`--mc-threshold` is not supported for `triposg`");
     }
+    if args.mode == TriposgMode::Image {
+        if args.prompt.is_some() {
+            anyhow::bail!("`--prompt` requires `triposg --mode scribble`");
+        }
+        if args.scribble_conf.is_some() {
+            anyhow::bail!("`--scribble-conf` requires `triposg --mode scribble`");
+        }
+        if args.prompt_conf.is_some() {
+            anyhow::bail!("`--prompt-conf` requires `triposg --mode scribble`");
+        }
+    }
+    Ok(())
+}
+
+/// The scribble pipeline is a single-pass distilled model: the reference
+/// script hardcodes `guidance_scale=0` (no CFG), `use_flash_decoder=False`,
+/// dense/hierarchical depth 8 and a raw diffusers-style checkpoint directory.
+/// Reject the flags that would silently contradict those semantics. Shared
+/// flags (`--steps`, `--seed`, `--num-tokens`, the octree depths, `--faces`,
+/// `--bounds`, `--timesteps`, `--chunk-size`, `--surface-input` excluded,
+/// `--dtype`, `--rmbg-model-path`) stay allowed.
+fn reject_scribble_mode_conflicts(args: &RunArgs) -> anyhow::Result<()> {
+    if args.surface_input.is_some() {
+        anyhow::bail!("`--surface-input` is not supported for `triposg --mode scribble`");
+    }
+    if args.guidance_scale.is_some() {
+        anyhow::bail!(
+            "`--guidance-scale` is not supported for `triposg --mode scribble` (the \
+             distilled scribble model runs without classifier-free guidance)"
+        );
+    }
+    if args.flash_decoder.is_some() {
+        anyhow::bail!(
+            "`--flash-decoder` is not supported for `triposg --mode scribble` (the \
+             reference always uses the dense/hierarchical decoder)"
+        );
+    }
+    if args.flash_octree_depth.is_some() {
+        anyhow::bail!("`--flash-octree-depth` is not supported for `triposg --mode scribble`");
+    }
+    if args.cache_dir.is_some() {
+        anyhow::bail!(
+            "`--cache-dir` is not supported for `triposg --mode scribble`: the scribble \
+             checkpoint has no canonical package/HF auto-download; pass --model-path or \
+             set LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR"
+        );
+    }
     Ok(())
 }
 
@@ -1549,6 +1667,30 @@ fn reject_triposg_only_options(args: &RunArgs, family: Family) -> anyhow::Result
     if args.timesteps.is_some() {
         anyhow::bail!(
             "`--timesteps` is not supported for `{}`",
+            family.model_family()
+        );
+    }
+    if args.mode != TriposgMode::Image {
+        anyhow::bail!(
+            "`--mode scribble` is not supported for `{}`",
+            family.model_family()
+        );
+    }
+    if args.prompt.is_some() {
+        anyhow::bail!(
+            "`--prompt` is not supported for `{}`",
+            family.model_family()
+        );
+    }
+    if args.scribble_conf.is_some() {
+        anyhow::bail!(
+            "`--scribble-conf` is not supported for `{}`",
+            family.model_family()
+        );
+    }
+    if args.prompt_conf.is_some() {
+        anyhow::bail!(
+            "`--prompt-conf` is not supported for `{}`",
             family.model_family()
         );
     }
@@ -2050,6 +2192,41 @@ fn triposg_run_options_from_args(args: &RunArgs) -> anyhow::Result<TripoSgRunOpt
         // `--faces 0` is the documented "no simplification" value (the
         // upstream `-1` equivalent); it maps to `None` like the flag default.
         faces: args.faces.filter(|&faces| faces > 0),
+    };
+    options.validate().map_err(anyhow::Error::from)?;
+    Ok(options)
+}
+
+/// Build the TripoSG-scribble run options from the reference defaults
+/// (`scripts/inference_triposg_scribble.py:32-43`: 16 steps, 512 tokens,
+/// dense 8 / hierarchical 8, scribble confidence 0.4, prompt confidence 1.0)
+/// plus the shared CLI overrides. `--guidance-scale`, `--flash-decoder` and
+/// `--flash-octree-depth` are rejected by the scribble-mode guard because the
+/// distilled model runs a single pass with the dense/hierarchical decoder.
+fn triposg_scribble_run_options_from_args(
+    args: &RunArgs,
+) -> anyhow::Result<TripoSgScribbleRunOptions> {
+    let defaults = TripoSgScribbleRunOptions::default();
+    let options = TripoSgScribbleRunOptions {
+        steps: args.steps.unwrap_or(defaults.steps),
+        seed: args.seed.unwrap_or(defaults.seed),
+        num_tokens: args.num_tokens.unwrap_or(defaults.num_tokens),
+        dense_octree_depth: args
+            .dense_octree_depth
+            .unwrap_or(defaults.dense_octree_depth),
+        hierarchical_octree_depth: args
+            .hierarchical_octree_depth
+            .unwrap_or(defaults.hierarchical_octree_depth),
+        query_chunk_size: args.chunk_size.unwrap_or(defaults.query_chunk_size),
+        timesteps: args
+            .timesteps
+            .as_deref()
+            .map(parse_timesteps_arg)
+            .transpose()?,
+        bounds: args.bounds.as_deref().map(parse_bounds_arg).transpose()?,
+        faces: args.faces.filter(|&faces| faces > 0),
+        scribble_confidence: args.scribble_conf.unwrap_or(defaults.scribble_confidence),
+        prompt_confidence: args.prompt_conf.unwrap_or(defaults.prompt_confidence),
     };
     options.validate().map_err(anyhow::Error::from)?;
     Ok(options)
@@ -2895,6 +3072,63 @@ fn run_triposg(
     // simplification.
     eprintln!(
         "[mesh] triposg: {} vertices, {} faces{}",
+        mesh.vertices.dims()[0],
+        mesh.faces.dims()[0],
+        match options.faces {
+            Some(faces) => format!(" (target {faces})"),
+            None => String::new(),
+        }
+    );
+    let t3 = std::time::Instant::now();
+    pipeline.export_mesh(&mesh, output)?;
+    if stage_time {
+        eprintln!("[stage] export: {:.2}s", t3.elapsed().as_secs_f64());
+    }
+    Ok(())
+}
+
+/// TripoSG-scribble run: raw `VAST-AI/TripoSG-scribble` checkpoint -> CLIP
+/// text embeds + DINOv2 scribble embeds -> 16-step dual-conditioned Euler
+/// denoise (no CFG) -> dense/hierarchical SDF decode -> GLB export.
+fn run_triposg_scribble(
+    model_dir: PathBuf,
+    rmbg_model_path: Option<PathBuf>,
+    source: &Path,
+    prompt: &str,
+    options: TripoSgScribbleRunOptions,
+    output: &Path,
+    device: &candle_core::Device,
+    dtype: candle_core::DType,
+) -> anyhow::Result<()> {
+    options.validate().map_err(anyhow::Error::from)?;
+    let stage_time = std::env::var_os("LUX3D_STAGE_TIME").is_some();
+    let t0 = std::time::Instant::now();
+    let pipeline =
+        TripoSgScribblePipeline::load_with_rmbg_and_dtype(model_dir, rmbg_model_path, dtype)?;
+    if stage_time {
+        eprintln!("[stage] load: {:.2}s", t0.elapsed().as_secs_f64());
+    }
+    let t1 = std::time::Instant::now();
+    let inference = pipeline.infer_from_path(source, prompt, device, &options)?;
+    if stage_time {
+        eprintln!("[stage] infer: {:.2}s", t1.elapsed().as_secs_f64());
+    }
+    eprintln!(
+        "[conditioning] triposg-scribble: prompt `{}`, text {:?}, image {:?}, \
+         scribble_conf {}, prompt_conf {}",
+        inference.prompt,
+        inference.text_embeds.dims(),
+        inference.image_embeds.dims(),
+        options.scribble_confidence,
+        options.prompt_confidence
+    );
+    let t2 = std::time::Instant::now();
+    let mesh = pipeline.extract_mesh(&inference.latents, &options)?;
+    if stage_time {
+        eprintln!("[stage] mesh: {:.2}s", t2.elapsed().as_secs_f64());
+    }
+    eprintln!(
+        "[mesh] triposg-scribble: {} vertices, {} faces{}",
         mesh.vertices.dims()[0],
         mesh.faces.dims()[0],
         match options.faces {
@@ -4126,6 +4360,207 @@ mod tests {
         assert!(!options.use_flash_decoder);
         assert_eq!(7, options.flash_octree_depth);
         assert_eq!(4096, options.query_chunk_size);
+    }
+
+    /// `--mode scribble` is triposg-only and keeps the reference scribble
+    /// defaults: 16 steps, 512 tokens, dense 8 / hierarchical 8, no flash
+    /// decoder, scribble confidence 0.4 and prompt confidence 1.0.
+    #[test]
+    fn triposg_scribble_mode_maps_reference_defaults() {
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "triposg",
+            "--mode",
+            "scribble",
+            "--prompt",
+            "a photo of a cat",
+            "--source",
+            "scribble.png",
+            "--output",
+            "out.glb",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(super::TriposgMode::Scribble, args.mode);
+        assert_eq!(Some("a photo of a cat"), args.prompt.as_deref());
+        let options = super::triposg_scribble_run_options_from_args(&args)
+            .expect("scribble reference defaults");
+        assert_eq!(super::TripoSgScribbleRunOptions::default(), options);
+        assert_eq!(16, options.steps);
+        assert_eq!(512, options.num_tokens);
+        assert_eq!(8, options.dense_octree_depth);
+        assert_eq!(8, options.hierarchical_octree_depth);
+        assert_eq!(0.4, options.scribble_confidence);
+        assert_eq!(1.0, options.prompt_confidence);
+    }
+
+    #[test]
+    fn triposg_scribble_mode_maps_cli_overrides() {
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "triposg",
+            "--mode",
+            "scribble",
+            "--prompt",
+            "low poly dragon",
+            "--source",
+            "scribble.png",
+            "--output",
+            "out.glb",
+            "--steps",
+            "8",
+            "--seed",
+            "7",
+            "--num-tokens",
+            "256",
+            "--dense-octree-depth",
+            "6",
+            "--hierarchical-octree-depth",
+            "7",
+            "--chunk-size",
+            "2048",
+            "--faces",
+            "50000",
+            "--scribble-conf",
+            "0.25",
+            "--prompt-conf",
+            "0.75",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        let options = super::triposg_scribble_run_options_from_args(&args).expect("options");
+        assert_eq!(8, options.steps);
+        assert_eq!(7, options.seed);
+        assert_eq!(256, options.num_tokens);
+        assert_eq!(6, options.dense_octree_depth);
+        assert_eq!(7, options.hierarchical_octree_depth);
+        assert_eq!(2048, options.query_chunk_size);
+        assert_eq!(Some(50000), options.faces);
+        assert_eq!(0.25, options.scribble_confidence);
+        assert_eq!(0.75, options.prompt_confidence);
+    }
+
+    /// The image-to-3D mode must not silently ignore scribble flags.
+    #[test]
+    fn triposg_image_mode_rejects_scribble_flags() {
+        for (flag, extra) in [
+            ("--prompt", &["--prompt", "cat"][..]),
+            ("--scribble-conf", &["--scribble-conf", "0.4"][..]),
+            ("--prompt-conf", &["--prompt-conf", "1.0"][..]),
+        ] {
+            let mut argv = vec![
+                "lux3d",
+                "run",
+                "triposg",
+                "--source",
+                "image.png",
+                "--output",
+                "out.glb",
+            ];
+            argv.extend_from_slice(extra);
+            let cli = Cli::parse_from(argv);
+            let Command::Run(args) = cli.command else {
+                panic!("expected run command");
+            };
+            let error = super::reject_unsupported_triposg_options(&args)
+                .expect_err(&format!("{flag} must be rejected in image mode"));
+            let message = error.to_string();
+            assert!(
+                message.contains(flag) && message.contains("--mode scribble"),
+                "unexpected message for {flag}: `{message}`"
+            );
+        }
+    }
+
+    /// The scribble pipeline is single-pass with the dense decoder and a raw
+    /// checkpoint directory; the flags that would contradict those semantics
+    /// are rejected before any weights are touched.
+    #[test]
+    fn triposg_scribble_mode_rejects_conflicting_flags() {
+        for (flag, extra) in [
+            ("--guidance-scale", &["--guidance-scale", "1.0"][..]),
+            ("--flash-decoder", &["--flash-decoder", "true"][..]),
+            ("--flash-octree-depth", &["--flash-octree-depth", "8"][..]),
+            ("--cache-dir", &["--cache-dir", "hf-cache"][..]),
+        ] {
+            let mut argv = vec![
+                "lux3d",
+                "run",
+                "triposg",
+                "--mode",
+                "scribble",
+                "--prompt",
+                "cat",
+                "--source",
+                "scribble.png",
+                "--output",
+                "out.glb",
+            ];
+            argv.extend_from_slice(extra);
+            let cli = Cli::parse_from(argv);
+            let Command::Run(args) = cli.command else {
+                panic!("expected run command");
+            };
+            let error = super::reject_scribble_mode_conflicts(&args)
+                .expect_err(&format!("{flag} must be rejected in scribble mode"));
+            assert!(
+                error.to_string().contains(flag),
+                "unexpected message for {flag}: `{error}`"
+            );
+        }
+        // `--surface-input` conflicts with `--source` at the clap layer, so
+        // exercise the guard with the surface input only.
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "triposg",
+            "--mode",
+            "scribble",
+            "--prompt",
+            "cat",
+            "--surface-input",
+            "surface.npy",
+            "--output",
+            "out.glb",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        let error = super::reject_scribble_mode_conflicts(&args)
+            .expect_err("--surface-input must be rejected in scribble mode");
+        assert!(error.to_string().contains("--surface-input"));
+    }
+
+    /// `--mode scribble`/`--prompt`/the confidence flags are TripoSG-only.
+    #[test]
+    fn scribble_flags_rejected_for_other_families() {
+        for family in ["pi3", "pi3x", "triposr", "vggt", "trellis2"] {
+            for (flag, extra) in [
+                ("--prompt", &["--prompt", "cat"][..]),
+                ("--scribble-conf", &["--scribble-conf", "0.4"][..]),
+                ("--prompt-conf", &["--prompt-conf", "1.0"][..]),
+                ("--mode", &["--mode", "scribble"][..]),
+            ] {
+                let mut argv = vec![
+                    "lux3d", "run", family, "--source", "input", "--output", "out",
+                ];
+                argv.extend_from_slice(extra);
+                let cli = Cli::parse_from(argv);
+                let Command::Run(args) = cli.command else {
+                    panic!("expected run command");
+                };
+                let error = super::reject_triposg_only_options(&args, args.family)
+                    .expect_err(&format!("{flag} must be rejected for {family}"));
+                assert!(
+                    error.to_string().contains(flag),
+                    "unexpected message for {flag} on {family}: `{error}`"
+                );
+            }
+        }
     }
 
     /// The new TripoSG core options flow through the CLI funnel exactly the
@@ -5977,6 +6412,10 @@ mod tests {
                     .join("house"),
             ),
             surface_input: None,
+            mode: super::TriposgMode::Image,
+            prompt: None,
+            scribble_conf: None,
+            prompt_conf: None,
             interval: None,
             conditions: None,
             vo: false,
@@ -6063,6 +6502,10 @@ mod tests {
                     .join("horse.png"),
             ),
             surface_input: None,
+            mode: super::TriposgMode::Image,
+            prompt: None,
+            scribble_conf: None,
+            prompt_conf: None,
             interval: None,
             conditions: None,
             vo: false,
@@ -6151,6 +6594,10 @@ mod tests {
                     .join("horse.png"),
             ),
             surface_input: None,
+            mode: super::TriposgMode::Image,
+            prompt: None,
+            scribble_conf: None,
+            prompt_conf: None,
             interval: None,
             conditions: None,
             vo: false,
@@ -6236,6 +6683,10 @@ mod tests {
                     .join("rgb"),
             ),
             surface_input: None,
+            mode: super::TriposgMode::Image,
+            prompt: None,
+            scribble_conf: None,
+            prompt_conf: None,
             interval: Some(2),
             conditions: Some(
                 repo_root()
@@ -6330,6 +6781,10 @@ mod tests {
                     .join("skating.mp4"),
             ),
             surface_input: None,
+            mode: super::TriposgMode::Image,
+            prompt: None,
+            scribble_conf: None,
+            prompt_conf: None,
             interval: None,
             conditions: None,
             vo: true,

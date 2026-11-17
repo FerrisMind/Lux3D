@@ -33,7 +33,11 @@
 //! and writes GLB/OBJ/PLY/STL according to the output extension; `export_obj`
 //! keeps the legacy OBJ-only entry point.
 
-use std::{path::Path, sync::Arc};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use candle_core::{DType, Device, Tensor};
 
@@ -42,6 +46,7 @@ use super::{
     triposg_dit::TripoSgDiT,
     triposg_field::hierarchical_sdf_grid,
     triposg_flash::{compact_dmc_mesh, flash_dual_marching_cubes, flash_sdf_grid},
+    triposg_text::{ClipBpeTokenizer, TripoSgClipTextEncoder},
     triposg_vae::{
         TripoSgLatentDistribution, TripoSgVaeConfig, TripoSgVaeDecoder, TripoSgVaeEncoder,
     },
@@ -54,11 +59,13 @@ use crate::{
     load_auxiliary_canonical_weights, load_canonical_weights,
     neural::TripoSgNeuralStage,
     preprocess::TripoSgPreprocessStage,
+    weights::VarBuilder,
     AuxiliaryWeightSetPaths, CanonicalWeightSetPaths, ModelAssetOptions, ModelFamily, Result,
 };
 
 use super::triposg_dit::{
-    denoise_with_schedule, RectifiedFlowSchedule, TripoSgTransformerConfig, SCHEDULER_SHIFT,
+    denoise_dual_with_schedule, denoise_with_schedule, RectifiedFlowSchedule,
+    TripoSgTransformerConfig, SCHEDULER_SHIFT,
 };
 
 /// TripoSG latent channel count (`transformer.in_channels` ==
@@ -82,6 +89,240 @@ const CANONICAL_SDF_LEVEL: f32 = 0.0;
 /// Hard octree-depth cap for run options (grid side `2^depth` <= 1024, the
 /// same cap `hierarchical_sdf_grid` enforces).
 const MAX_OCTREE_DEPTH: u32 = 10;
+
+// ---------------------------------------------------------------------------
+// TripoSG-scribble defaults (`scripts/inference_triposg_scribble.py:32-40`
+// and the checkpoint's `transformer/config.json`)
+// ---------------------------------------------------------------------------
+
+/// Scribble latent token count (`TripoSGScribblePipeline.__call__` default
+/// `num_tokens=512`, `pipeline_triposg_scribble.py:192`).
+pub const TRIPOSG_SCRIBBLE_NUM_TOKENS: usize = 512;
+/// Reference scribble inference steps (`inference_triposg_scribble.py:25`).
+pub const TRIPOSG_SCRIBBLE_STEPS: usize = 16;
+/// Official scribble cross-attention scale for the image branch
+/// (`--scribble-conf` default 0.4).
+pub const TRIPOSG_SCRIBBLE_CONFIDENCE: f32 = 0.4;
+/// Official scribble cross-attention scale for the text branch
+/// (`--prompt-conf` default 1.0).
+pub const TRIPOSG_SCRIBBLE_PROMPT_CONFIDENCE: f32 = 1.0;
+/// Reference scribble dense octree depth (`inference_triposg_scribble.py:40`).
+pub const TRIPOSG_SCRIBBLE_DENSE_OCTREE_DEPTH: u32 = 8;
+/// Reference scribble hierarchical octree depth
+/// (`inference_triposg_scribble.py:40`).
+pub const TRIPOSG_SCRIBBLE_HIERARCHICAL_OCTREE_DEPTH: u32 = 8;
+/// Default local checkpoint directory (Hugging Face `VAST-AI/TripoSG-scribble`).
+pub const TRIPOSG_SCRIBBLE_DEFAULT_DIR: &str = "models/TripoSG-scribble";
+/// Environment override for the local scribble checkpoint directory.
+pub const TRIPOSG_SCRIBBLE_MODEL_DIR_ENV: &str = "LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR";
+/// Files the raw diffusers-style scribble checkpoint must provide.
+pub const TRIPOSG_SCRIBBLE_REQUIRED_FILES: [&str; 12] = [
+    "model_index.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+    "image_encoder_dinov2/config.json",
+    "image_encoder_dinov2/model.safetensors",
+    "text_encoder/config.json",
+    "text_encoder/model.safetensors",
+    "tokenizer/vocab.json",
+    "tokenizer/merges.txt",
+    "tokenizer/tokenizer_config.json",
+];
+
+/// Per-run options for the TripoSG-scribble pipeline. Defaults replicate the
+/// shipped `run_triposg_scribble` call
+/// (`scripts/inference_triposg_scribble.py:32-40`): 16 rectified-flow steps,
+/// 512 latent tokens, dense depth 8 / hierarchical depth 8, no flash decoder,
+/// `guidance_scale=0` (CFG-distilled model, so no classifier-free guidance),
+/// and the two per-branch cross-attention scales.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TripoSgScribbleRunOptions {
+    /// Rectified-flow Euler steps. Ignored when [`Self::timesteps`] is `Some`.
+    pub steps: usize,
+    /// Latent-initialization seed (Lux3D deterministic RNG).
+    pub seed: u64,
+    /// Number of latent tokens (`[1, num_tokens, 64]`).
+    pub num_tokens: usize,
+    /// Dense octree depth of the hierarchical SDF grid.
+    pub dense_octree_depth: u32,
+    /// Final hierarchical octree depth.
+    pub hierarchical_octree_depth: u32,
+    /// Maximum SDF query points per decoder pass.
+    pub query_chunk_size: usize,
+    /// Explicit timestep schedule override (reference pipeline
+    /// `timesteps=` argument); `steps` is ignored when set.
+    pub timesteps: Option<Vec<f32>>,
+    /// SDF query bounds override `[min_x, min_y, min_z, max_x, max_y, max_z]`.
+    pub bounds: Option<[f32; 6]>,
+    /// Target face count after mesh extraction (reference `--faces`).
+    pub faces: Option<usize>,
+    /// `cross_attention_2_scale`: weight of the scribble-image branch
+    /// (`--scribble-conf`, default 0.4).
+    pub scribble_confidence: f32,
+    /// `cross_attention_scale`: weight of the CLIP text branch
+    /// (`--prompt-conf`, default 1.0).
+    pub prompt_confidence: f32,
+}
+
+impl Default for TripoSgScribbleRunOptions {
+    fn default() -> Self {
+        Self {
+            steps: TRIPOSG_SCRIBBLE_STEPS,
+            seed: 42,
+            num_tokens: TRIPOSG_SCRIBBLE_NUM_TOKENS,
+            dense_octree_depth: TRIPOSG_SCRIBBLE_DENSE_OCTREE_DEPTH,
+            hierarchical_octree_depth: TRIPOSG_SCRIBBLE_HIERARCHICAL_OCTREE_DEPTH,
+            query_chunk_size: 16384,
+            timesteps: None,
+            bounds: None,
+            faces: None,
+            scribble_confidence: TRIPOSG_SCRIBBLE_CONFIDENCE,
+            prompt_confidence: TRIPOSG_SCRIBBLE_PROMPT_CONFIDENCE,
+        }
+    }
+}
+
+impl TripoSgScribbleRunOptions {
+    pub fn validate(&self) -> Result<()> {
+        if self.timesteps.is_none() && self.steps == 0 {
+            return Err(Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "TripoSG scribble steps must be at least 1, got {}",
+                    self.steps
+                ),
+            });
+        }
+        if self.num_tokens == 0 {
+            return Err(Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "TripoSG scribble num_tokens must be at least 1, got {}",
+                    self.num_tokens
+                ),
+            });
+        }
+        if self.dense_octree_depth > MAX_OCTREE_DEPTH {
+            return Err(Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "TripoSG scribble dense_octree_depth {} exceeds the maximum \
+                     {MAX_OCTREE_DEPTH}",
+                    self.dense_octree_depth
+                ),
+            });
+        }
+        if self.hierarchical_octree_depth > MAX_OCTREE_DEPTH {
+            return Err(Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "TripoSG scribble hierarchical_octree_depth {} exceeds the maximum \
+                     {MAX_OCTREE_DEPTH}",
+                    self.hierarchical_octree_depth
+                ),
+            });
+        }
+        if let Some(timesteps) = &self.timesteps {
+            if timesteps.is_empty() {
+                return Err(Lux3dError::CanonicalWeightsValidation {
+                    message: "TripoSG scribble timesteps must not be empty".to_string(),
+                });
+            }
+            if let Some(index) = timesteps.iter().position(|value| !value.is_finite()) {
+                return Err(Lux3dError::CanonicalWeightsValidation {
+                    message: format!(
+                        "TripoSG scribble timesteps[{index}] must be finite, got {}",
+                        timesteps[index]
+                    ),
+                });
+            }
+        }
+        if let Some(bounds) = self.bounds {
+            for (axis, window) in [
+                ("x", (bounds[0], bounds[3])),
+                ("y", (bounds[1], bounds[4])),
+                ("z", (bounds[2], bounds[5])),
+            ] {
+                let (min, max) = window;
+                if !min.is_finite() || !max.is_finite() {
+                    return Err(Lux3dError::CanonicalWeightsValidation {
+                        message: format!(
+                            "TripoSG scribble bounds {axis} axis must be finite, got \
+                             [{min}, {max}]"
+                        ),
+                    });
+                }
+                if min >= max {
+                    return Err(Lux3dError::CanonicalWeightsValidation {
+                        message: format!(
+                            "TripoSG scribble bounds {axis} axis must have min < max, got \
+                             [{min}, {max}]"
+                        ),
+                    });
+                }
+            }
+        }
+        if !self.scribble_confidence.is_finite() {
+            return Err(Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "TripoSG scribble confidence must be finite, got {}",
+                    self.scribble_confidence
+                ),
+            });
+        }
+        if !self.prompt_confidence.is_finite() {
+            return Err(Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "TripoSG prompt confidence must be finite, got {}",
+                    self.prompt_confidence
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// The SDF query bounds this run decodes at (override or canonical).
+    pub fn effective_bounds(&self) -> [f32; 6] {
+        self.bounds.unwrap_or(CANONICAL_BOUNDS)
+    }
+}
+
+/// Resolve the local `VAST-AI/TripoSG-scribble` checkpoint directory: an
+/// explicit path wins, then `LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR`, then
+/// [`TRIPOSG_SCRIBBLE_DEFAULT_DIR`] relative to the current directory.
+pub fn resolve_triposg_scribble_model_dir(explicit: Option<&Path>) -> Result<PathBuf> {
+    let candidate = match explicit {
+        Some(path) => path.to_path_buf(),
+        None => std::env::var_os(TRIPOSG_SCRIBBLE_MODEL_DIR_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(TRIPOSG_SCRIBBLE_DEFAULT_DIR)),
+    };
+    if !candidate.is_dir() {
+        return Err(Lux3dError::InvalidInput(
+            "TripoSG scribble weights were not found; download the Hugging Face \
+             `VAST-AI/TripoSG-scribble` checkpoint and pass --model-path (or set \
+             LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR). Expected the diffusers-style directory \
+             with transformer/, vae/, image_encoder_dinov2/, text_encoder/ and tokenizer/.",
+        ));
+    }
+    let missing = TRIPOSG_SCRIBBLE_REQUIRED_FILES
+        .iter()
+        .map(|relative| candidate.join(relative))
+        .filter(|path| !path.is_file())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        let list = missing
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(Lux3dError::CanonicalWeightsValidation {
+            message: format!(
+                "TripoSG scribble checkpoint directory `{}` is incomplete; missing: {list}",
+                candidate.display()
+            ),
+        });
+    }
+    Ok(candidate)
+}
 
 /// Surface points the reference `load_surface` draws before encoding
 /// (`scripts/inference_vae.py:12-23`, `num_pc = 204800`; the shipped demo has
@@ -337,6 +578,24 @@ pub struct TripoSgInferenceOutput {
     pub latents: Tensor,
 }
 
+/// TripoSG-scribble inference output: CLIP text conditioning, DINOv2 scribble
+/// conditioning, the seeded initial latents and the denoised latents (all
+/// F32, `[1, ...]`).
+#[derive(Debug, Clone)]
+pub struct TripoSgScribbleInferenceOutput {
+    /// Prompt the text embeds were produced from (for run reporting).
+    pub prompt: String,
+    /// `[1, model_max_length, 768]` CLIP `last_hidden_state` (PRE-projection).
+    pub text_embeds: Tensor,
+    /// `[1, 257, 1024]` last hidden state of the DINOv2-large encoder for the
+    /// scribble image.
+    pub image_embeds: Tensor,
+    /// `[1, num_tokens, 64]` seeded standard-normal init latents.
+    pub latents_init: Tensor,
+    /// `[1, num_tokens, 64]` latents after the rectified-flow Euler schedule.
+    pub latents: Tensor,
+}
+
 /// Device mesh buffers produced by `extract_mesh` (positions in the canonical
 /// `+/-1.005` world space, zero-based triangle indices).
 #[derive(Debug, Clone)]
@@ -404,6 +663,451 @@ impl TripoSgModelBundle {
                 }
             })?,
         })
+    }
+}
+
+/// Everything the scribble pipeline needs per device, loaded from the raw
+/// diffusers-style `VAST-AI/TripoSG-scribble` checkpoint: the DINOv2 scribble
+/// encoder, the dual-cross-attention DiT, the VAE SDF decoder and the CLIP
+/// text encoder plus its byte-level BPE tokenizer.
+#[derive(Debug)]
+struct TripoSgScribbleModelBundle {
+    dino: TripoSgDinoEncoder,
+    dit: TripoSgDiT,
+    vae: TripoSgVaeDecoder,
+    text_encoder: TripoSgClipTextEncoder,
+    tokenizer: ClipBpeTokenizer,
+}
+
+impl TripoSgScribbleModelBundle {
+    fn load(dir: &Path, device: &Device, dtype: DType) -> Result<Self> {
+        let transformer_config = read_triposg_scribble_json(dir, "transformer/config.json")?;
+        let vae_config = read_triposg_scribble_json(dir, "vae/config.json")?;
+        let dino_config = read_triposg_scribble_json(dir, "image_encoder_dinov2/config.json")?;
+        let text_config = read_triposg_scribble_json(dir, "text_encoder/config.json")?;
+
+        let transformer_cfg = TripoSgTransformerConfig::from_resolved_config(&transformer_config)
+            .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+            message: format!("failed to parse TripoSG-scribble transformer config: {source}"),
+        })?;
+        if !transformer_cfg.use_cross_attention_2 {
+            return Err(Lux3dError::CanonicalWeightsValidation {
+                message: "TripoSG-scribble transformer config does not enable \
+                          use_cross_attention_2; the raw checkpoint is not a scribble model"
+                    .to_string(),
+            });
+        }
+        let vae_cfg = TripoSgVaeConfig::from_resolved_config(&vae_config).map_err(|source| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!("failed to parse TripoSG-scribble VAE config: {source}"),
+            }
+        })?;
+        let dino_hidden = dino_config
+            .get("hidden_size")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize)
+            .unwrap_or(1024);
+        let dino_layers = dino_config
+            .get("num_hidden_layers")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize)
+            .unwrap_or(24);
+        if dino_hidden != 1024 || dino_layers != 24 {
+            return Err(Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "TripoSG-scribble image encoder must be DINOv2-large (hidden 1024, 24 \
+                     layers), got hidden {dino_hidden}, {dino_layers} layers"
+                ),
+            });
+        }
+        if transformer_cfg.cross_attention_2_dim != Some(dino_hidden) {
+            return Err(Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "TripoSG-scribble transformer cross_attention_2_dim {:?} does not match \
+                     the image encoder hidden size {dino_hidden}",
+                    transformer_cfg.cross_attention_2_dim
+                ),
+            });
+        }
+
+        let text_encoder = TripoSgClipTextEncoder::load(
+            raw_safetensors_var_builder(dir, "text_encoder/model.safetensors", dtype, device)?,
+            &text_config,
+            dtype,
+        )
+        .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+            message: format!("failed to construct TripoSG-scribble CLIP text encoder: {source}"),
+        })?;
+        if text_encoder.config().embed_dim != transformer_cfg.cross_attention_dim {
+            return Err(Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "TripoSG-scribble text encoder hidden size {} does not match the \
+                     transformer cross_attention_dim {}",
+                    text_encoder.config().embed_dim,
+                    transformer_cfg.cross_attention_dim
+                ),
+            });
+        }
+
+        Ok(Self {
+            dino: TripoSgDinoEncoder::load(raw_safetensors_var_builder(
+                dir,
+                "image_encoder_dinov2/model.safetensors",
+                dtype,
+                device,
+            )?)
+            .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                message: format!("failed to construct TripoSG-scribble image encoder: {source}"),
+            })?,
+            dit: TripoSgDiT::load(
+                raw_safetensors_var_builder(
+                    dir,
+                    "transformer/diffusion_pytorch_model.safetensors",
+                    dtype,
+                    device,
+                )?,
+                &transformer_cfg,
+            )
+            .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                message: format!("failed to construct TripoSG-scribble DiT: {source}"),
+            })?,
+            vae: TripoSgVaeDecoder::load(
+                raw_safetensors_var_builder(
+                    dir,
+                    "vae/diffusion_pytorch_model.safetensors",
+                    dtype,
+                    device,
+                )?,
+                &vae_cfg,
+            )
+            .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                message: format!("failed to construct TripoSG-scribble VAE decoder: {source}"),
+            })?,
+            text_encoder,
+            tokenizer: ClipBpeTokenizer::from_dir(&dir.join("tokenizer")).map_err(|source| {
+                Lux3dError::CanonicalWeightsValidation {
+                    message: format!(
+                        "failed to load the TripoSG-scribble CLIP tokenizer from `{}`: {source}",
+                        dir.join("tokenizer").display()
+                    ),
+                }
+            })?,
+        })
+    }
+}
+
+fn read_triposg_scribble_json(dir: &Path, relative: &str) -> Result<serde_json::Value> {
+    let path = dir.join(relative);
+    let body =
+        fs::read_to_string(&path).map_err(|source| Lux3dError::CanonicalWeightsValidation {
+            message: format!(
+                "failed to read TripoSG-scribble checkpoint file `{}`: {source}",
+                path.display()
+            ),
+        })?;
+    serde_json::from_str(&body).map_err(|source| Lux3dError::CanonicalWeightsValidation {
+        message: format!(
+            "failed to parse TripoSG-scribble checkpoint file `{}`: {source}",
+            path.display()
+        ),
+    })
+}
+
+/// Open one raw safetensors shard as a `VarBuilder`.
+fn raw_safetensors_var_builder(
+    dir: &Path,
+    relative: &str,
+    dtype: DType,
+    device: &Device,
+) -> Result<VarBuilder<'static>> {
+    let path = dir.join(relative);
+    // SAFETY: the checkpoint file is read-only and the mmap stays alive for
+    // the 'static borrow owned by the bundle's VarBuilder (same contract as
+    // the canonical TripoSG loader and the TRELLIS.2 raw-directory loader).
+    unsafe { VarBuilder::from_mmaped_safetensors(&[&path], dtype, device) }.map_err(|source| {
+        Lux3dError::CanonicalWeightsValidation {
+            message: format!(
+                "failed to open TripoSG-scribble weights `{}`: {source}",
+                path.display()
+            ),
+        }
+    })
+}
+
+/// TripoSG-scribble pipeline: preprocess -> CLIP text embeds + DINOv2
+/// scribble embeds -> seeded rectified-flow denoise with dual cross-attention
+/// scales -> VAE SDF decode (dense/hierarchical marching cubes) -> GLB export.
+#[derive(Debug)]
+pub struct TripoSgScribblePipeline {
+    /// Raw diffusers-style checkpoint directory (`VAST-AI/TripoSG-scribble`).
+    pub model_dir: PathBuf,
+    /// Optional separate RMBG-1.4 canonical package for inputs without a
+    /// valid alpha channel (same fallback as the image pipeline).
+    pub rmbg_weights: Option<AuxiliaryWeightSetPaths>,
+    pub preprocess: TripoSgPreprocessStage,
+    pub geometry: TripoSgGeometryStage,
+    pub export: TripoSgExportStage,
+    dtype: DType,
+    bundle_cache: Arc<DeviceLocalCache<TripoSgScribbleModelBundle>>,
+    rmbg_cache: Arc<DeviceLocalCache<RmbgModel>>,
+}
+
+impl TripoSgScribblePipeline {
+    pub fn load(model_dir: impl Into<PathBuf>) -> Result<Self> {
+        Self::load_with_rmbg_and_dtype(model_dir, None, DType::F32)
+    }
+
+    pub fn load_with_dtype(model_dir: impl Into<PathBuf>, dtype: DType) -> Result<Self> {
+        Self::load_with_rmbg_and_dtype(model_dir, None, dtype)
+    }
+
+    pub fn load_with_rmbg_and_dtype(
+        model_dir: impl Into<PathBuf>,
+        rmbg_model_dir: Option<PathBuf>,
+        dtype: DType,
+    ) -> Result<Self> {
+        let model_dir = model_dir.into();
+        let resolved = resolve_triposg_scribble_model_dir(Some(&model_dir))?;
+        let rmbg_weights = match rmbg_model_dir {
+            Some(dir) => Some(load_auxiliary_canonical_weights(dir, "rmbg")?),
+            None => None,
+        };
+        Ok(Self {
+            model_dir: resolved,
+            rmbg_weights,
+            preprocess: TripoSgPreprocessStage::default(),
+            geometry: TripoSgGeometryStage,
+            export: TripoSgExportStage,
+            dtype,
+            bundle_cache: Arc::default(),
+            rmbg_cache: Arc::default(),
+        })
+    }
+
+    fn bundle_for(&self, device: &Device) -> Result<Arc<TripoSgScribbleModelBundle>> {
+        self.bundle_cache.get_or_try_init(device, || {
+            TripoSgScribbleModelBundle::load(&self.model_dir, device, self.dtype)
+        })
+    }
+
+    fn rmbg_for(&self, device: &Device) -> Result<Option<Arc<RmbgModel>>> {
+        let Some(weights) = &self.rmbg_weights else {
+            return Ok(None);
+        };
+        self.rmbg_cache
+            .get_or_try_init(device, || {
+                let config =
+                    RmbgConfig::from_resolved_config(&weights.read_resolved_config_json()?)
+                        .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                            message: format!("failed to parse RMBG config: {source}"),
+                        })?;
+                // SAFETY: canonical safetensors mmap, same lifetime contract
+                // as the scribble bundle.
+                let vb = unsafe { weights.var_builder(DType::F32, device) }.map_err(|source| {
+                    Lux3dError::CanonicalWeightsValidation {
+                        message: format!("failed to open RMBG canonical weights: {source}"),
+                    }
+                })?;
+                RmbgModel::load(vb, &config).map_err(|source| {
+                    Lux3dError::CanonicalWeightsValidation {
+                        message: format!("failed to construct RMBG model: {source}"),
+                    }
+                })
+            })
+            .map(Some)
+    }
+
+    /// Same preprocessing contract as the image pipeline (see
+    /// `TripoSgPipeline::prepare_inputs_from_path`); the scribble reference
+    /// script feeds the raw RGB scribble through the DINOv2 image processor,
+    /// so this path shares Lux3D's TripoSG preprocess (documented deviation:
+    /// the reference skips the alpha/RMBG foreground step for scribbles).
+    pub fn prepare_inputs_from_path(
+        &self,
+        source: &Path,
+        device: &Device,
+    ) -> Result<TripoSgPreparedInputs> {
+        match self
+            .preprocess
+            .prepare_inputs_from_path_with_rmbg(source, device, None)
+        {
+            Ok(prepared) => Ok(prepared),
+            Err(Lux3dError::InvalidInput(message))
+                if message.starts_with("TripoSG input has no valid alpha channel")
+                    && self.rmbg_weights.is_some() =>
+            {
+                let rmbg = self.rmbg_for(device)?;
+                self.preprocess
+                    .prepare_inputs_from_path_with_rmbg(source, device, rmbg.as_deref())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// `CLIPTextModelWithProjection(prompt).last_hidden_state`
+    /// `[1, model_max_length, 768]` (PRE-projection), F32.
+    pub fn text_embeds(&self, prompt: &str, device: &Device) -> Result<Tensor> {
+        if prompt.trim().is_empty() {
+            return Err(Lux3dError::InvalidInput(
+                "TripoSG-scribble prompt must not be empty",
+            ));
+        }
+        let bundle = self.bundle_for(device)?;
+        bundle
+            .text_encoder
+            .encode_prompt(&bundle.tokenizer, prompt, device)
+            .and_then(|embeds| embeds.to_dtype(DType::F32))
+            .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                message: format!("TripoSG-scribble text encode failed: {source}"),
+            })
+    }
+
+    /// DINOv2-large scribble conditioning embeds `[1, 257, 1024]` from
+    /// prepared `[1, 3, 224, 224]` pixel values, F32.
+    pub fn image_embeds(&self, pixel_values: &Tensor) -> Result<Tensor> {
+        let bundle = self.bundle_for(pixel_values.device())?;
+        let pixel_values = pixel_values.to_dtype(self.dtype).map_err(|source| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "failed to convert TripoSG-scribble image input to {dtype:?}: {source}",
+                    dtype = self.dtype
+                ),
+            }
+        })?;
+        let embeds = bundle.dino.forward(&pixel_values).map_err(|source| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!("TripoSG-scribble image encoder forward failed: {source}"),
+            }
+        })?;
+        embeds
+            .to_dtype(DType::F32)
+            .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "failed to convert TripoSG-scribble image embeds to f32: {source}"
+                ),
+            })
+    }
+
+    /// Full scribble inference from files: preprocess the scribble image ->
+    /// DINOv2 embeds -> CLIP text embeds -> seeded 512-token latents ->
+    /// dual-conditioned Euler denoise with `guidance_scale=0` (no CFG) and
+    /// the per-branch confidences from `options`.
+    pub fn infer_from_path(
+        &self,
+        scribble: &Path,
+        prompt: &str,
+        device: &Device,
+        options: &TripoSgScribbleRunOptions,
+    ) -> Result<TripoSgScribbleInferenceOutput> {
+        options.validate()?;
+        let prepared = self.prepare_inputs_from_path(scribble, device)?;
+        let text_embeds = self.text_embeds(prompt, device)?;
+        let image_embeds = self.image_embeds(&prepared.pixel_values)?;
+        let latents_init = TripoSgPipeline::sample_latents(
+            options.seed,
+            options.num_tokens,
+            TRIPOSG_LATENT_CHANNELS,
+            device,
+        )?;
+        let latents =
+            self.infer_with_latents(&text_embeds, &image_embeds, &latents_init, options)?;
+        Ok(TripoSgScribbleInferenceOutput {
+            prompt: prompt.to_string(),
+            text_embeds,
+            image_embeds,
+            latents_init,
+            latents,
+        })
+    }
+
+    /// Denoise caller-supplied initial latents with both conditionings. The
+    /// per-branch attention scales are
+    /// `cross_attention_scale = options.prompt_confidence` (text branch) and
+    /// `cross_attention_2_scale = options.scribble_confidence` (image
+    /// branch); guidance stays at 0 (single pass, no CFG), matching
+    /// `pipeline_triposg_scribble.py`.
+    pub fn infer_with_latents(
+        &self,
+        text_embeds: &Tensor,
+        image_embeds: &Tensor,
+        latents_init: &Tensor,
+        options: &TripoSgScribbleRunOptions,
+    ) -> Result<Tensor> {
+        options.validate()?;
+        TripoSgPipeline::validate_latents(latents_init, options.num_tokens)?;
+        let bundle = self.bundle_for(latents_init.device())?;
+        let scheduler = match &options.timesteps {
+            Some(timesteps) => RectifiedFlowSchedule::from_timesteps(timesteps, SCHEDULER_SHIFT),
+            None => RectifiedFlowSchedule::new(options.steps, SCHEDULER_SHIFT),
+        };
+        denoise_dual_with_schedule(
+            &bundle.dit,
+            latents_init,
+            text_embeds,
+            image_embeds,
+            &scheduler,
+            0.0,
+            options.prompt_confidence,
+            options.scribble_confidence,
+            self.dtype,
+        )
+        .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+            message: format!("TripoSG-scribble denoise failed: {source}"),
+        })
+    }
+
+    /// Decode the SDF field and assemble the marching-cubes mesh, always via
+    /// the reference scribble path: `use_flash_decoder=False` with dense
+    /// depth 8 / hierarchical depth 8 and level-0 marching cubes.
+    pub fn extract_mesh(
+        &self,
+        latents: &Tensor,
+        options: &TripoSgScribbleRunOptions,
+    ) -> Result<TripoSgMeshBuffers> {
+        options.validate()?;
+        TripoSgPipeline::validate_latents(latents, options.num_tokens)?;
+        let bundle = self.bundle_for(latents.device())?;
+        let latents = latents.to_dtype(self.dtype).map_err(|source| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "failed to convert TripoSG-scribble latents to {dtype:?}: {source}",
+                    dtype = self.dtype
+                ),
+            }
+        })?;
+        let bounds = options.effective_bounds();
+        let grid = hierarchical_sdf_grid(
+            &bundle.vae,
+            &latents,
+            bounds,
+            options.dense_octree_depth,
+            options.hierarchical_octree_depth,
+            options.query_chunk_size,
+        )
+        .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+            message: format!("TripoSG-scribble SDF grid decode failed: {source}"),
+        })?;
+        let mut mesh_cpu = self.geometry.assemble_cpu(&grid)?;
+
+        if let Some(target_faces) = options.faces {
+            if target_faces > 0 && mesh_cpu.faces.len() / 3 > target_faces {
+                mesh_cpu = simplify_triposg_mesh(&mesh_cpu, target_faces)?;
+            }
+        }
+
+        triposg_mesh_buffers(&mesh_cpu, latents.device())
+    }
+
+    /// Export mesh buffers in the format selected by `path`'s extension.
+    pub fn export_mesh(&self, mesh: &TripoSgMeshBuffers, path: &Path) -> Result<MeshFormat> {
+        let mesh_cpu = triposg_mesh_buffers_to_cpu(mesh)?;
+        self.export.write_mesh(&mesh_cpu, path)
+    }
+
+    /// Export mesh buffers as ASCII OBJ.
+    pub fn export_obj(&self, mesh: &TripoSgMeshBuffers, path: &Path) -> Result<()> {
+        let mesh_cpu = triposg_mesh_buffers_to_cpu(mesh)?;
+        self.export.write_obj(&mesh_cpu, path)
     }
 }
 
@@ -867,44 +1571,14 @@ impl TripoSgPipeline {
     /// Export mesh buffers in the format selected by `path`'s extension:
     /// `.glb` (primary), `.obj`, `.ply` or `.stl`.
     pub fn export_mesh(&self, mesh: &TripoSgMeshBuffers, path: &Path) -> Result<MeshFormat> {
-        let mesh_cpu = self.mesh_cpu(mesh)?;
+        let mesh_cpu = triposg_mesh_buffers_to_cpu(mesh)?;
         self.export.write_mesh(&mesh_cpu, path)
     }
 
     /// Export mesh buffers as ASCII OBJ (legacy entry point).
     pub fn export_obj(&self, mesh: &TripoSgMeshBuffers, path: &Path) -> Result<()> {
-        let mesh_cpu = self.mesh_cpu(mesh)?;
+        let mesh_cpu = triposg_mesh_buffers_to_cpu(mesh)?;
         self.export.write_obj(&mesh_cpu, path)
-    }
-
-    fn mesh_cpu(&self, mesh: &TripoSgMeshBuffers) -> Result<TripoSgMeshCpu> {
-        let vertices = mesh
-            .vertices
-            .to_device(&Device::Cpu)
-            .and_then(|tensor| tensor.flatten_all())
-            .and_then(|tensor| tensor.to_vec1::<f32>())
-            .map_err(|source| Lux3dError::CanonicalWeightsValidation {
-                message: format!("failed to gather TripoSG mesh vertices on cpu: {source}"),
-            })?;
-        let faces = mesh
-            .faces
-            .to_device(&Device::Cpu)
-            .and_then(|tensor| tensor.flatten_all())
-            .and_then(|tensor| tensor.to_vec1::<i64>())
-            .map_err(|source| Lux3dError::CanonicalWeightsValidation {
-                message: format!("failed to gather TripoSG mesh faces on cpu: {source}"),
-            })?;
-        // The device buffers don't carry grid metadata (resolution and the
-        // query bounds live in the SDF grid, which is consumed inside
-        // extract_mesh); exporters only read vertices/faces, so the bounds
-        // here are descriptive metadata only (canonical default).
-        Ok(TripoSgMeshCpu {
-            resolution: 0,
-            sdf_level: CANONICAL_SDF_LEVEL,
-            bounds: CANONICAL_BOUNDS,
-            vertices,
-            faces,
-        })
     }
 
     /// `latents` must be `[1, num_tokens, 64]` (batch 1 — the VAE decoder and
@@ -925,6 +1599,59 @@ impl TripoSgPipeline {
         }
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared mesh-buffer helpers (image and scribble pipelines)
+// ---------------------------------------------------------------------------
+
+/// Materialize a CPU mesh as device buffers on `device`.
+fn triposg_mesh_buffers(mesh: &TripoSgMeshCpu, device: &Device) -> Result<TripoSgMeshBuffers> {
+    let vertex_count = mesh.vertices.len() / 3;
+    let face_count = mesh.faces.len() / 3;
+    let vertices =
+        Tensor::from_vec(mesh.vertices.clone(), (vertex_count, 3), device).map_err(|source| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!("failed to materialize TripoSG mesh vertices: {source}"),
+            }
+        })?;
+    let faces =
+        Tensor::from_vec(mesh.faces.clone(), (face_count, 3), device).map_err(|source| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!("failed to materialize TripoSG mesh faces: {source}"),
+            }
+        })?;
+    Ok(TripoSgMeshBuffers { vertices, faces })
+}
+
+/// Gather device mesh buffers back to CPU. The device buffers don't carry
+/// grid metadata (resolution and query bounds live in the SDF grid, which is
+/// consumed inside `extract_mesh`); exporters only read vertices/faces, so
+/// the bounds here are descriptive metadata only (canonical default).
+fn triposg_mesh_buffers_to_cpu(mesh: &TripoSgMeshBuffers) -> Result<TripoSgMeshCpu> {
+    let vertices = mesh
+        .vertices
+        .to_device(&Device::Cpu)
+        .and_then(|tensor| tensor.flatten_all())
+        .and_then(|tensor| tensor.to_vec1::<f32>())
+        .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+            message: format!("failed to gather TripoSG mesh vertices on cpu: {source}"),
+        })?;
+    let faces = mesh
+        .faces
+        .to_device(&Device::Cpu)
+        .and_then(|tensor| tensor.flatten_all())
+        .and_then(|tensor| tensor.to_vec1::<i64>())
+        .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+            message: format!("failed to gather TripoSG mesh faces on cpu: {source}"),
+        })?;
+    Ok(TripoSgMeshCpu {
+        resolution: 0,
+        sdf_level: CANONICAL_SDF_LEVEL,
+        bounds: CANONICAL_BOUNDS,
+        vertices,
+        faces,
+    })
 }
 
 // ---------------------------------------------------------------------------
