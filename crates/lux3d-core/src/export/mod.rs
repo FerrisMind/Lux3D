@@ -2,6 +2,7 @@ pub mod colmap;
 pub mod glb_textured;
 pub mod import;
 pub mod mesh;
+pub mod ovox;
 mod pi3;
 pub mod point_cloud;
 mod trellis2;
