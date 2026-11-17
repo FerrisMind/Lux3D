@@ -39,10 +39,15 @@
 //!    `pred_subdiv = false`) with SYNTHESIZED guide logits
 //!    ([`synthesize_tex_guide_subs`]), `raw * 0.5 + 0.5` -> the 6-channel
 //!    PBR layout (base_color 0:3, metallic 3, roughness 4, alpha 5).
-//! 6. `postprocess_mesh`: `uv_unwrap` (xatlas) at `texture_size`, area
-//!    weighted vertex normals, per-texel sparse-trilinear sampling of the
-//!    PBR voxels and TELEA-style inpainting
-//!    ([`crate::geometry::bake_pbr_texture`], via
+//! 6. `postprocess_mesh`: when the input mesh carries UVs they are USED
+//!    (the atlas is not re-unwrapped) — the reference
+//!    `trellis2_texturing.py:299-313` branch, which keeps
+//!    `mesh.visual.uv` and only calls `uv_unwrap` when it is absent. With
+//!    provided UVs the bake runs on them directly and they are carried into
+//!    the textured GLB; otherwise `uv_unwrap` (xatlas) runs at
+//!    `texture_size`. Area-weighted vertex normals, per-texel
+//!    sparse-trilinear sampling of the PBR voxels and TELEA-style inpainting
+//!    follow in both branches ([`crate::geometry::bake_pbr_texture`], via
 //!    `build_trellis2_textured_mesh`). Axis conversion and the UV V-flip
 //!    happen only at GLB export.
 //!
@@ -96,7 +101,7 @@
 //! that carries `shape_enc.*` keys in its merged file is honored
 //! automatically.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use candle_core::{DType, Device, Tensor};
@@ -112,7 +117,10 @@ use super::trellis2_tex::{query_vertex_colors, Trellis2PbrLayout};
 use super::trellis2_vae::Trellis2ShapeVaeConfig;
 use crate::contracts::{SpatialSize, TensorContract, Trellis2PreparedImage, Trellis2RawInput};
 use crate::error::Lux3dError;
-use crate::geometry::{mesh_to_flexible_dual_grid, MeshToDualGridOptions, Trellis2MeshBuffers};
+use crate::geometry::{
+    area_weighted_vertex_normals, bake_pbr_texture, mesh_to_flexible_dual_grid,
+    MeshToDualGridOptions, Trellis2MeshBuffers,
+};
 use crate::preprocess::{resize_lanczos_u8, Trellis2Preprocess};
 use crate::weights::{is_gguf_path, load_canonical_weights, ModelAssetOptions, VarBuilder};
 use crate::{ModelFamily, Result};
@@ -293,6 +301,122 @@ pub fn preprocess_mesh_for_texturing(vertices: &[f32], faces: &[u32]) -> Result<
         ));
     }
     Ok(out)
+}
+
+/// Per-corner UV layouts hold two floats per entry of `faces` (each entry is
+/// one face corner), i.e. `2 * faces.len()` values — not `2/3` of that.
+/// Shared by the public [`Trellis2Pipeline::texture_mesh`] validation and the
+/// input-UV bake helper so the two cannot diverge.
+fn validate_corner_uv_count(faces_len: usize, uv_len: usize) -> Result<()> {
+    if uv_len != faces_len * 2 {
+        return Err(Lux3dError::ContractValidation {
+            message: format!(
+                "Trellis2 input UV layout must hold two values per face corner ({} values), got {}",
+                faces_len * 2,
+                uv_len
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Build the textured atlas mesh from INPUT per-corner UVs (the reference
+/// `postprocess_mesh` UV-reuse branch, `trellis2_texturing.py:299-313`):
+/// no UV unwrap runs, the provided UVs are rasterized/baked directly and
+/// carried into the textured mesh (and thus the GLB).
+///
+/// Corners are split per distinct `(input vertex, UV)` pair so the result is
+/// an atlas-style per-vertex UV buffer (duplicates only at UV seams). The
+/// area-weighted normals are computed on the INPUT topology and gathered to
+/// the split vertices — the reference keeps `mesh.vertex_normals` unchanged
+/// in this branch (no `vmap` gather, unlike the unwrap branch).
+///
+/// `corner_uvs` layout is [`ImportedMesh::uvs`](crate::export::ImportedMesh)
+/// (two floats per face corner, trimesh-internal lower-left convention).
+/// `chart_count` is `0`: no chart unwrap ran for this mesh.
+fn build_textured_mesh_with_input_uvs(
+    vertices: &[f32],
+    faces: &[u32],
+    corner_uvs: &[f32],
+    tex_coords: &[[i32; 3]],
+    attrs: &[f32],
+    resolution: u32,
+    texture_size: usize,
+) -> Result<Trellis2TexturedMesh> {
+    validate_corner_uv_count(faces.len(), corner_uvs.len())?;
+    if vertices.len() % 3 != 0 || faces.len() % 3 != 0 {
+        return Err(Lux3dError::InvalidInput(
+            "Trellis2 input UV layout requires [V, 3] vertices and [F, 3] faces",
+        ));
+    }
+    let input_vertices: Vec<[f32; 3]> = vertices
+        .chunks_exact(3)
+        .map(|chunk| [chunk[0], chunk[1], chunk[2]])
+        .collect();
+    if faces
+        .iter()
+        .any(|&index| index as usize >= input_vertices.len())
+    {
+        return Err(Lux3dError::InvalidInput(
+            "Trellis2 input UV layout face index outside the vertex buffer",
+        ));
+    }
+    let input_normals = area_weighted_vertex_normals(&input_vertices, faces);
+
+    let mut split_lookup: HashMap<(u32, [u32; 2]), u32> = HashMap::new();
+    let mut atlas_vertices: Vec<[f32; 3]> = Vec::new();
+    let mut atlas_normals: Vec<[f32; 3]> = Vec::new();
+    let mut atlas_uvs: Vec<[f32; 2]> = Vec::new();
+    let mut atlas_faces: Vec<u32> = Vec::with_capacity(faces.len());
+    for (corner, &vertex_index) in faces.iter().enumerate() {
+        let uv = [corner_uvs[corner * 2], corner_uvs[corner * 2 + 1]];
+        // Exact-bit UV keys: corners of the same vertex sharing the same UV
+        // stay one atlas vertex; distinct UVs split at the seam.
+        let key = (vertex_index, [uv[0].to_bits(), uv[1].to_bits()]);
+        let split = match split_lookup.get(&key) {
+            Some(&index) => index,
+            None => {
+                let index = u32::try_from(atlas_vertices.len()).map_err(|_| {
+                    Lux3dError::ContractValidation {
+                        message: "Trellis2 input UV layout exceeds the u32 atlas vertex \
+                                      index range"
+                            .to_string(),
+                    }
+                })?;
+                let source = vertex_index as usize;
+                atlas_vertices.push(input_vertices[source]);
+                atlas_normals.push(input_normals[source]);
+                atlas_uvs.push(uv);
+                split_lookup.insert(key, index);
+                index
+            }
+        };
+        atlas_faces.push(split);
+    }
+
+    let texture = bake_pbr_texture(
+        &atlas_vertices,
+        &atlas_uvs,
+        &atlas_faces,
+        tex_coords,
+        attrs,
+        resolution,
+        texture_size,
+    )
+    .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+        message: format!("Trellis2 PBR texture bake failed: {source}"),
+    })?;
+
+    Ok(Trellis2TexturedMesh {
+        vertices: atlas_vertices.iter().flatten().copied().collect(),
+        faces: atlas_faces,
+        normals: atlas_normals.iter().flatten().copied().collect(),
+        uvs: atlas_uvs.iter().flatten().copied().collect(),
+        texture,
+        chart_count: 0,
+        atlas_count: 1,
+        atlas_size: texture_size as u32,
+    })
 }
 
 /// Synthesize the texture decoder's `guide_subs` from the mesh voxelization
@@ -639,17 +763,23 @@ impl Trellis2Pipeline {
     ///   `preprocess_mesh_for_texturing` normalizes unless
     ///   `options.preprocess_mesh` is false).
     /// * `faces` — flat zero-based triangle indices.
+    /// * `corner_uvs` — optional per-corner UVs carried by the imported mesh
+    ///   (`ImportedMesh::uvs` layout: two floats per face corner, length
+    ///   `2 * faces.len()`, trimesh-internal lower-left convention).
+    ///   `Some` takes the reference UV-reuse branch
+    ///   (`trellis2_texturing.py:299-313`): the provided layout is baked and
+    ///   exported as-is, NO xatlas unwrap runs. `None` takes the unwrap
+    ///   branch. Partial or unusable sets are already collapsed to `None` by
+    ///   the importer (documented rule); a `Some` buffer that does not cover
+    ///   every corner is rejected rather than silently baked.
     /// * `image` — the condition image (reference `preprocess_image` +
     ///   `get_cond` semantics; the pipeline's RMBG-2.0 remover handles
     ///   opaque inputs when `options.preprocess_image` is set).
-    ///
-    /// Existing input UVs are not accepted by this surface — the atlas is
-    /// always unwrapped (upstream keeps mesh UVs when present; the buffers
-    /// in this repo carry none).
     pub fn texture_mesh(
         &self,
         vertices: &[f32],
         faces: &[u32],
+        corner_uvs: Option<&[f32]>,
         image: &Trellis2RawInput,
         options: &Trellis2TexturingOptions,
         device: &Device,
@@ -670,6 +800,14 @@ impl Trellis2Pipeline {
             return Err(Lux3dError::InvalidInput(
                 "Trellis2 texturing mesh face index outside the vertex buffer",
             ));
+        }
+        if let Some(uvs) = corner_uvs {
+            validate_corner_uv_count(faces.len(), uvs.len())?;
+            if uvs.iter().any(|value| !value.is_finite()) {
+                return Err(Lux3dError::InvalidInput(
+                    "Trellis2 texturing input UVs contain a non-finite value",
+                ));
+            }
         }
 
         // 1. preprocess_mesh: center/scale + y/z axis swap into
@@ -824,42 +962,55 @@ impl Trellis2Pipeline {
             });
         }
 
-        // 7. postprocess_mesh: UV unwrap + PBR bake over the preprocessed
-        //    mesh, via the shared texture-export stage. Per-vertex colors
-        //    are sampled alongside (they feed the PLY/GLB vertex-color path
-        //    and satisfy the stage's PBR-payload guard).
-        let vertices_rows: Vec<[f32; 3]> = mesh_vertices
-            .chunks_exact(3)
-            .map(|c| [c[0], c[1], c[2]])
-            .collect();
-        let vertex_colors =
-            query_vertex_colors(&vertices_rows, &tex_coords, &attrs, options.resolution).map_err(
-                |source| Lux3dError::CanonicalWeightsValidation {
-                    message: format!("Trellis2 vertex color sampling failed: {source}"),
+        // 7. postprocess_mesh: UV reuse when the input carries UVs (no
+        //    unwrap), else xatlas unwrap + bake, over the preprocessed mesh.
+        //    The unwrap branch samples per-vertex colors alongside (they
+        //    feed the PLY/GLB vertex-color path and satisfy the stage's
+        //    PBR-payload guard); the UV-reuse branch only needs the bake,
+        //    exactly like the reference postprocess_mesh.
+        let textured = if let Some(corner_uvs) = corner_uvs {
+            build_textured_mesh_with_input_uvs(
+                &mesh_vertices,
+                faces,
+                corner_uvs,
+                &tex_coords,
+                &attrs,
+                options.resolution,
+                options.texture_size,
+            )?
+        } else {
+            let vertices_rows: Vec<[f32; 3]> = mesh_vertices
+                .chunks_exact(3)
+                .map(|c| [c[0], c[1], c[2]])
+                .collect();
+            let vertex_colors =
+                query_vertex_colors(&vertices_rows, &tex_coords, &attrs, options.resolution)
+                    .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                        message: format!("Trellis2 vertex color sampling failed: {source}"),
+                    })?;
+            let buffers = Trellis2MeshBuffers {
+                resolution: options.resolution,
+                vertices: mesh_vertices,
+                faces: faces.iter().map(|&f| f as i64).collect(),
+                voxel_coords: tex_coords.iter().flat_map(|c| [c[0], c[1], c[2]]).collect(),
+                voxel_attrs: attrs,
+                voxel_attr_channels: Trellis2PbrLayout::CHANNELS,
+                vertex_colors: Some(vertex_colors),
+            };
+            build_trellis2_textured_mesh(
+                &buffers,
+                &Trellis2TextureExportOptions {
+                    enabled: true,
+                    texture_size: options.texture_size,
+                    uv_unwrap: true,
                 },
-            )?;
-        let buffers = Trellis2MeshBuffers {
-            resolution: options.resolution,
-            vertices: mesh_vertices,
-            faces: faces.iter().map(|&f| f as i64).collect(),
-            voxel_coords: tex_coords.iter().flat_map(|c| [c[0], c[1], c[2]]).collect(),
-            voxel_attrs: attrs,
-            voxel_attr_channels: Trellis2PbrLayout::CHANNELS,
-            vertex_colors: Some(vertex_colors),
+            )?
+            .ok_or_else(|| Lux3dError::ContractValidation {
+                message: "Trellis2 texture export skipped cleanly but the texturing \
+                              pipeline requires a baked atlas mesh"
+                    .to_string(),
+            })?
         };
-        let textured = build_trellis2_textured_mesh(
-            &buffers,
-            &Trellis2TextureExportOptions {
-                enabled: true,
-                texture_size: options.texture_size,
-                uv_unwrap: true,
-            },
-        )?
-        .ok_or_else(|| Lux3dError::ContractValidation {
-            message: "Trellis2 texture export skipped cleanly but the texturing \
-                          pipeline requires a baked atlas mesh"
-                .to_string(),
-        })?;
 
         Ok(Trellis2TexturingOutput {
             mesh: textured,
@@ -876,6 +1027,10 @@ impl Trellis2Pipeline {
     /// texture the mesh. The prepared crop is square and already
     /// premultiplied, so the inner call runs with
     /// `preprocess_image = false` (no second RMBG pass).
+    ///
+    /// This surface has no UV channel and always takes the unwrap branch;
+    /// callers holding `ImportedMesh::uvs` should call [`Self::texture_mesh`]
+    /// directly to reuse them.
     pub fn texture_mesh_from_path(
         &self,
         vertices: &[f32],
@@ -920,7 +1075,7 @@ impl Trellis2Pipeline {
             let raw = Trellis2Preprocess::load_raw_input_from_path(image_path)?;
             (raw, options.clone())
         };
-        self.texture_mesh(vertices, faces, &raw, &inner, device)
+        self.texture_mesh(vertices, faces, None, &raw, &inner, device)
     }
 }
 
@@ -1069,5 +1224,167 @@ mod tests {
             };
             assert_eq!(expected_cond, options.cond_resolution());
         }
+    }
+
+    /// Quad fixture for the UV-reuse tests: reference-frame quad in `z = 0`,
+    /// two triangles, per-corner UV rect `0.1..0.9` (trimesh-internal
+    /// lower-left convention) and a constant red PBR volume at resolution 2.
+    fn textured_quad_fixture() -> (Vec<f32>, Vec<u32>, Vec<f32>, Vec<[i32; 3]>, Vec<f32>) {
+        let vertices = vec![
+            -0.5, -0.5, 0.0, 0.5, -0.5, 0.0, 0.5, 0.5, 0.0, -0.5, 0.5, 0.0,
+        ];
+        let faces = vec![0, 1, 2, 0, 2, 3];
+        let corner_uvs = vec![0.1, 0.1, 0.9, 0.1, 0.9, 0.9, 0.1, 0.1, 0.9, 0.9, 0.1, 0.9];
+        let mut coords = Vec::new();
+        let mut attrs = Vec::new();
+        for z in 0..2 {
+            for y in 0..2 {
+                for x in 0..2 {
+                    coords.push([x, y, z]);
+                    // base color red, metallic 0, roughness 0.5, alpha 1.
+                    attrs.extend([1.0, 0.0, 0.0, 0.0, 0.5, 1.0]);
+                }
+            }
+        }
+        (vertices, faces, corner_uvs, coords, attrs)
+    }
+
+    /// Reference `postprocess_mesh` UV-reuse branch
+    /// (`trellis2_texturing.py:299-313`): provided UVs are baked directly
+    /// (no xatlas unwrap), and the textured GLB carries them back unchanged
+    /// (the writer's V flip is undone by the importer's V flip).
+    #[test]
+    fn provided_uvs_bypass_unwrap_and_roundtrip_through_the_textured_glb() {
+        let (vertices, faces, corner_uvs, coords, attrs) = textured_quad_fixture();
+        let textured = build_textured_mesh_with_input_uvs(
+            &vertices,
+            &faces,
+            &corner_uvs,
+            &coords,
+            &attrs,
+            2,
+            64,
+        )
+        .expect("input-UV bake");
+
+        assert_eq!(0, textured.chart_count, "no unwrap runs with input UVs");
+        assert_eq!(1, textured.atlas_count);
+        assert_eq!(64, textured.atlas_size);
+        // Shared corners with identical UVs stay shared: 4 split vertices.
+        assert_eq!(vec![0, 1, 2, 0, 2, 3], textured.faces);
+        assert_eq!(
+            vec![0.1, 0.1, 0.9, 0.1, 0.9, 0.9, 0.1, 0.9],
+            textured.uvs,
+            "per-atlas-vertex UVs are the provided corner UVs, deduplicated"
+        );
+        assert_eq!(12, textured.vertices.len());
+        assert_eq!(12, textured.normals.len());
+        assert!(textured.texture.stats.valid_texels > 0);
+        for texel in 0..64 * 64 {
+            if !textured.texture.valid_mask[texel] {
+                continue;
+            }
+            assert_eq!(
+                [255, 0, 0, 255],
+                textured.texture.base_color_rgba[texel * 4..texel * 4 + 4]
+            );
+            assert_eq!(
+                [0, 127, 0, 255],
+                textured.texture.metallic_roughness[texel * 4..texel * 4 + 4]
+            );
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "lux3d-trellis2-input-uv-{}.glb",
+            std::process::id()
+        ));
+        crate::export::Trellis2ExportStage
+            .write_textured_glb(&textured, &path)
+            .expect("write textured glb");
+        let imported = crate::export::load_mesh(&path).expect("read textured glb");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(textured.faces, imported.faces);
+        let imported_uvs = imported.uvs.expect("textured GLB must carry TEXCOORD_0");
+        assert_eq!(
+            corner_uvs.len(),
+            imported_uvs.len(),
+            "UV count is unchanged through bake + GLB export"
+        );
+        for (expected, actual) in corner_uvs.iter().zip(imported_uvs.iter()) {
+            assert!(
+                (expected - actual).abs() <= 1e-6,
+                "UV {expected} must survive the GLB round trip, got {actual}"
+            );
+        }
+    }
+
+    /// Meshes without UVs keep the current behavior: xatlas unwrap runs and
+    /// still produces an atlas (the byte-identical fallback path).
+    #[test]
+    fn no_uv_mesh_still_unwraps() {
+        let (vertices, faces, _corner_uvs, coords, attrs) = textured_quad_fixture();
+        let buffers = Trellis2MeshBuffers {
+            resolution: 2,
+            vertices,
+            faces: faces.iter().map(|&face| face as i64).collect(),
+            voxel_coords: coords.iter().flatten().copied().collect(),
+            voxel_attrs: attrs,
+            voxel_attr_channels: 6,
+            vertex_colors: Some(vec![1.0; 4 * 3]),
+        };
+        let textured = build_trellis2_textured_mesh(
+            &buffers,
+            &Trellis2TextureExportOptions {
+                enabled: true,
+                texture_size: 64,
+                uv_unwrap: true,
+            },
+        )
+        .expect("build succeeds")
+        .expect("PBR payload present");
+        assert!(
+            textured.chart_count > 0,
+            "a mesh without UVs must still run the xatlas unwrap"
+        );
+        assert!(!textured.uvs.is_empty());
+        for uv in textured.uvs.chunks_exact(2) {
+            assert!((0.0..=1.0).contains(&uv[0]) && (0.0..=1.0).contains(&uv[1]));
+        }
+    }
+
+    /// Regression: the entry-point validation must count two floats per
+    /// entry of `faces` (per corner), e.g. 12 triangles = 36 corners = 72
+    /// floats. An earlier `2 * faces.len() / 3` rule rejected valid layouts
+    /// (caught by the 4B e2e cube fixture).
+    #[test]
+    fn corner_uv_count_is_two_per_face_corner() {
+        validate_corner_uv_count(36, 72).expect("12 triangles -> 72 UV floats");
+        let error = validate_corner_uv_count(36, 24).expect_err("24 floats are not per-corner");
+        assert!(
+            error.to_string().contains("(72 values), got 24"),
+            "unexpected message: {error}"
+        );
+    }
+
+    /// A partial UV buffer cannot reach the bake (the importer already
+    /// collapses incomplete sets); a direct caller gets a clear error.
+    #[test]
+    fn partial_uv_layout_is_rejected() {
+        let (vertices, faces, corner_uvs, coords, attrs) = textured_quad_fixture();
+        let error = build_textured_mesh_with_input_uvs(
+            &vertices,
+            &faces,
+            &corner_uvs[..corner_uvs.len() - 1],
+            &coords,
+            &attrs,
+            2,
+            64,
+        )
+        .expect_err("partial UV layout must fail");
+        assert!(
+            error.to_string().contains("two values per face corner"),
+            "unexpected message: {error}"
+        );
     }
 }

@@ -18,8 +18,11 @@
 //!    UV unwrap + PBR bake). CPU cost is heavy at the production 1024
 //!    resolution (the encoder runs the full-resolution voxel grid); run it
 //!    in release with `LUX3D_TRELLIS2_TEX_E2E_RESOLUTION` (default 512),
-//!    `LUX3D_TRELLIS2_TEX_E2E_STEPS` (sampler override, default 12) and
-//!    `LUX3D_TRELLIS2_TEX_E2E_DEVICE` (cpu|cuda|vulkan|wgpu, default cpu):
+//!    `LUX3D_TRELLIS2_TEX_E2E_STEPS` (sampler override, default 12),
+//!    `LUX3D_TRELLIS2_TEX_E2E_DEVICE` (cpu|cuda|vulkan|wgpu, default cpu)
+//!    and `LUX3D_TRELLIS2_TEX_E2E_UVS=1` to exercise the input-UV reuse
+//!    branch (no xatlas unwrap; the UVs must round-trip through the
+//!    textured GLB):
 //!    `LUX3D_TRELLIS2_RUN_TEXTURE_E2E=1 cargo test --release -p lux3d-core
 //!    --test trellis2_texture texture_mesh_run_e2e -- --nocapture
 //!    --test-threads 1`.
@@ -31,8 +34,8 @@ use candle_core::{DType, Device, Tensor};
 use lux3d_core::contracts::Trellis2RawInput;
 use lux3d_core::geometry::mesh_to_flexible_dual_grid;
 use lux3d_core::runtime::{
-    Trellis2Pipeline, Trellis2SamplerOverrides, Trellis2TexturingOptions, channel_to_spatial,
-    preprocess_mesh_for_texturing, synthesize_tex_guide_subs,
+    channel_to_spatial, preprocess_mesh_for_texturing, synthesize_tex_guide_subs, Trellis2Pipeline,
+    Trellis2SamplerOverrides, Trellis2TexturingOptions,
 };
 use lux3d_core::test_support::workspace_root;
 use lux3d_core::weights::ModelAssetOptions;
@@ -574,8 +577,10 @@ fn e2e_device() -> Device {
 }
 
 /// Env-gated full run (`LUX3D_TRELLIS2_RUN_TEXTURE_E2E=1`): cube mesh +
-/// synthetic RGBA condition image -> textured atlas mesh + GLB smoke. See
-/// the module doc comment for the exact command and env knobs.
+/// synthetic RGBA condition image -> textured atlas mesh + GLB smoke. Set
+/// `LUX3D_TRELLIS2_TEX_E2E_UVS=1` to pass a complete per-corner UV layout
+/// (the UV-reuse branch: no unwrap, UVs round-trip through the GLB). See the
+/// module doc comment for the exact command and env knobs.
 #[test]
 fn texture_mesh_run_e2e() {
     if std::env::var_os("LUX3D_TRELLIS2_RUN_TEXTURE_E2E").is_none() {
@@ -634,8 +639,29 @@ fn texture_mesh_run_e2e() {
 
     let vertices = cube_vertices();
     let faces = cube_faces();
+    // Optional UV-reuse run (`LUX3D_TRELLIS2_TEX_E2E_UVS=1`): distinct
+    // per-triangle UV rects in the trimesh-internal convention, passed
+    // straight into the pipeline (no xatlas unwrap; the reference
+    // `postprocess_mesh` UV branch).
+    let corner_uvs = std::env::var_os("LUX3D_TRELLIS2_TEX_E2E_UVS")
+        .is_some()
+        .then(|| {
+            let mut uvs = Vec::with_capacity(faces.len() / 3 * 6);
+            for triangle in 0..faces.len() / 3 {
+                let base = triangle as f32 * 0.07;
+                uvs.extend([base, base, base + 0.06, base, base, base + 0.06]);
+            }
+            uvs
+        });
     let output = pipeline
-        .texture_mesh(&vertices, &faces, &image, &options, &device)
+        .texture_mesh(
+            &vertices,
+            &faces,
+            corner_uvs.as_deref(),
+            &image,
+            &options,
+            &device,
+        )
         .expect("texture_mesh e2e");
 
     // Structural output contract.
@@ -644,16 +670,29 @@ fn texture_mesh_run_e2e() {
     assert_eq!(output.mesh.vertices.len() % 3, 0);
     assert!(!output.mesh.faces.is_empty());
     assert_eq!(output.mesh.normals.len(), output.mesh.vertices.len());
+    if let Some(expected_uvs) = &corner_uvs {
+        assert_eq!(
+            0, output.mesh.chart_count,
+            "input UVs must skip the xatlas unwrap"
+        );
+        assert_eq!(
+            expected_uvs, &output.mesh.uvs,
+            "all corners have distinct UVs, so the atlas UV buffer is 1:1"
+        );
+        assert!(output.mesh.texture.stats.valid_texels > 0);
+    }
     let latent_grid = (resolution / 16) as i32;
-    assert!(
-        output
-            .shape_coords
-            .iter()
-            .all(|c| c.iter().all(|&v| v >= 0 && v < latent_grid))
-    );
+    assert!(output
+        .shape_coords
+        .iter()
+        .all(|c| c.iter().all(|&v| v >= 0 && v < latent_grid)));
     assert!(!output.tex_coords.is_empty());
     assert_eq!(output.shape_latent.dims(), &[output.shape_coords.len(), 32]);
-    assert_eq!(output.tex_latent.dims(), &[output.tex_coords.len(), 32]);
+    // `tex_latent` lives on the latent `shape_coords` (see the output struct
+    // docs); `tex_coords` is the decoded full-resolution voxelization, which
+    // `texture_mesh` already verifies against the input voxelization.
+    assert_eq!(output.tex_latent.dims(), &[output.shape_coords.len(), 32]);
+    assert!(output.tex_coords.len() >= output.shape_coords.len());
 
     // GLB export smoke through the shared writer.
     let out_path = std::env::temp_dir().join(format!(
@@ -665,5 +704,20 @@ fn texture_mesh_run_e2e() {
         .write_textured_glb(&output.mesh, &out_path)
         .expect("textured glb write");
     assert!(out_path.is_file());
+    if let Some(expected_uvs) = &corner_uvs {
+        let imported = lux3d_core::export::load_mesh(&out_path).expect("read e2e glb");
+        let imported_uvs = imported.uvs.expect("e2e GLB must carry TEXCOORD_0");
+        assert_eq!(
+            expected_uvs.len(),
+            imported_uvs.len(),
+            "UV count unchanged through bake + GLB export"
+        );
+        for (expected, actual) in expected_uvs.iter().zip(imported_uvs.iter()) {
+            assert!(
+                (expected - actual).abs() <= 1e-5,
+                "UV {expected} must round-trip, got {actual}"
+            );
+        }
+    }
     let _ = std::fs::remove_file(&out_path);
 }

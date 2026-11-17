@@ -7,29 +7,51 @@
 //! [`crate::export::mesh`].
 //!
 //! Supported formats and limits:
-//! - **OBJ** (`read_obj`): ASCII Wavefront with `v`/`f` lines. Polygon faces
-//!   are fan-triangulated; `v`, `v/vt`, `v//vn` and `v/vt/vn` face tokens are
-//!   accepted with 1-based positive and negative relative indices. `vt`, `vn`,
-//!   groups, materials and unknown keywords are ignored; multiple objects
-//!   merge into one buffer. Line continuations (`\`) are not supported.
+//! - **OBJ** (`read_obj`): ASCII Wavefront with `v`/`vt`/`f` lines. Polygon
+//!   faces are fan-triangulated; `v`, `v/vt`, `v//vn` and `v/vt/vn` face
+//!   tokens are accepted with 1-based positive and negative relative indices.
+//!   `vt` lines are read as per-corner UVs (independent of the `v` index, as
+//!   the OBJ format specifies); `vn`, groups, materials and unknown keywords
+//!   are ignored; multiple objects merge into one buffer. Line continuations
+//!   (`\`) are not supported.
 //! - **PLY** (`read_ply`): `format ascii 1.0` and
 //!   `format binary_little_endian 1.0`. Arbitrary vertex property order;
 //!   `x`/`y`/`z` may use any numeric scalar type (`float`/`double` are the
 //!   common ones). Faces are read from the `vertex_indices`/`vertex_index`
 //!   list property and polygons are fan-triangulated. Big-endian PLY and any
 //!   unknown/compressed format variant are rejected with a clear error.
+//!   PLY UVs are not read.
 //! - **GLB** (`read_glb`): glTF 2.0 container (JSON + optional BIN chunk).
 //!   Triangle primitives (`mode` 4) are gathered from the active scene, or
 //!   from every mesh at identity when the file has no scene graph. Static
 //!   node transforms (`matrix` or TRS with a unit quaternion) are applied to
 //!   positions; winding order is preserved. Indices may be `u8`/`u16`/`u32`;
-//!   positions must be `f32`. `KHR_draco_mesh_compression`,
-//!   `EXT_meshopt_compression` and sparse accessors are rejected. Skins are
-//!   ignored (bind-pose geometry is returned) and non-affine transforms are
-//!   applied without perspective divide.
+//!   positions must be `f32`. `TEXCOORD_0` is read as per-corner UVs (float
+//!   or normalized `u8`/`u16` VEC2 accessors).
+//!   `KHR_draco_mesh_compression`, `EXT_meshopt_compression` and sparse
+//!   accessors are rejected. Skins are ignored (bind-pose geometry is
+//!   returned) and non-affine transforms are applied without perspective
+//!   divide.
 //! - **STL** (`read_stl`): ASCII and binary. Vertices are deduplicated by
 //!   exact bit pattern (no epsilon welding; upstream trimesh merges by
-//!   proximity anyway), so shared corners become shared indices.
+//!   proximity anyway), so shared corners become shared indices. STL has no
+//!   UVs.
+//!
+//! # UVs
+//!
+//! [`ImportedMesh::uvs`] carries a COMPLETE per-corner UV set only: two
+//! floats per face corner (`2 * faces.len() / 3` values), aligned with
+//! `faces`. OBJ `vt` indices are independent of the vertex indices (the
+//! `v/vt` layout); the glTF `TEXCOORD_0` per-vertex accessor is expanded
+//! through each primitive's index buffer. UVs are stored in the
+//! trimesh-internal texture convention (origin at the lower-left, `v` up):
+//! OBJ `vt` coordinates pass through as written, glTF `TEXCOORD_0` values
+//! are flipped (`v' = 1 - v`) exactly like trimesh's loader. Partial or
+//! unusable UV sets (some face corners without a UV, malformed or
+//! unresolvable OBJ `vt` data, `TEXCOORD_0` missing on some primitive,
+//! mismatched accessor counts, non-finite values, unsupported component
+//! types) collapse to `None`, so the texturing pipeline unwraps the mesh
+//! itself instead of baking a broken atlas.
 //!
 //! All readers reject empty meshes, non-finite coordinates and face indices
 //! outside the vertex range. Triangles whose three indices are not pairwise
@@ -41,7 +63,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::{Result, error::Lux3dError};
+use crate::{error::Lux3dError, Result};
 
 /// A loaded triangle mesh with flat, writer-compatible buffers.
 #[derive(Debug, Clone, PartialEq)]
@@ -50,6 +72,12 @@ pub struct ImportedMesh {
     pub vertices: Vec<f32>,
     /// Flat zero-based triangle indices in file order.
     pub faces: Vec<u32>,
+    /// Optional per-corner UVs, two floats `[u, v]` per face corner (length
+    /// `2 * faces.len() / 3`, aligned with `faces`). `None` when the file
+    /// carries no COMPLETE UV set (partial sets are dropped; see the module
+    /// docs). Values use the trimesh-internal texture convention (origin at
+    /// the lower-left, `v` up).
+    pub uvs: Option<Vec<f32>>,
 }
 
 /// Load a triangle mesh, selecting the reader from `path`'s extension.
@@ -93,9 +121,15 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
 
 /// Shared end-of-load validation. Drops index-degenerate triangles, checks
 /// finiteness and index ranges, and never reorders vertices or faces.
+///
+/// `corner_uvs` is the optional per-corner UV buffer (one `[u, v]` row per
+/// face corner). Its rows are dropped together with degenerate triangles;
+/// a non-finite value or a row-count mismatch collapses the whole set to
+/// `None` (the documented partial/degenerate-UV fallback to unwrapping).
 fn finalize_import(
     vertices: Vec<f32>,
     faces: Vec<u32>,
+    corner_uvs: Option<Vec<[f32; 2]>>,
     path: &Path,
     format: &str,
 ) -> Result<ImportedMesh> {
@@ -143,14 +177,29 @@ fn finalize_import(
             }
         }
     }
+    if let Some(uvs) = &corner_uvs {
+        if uvs.len() != faces.len() {
+            return Err(validation(format!(
+                "{format} `{}` carries {} UV corners for {} face corners",
+                path.display(),
+                uvs.len(),
+                faces.len()
+            )));
+        }
+    }
     let mut kept = Vec::with_capacity(faces.len());
+    let mut kept_uvs = corner_uvs.as_ref().map(|_| Vec::with_capacity(faces.len()));
     let mut dropped = 0usize;
-    for triangle in faces.chunks_exact(3) {
+    for (triangle_index, triangle) in faces.chunks_exact(3).enumerate() {
         if triangle[0] == triangle[1] || triangle[1] == triangle[2] || triangle[0] == triangle[2] {
             dropped += 1;
             continue;
         }
         kept.extend_from_slice(triangle);
+        if let (Some(uvs), Some(kept_uvs)) = (&corner_uvs, &mut kept_uvs) {
+            let start = triangle_index * 3;
+            kept_uvs.extend_from_slice(&uvs[start..start + 3]);
+        }
     }
     if kept.is_empty() {
         return Err(validation(format!(
@@ -158,9 +207,22 @@ fn finalize_import(
             path.display()
         )));
     }
+    let uvs = match kept_uvs {
+        Some(rows)
+            if rows
+                .iter()
+                .all(|uv| uv.iter().all(|value| value.is_finite())) =>
+        {
+            Some(rows.iter().flat_map(|uv| [uv[0], uv[1]]).collect())
+        }
+        // Partial / degenerate UV set: fall back to the texturing pipeline's
+        // own unwrap instead of carrying a broken atlas (documented rule).
+        _ => None,
+    };
     Ok(ImportedMesh {
         vertices,
         faces: kept,
+        uvs,
     })
 }
 
@@ -209,17 +271,28 @@ fn obj_error(path: &Path, line_number: usize, message: impl std::fmt::Display) -
 
 /// Read an ASCII Wavefront OBJ mesh.
 ///
-/// `v x y z [w]` defines vertices (the optional `w` is ignored) and `f` lines
-/// define faces with `v`, `v/vt`, `v//vn` or `v/vt/vn` tokens using 1-based
-/// positive or negative relative indices. Polygons are fan-triangulated;
-/// `vt`, `vn`, groups, materials, comments and unknown keywords are ignored,
-/// and multiple objects merge into one mesh.
+/// `v x y z [w]` defines vertices (the optional `w` is ignored), `vt u v`
+/// defines texture coordinates and `f` lines define faces with `v`, `v/vt`,
+/// `v//vn` or `v/vt/vn` tokens using 1-based positive or negative relative
+/// indices. Polygon faces are fan-triangulated; `vn`, groups, materials,
+/// comments and unknown keywords are ignored, and multiple objects merge
+/// into one mesh. The returned (optional) UVs are per face corner in the
+/// trimesh-internal lower-left convention (OBJ `vt` values pass through
+/// unchanged); see the module docs for the partial-set rule.
 pub fn read_obj(path: &Path) -> Result<ImportedMesh> {
     let bytes = read_file(path)?;
     let text = String::from_utf8(bytes)
         .map_err(|_| validation(format!("OBJ `{}` is not valid UTF-8", path.display())))?;
     let mut vertices = Vec::new();
     let mut faces = Vec::new();
+    let mut uvs: Vec<[f32; 2]> = Vec::new();
+    // Per-face-corner UV slots, created when the first `vt` line appears
+    // (faces parsed before it start with `None`); any `None` slot collapses
+    // the whole set to no-UV at the end. `uvs_usable` additionally degrades
+    // malformed/unresolvable `vt` data to the same no-UV fallback instead of
+    // rejecting a file that loaded before UVs were read.
+    let mut corner_uvs: Option<Vec<Option<[f32; 2]>>> = None;
+    let mut uvs_usable = true;
     for (line_index, line) in text.lines().enumerate() {
         let line_number = line_index + 1;
         let trimmed = line.trim();
@@ -245,11 +318,39 @@ pub fn read_obj(path: &Path) -> Result<ImportedMesh> {
                 vertices.extend_from_slice(&vertex);
                 // A trailing `w` component is accepted and ignored.
             }
+            Some("vt") => {
+                if !uvs_usable {
+                    continue;
+                }
+                let parsed = tokens
+                    .next()
+                    .and_then(|u| u.parse::<f32>().ok())
+                    .zip(tokens.next().and_then(|v| v.parse::<f32>().ok()));
+                match parsed {
+                    Some((u, v)) => {
+                        uvs.push([u, v]);
+                        // A trailing `w` component is accepted and ignored.
+                        if corner_uvs.is_none() {
+                            corner_uvs = Some(vec![None; faces.len()]);
+                        }
+                    }
+                    None => {
+                        // Malformed `vt`: the UV set is unusable (the mesh
+                        // itself still loads; texturing falls back to unwrap).
+                        uvs_usable = false;
+                        corner_uvs = None;
+                    }
+                }
+            }
             Some("f") => {
                 let vertex_count = vertices.len() / 3;
+                let uv_count = uvs.len();
                 let mut polygon = Vec::new();
+                let mut polygon_uvs: Vec<Option<[f32; 2]>> = Vec::new();
                 for token in tokens {
-                    let vertex_token = token.split('/').next().unwrap_or_default();
+                    let mut parts = token.split('/');
+                    let vertex_token = parts.next().unwrap_or_default();
+                    let uv_token = parts.next();
                     let index: i64 = if vertex_token.is_empty() {
                         return Err(obj_error(
                             path,
@@ -275,6 +376,26 @@ pub fn read_obj(path: &Path) -> Result<ImportedMesh> {
                         )
                     })?;
                     polygon.push(resolved);
+                    let uv = match uv_token {
+                        Some(uv_token) if !uv_token.is_empty() && uvs_usable => {
+                            match uv_token
+                                .parse::<i64>()
+                                .ok()
+                                .and_then(|uv_index| resolve_obj_index(uv_index, uv_count))
+                            {
+                                Some(resolved_uv) => Some(uvs[resolved_uv]),
+                                None => {
+                                    // Unresolvable UV index: drop the whole
+                                    // UV set, keep the geometry.
+                                    uvs_usable = false;
+                                    corner_uvs = None;
+                                    None
+                                }
+                            }
+                        }
+                        _ => None,
+                    };
+                    polygon_uvs.push(uv);
                 }
                 if polygon.len() < 3 {
                     return Err(obj_error(
@@ -288,12 +409,31 @@ pub fn read_obj(path: &Path) -> Result<ImportedMesh> {
                 }
                 let error = |message: String| obj_error(path, line_number, message);
                 push_triangulated_face(&polygon, &mut faces, Some(vertex_count), error)?;
+                if let Some(slots) = corner_uvs.as_mut() {
+                    // Same fan triangulation as `push_triangulated_face`.
+                    for window in 1..polygon.len() - 1 {
+                        slots.push(polygon_uvs[0]);
+                        slots.push(polygon_uvs[window]);
+                        slots.push(polygon_uvs[window + 1]);
+                    }
+                }
             }
-            // `vt`, `vn`, `vp`, `g`, `o`, `s`, `usemtl`, `mtllib`, ... ignored.
+            // `vn`, `vp`, `g`, `o`, `s`, `usemtl`, `mtllib`, ... ignored.
             _ => {}
         }
     }
-    finalize_import(vertices, faces, path, "OBJ")
+    let complete_uvs = if uvs_usable {
+        corner_uvs.and_then(|slots| {
+            if slots.len() == faces.len() && slots.iter().all(Option::is_some) {
+                Some(slots.into_iter().flatten().collect::<Vec<_>>())
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+    finalize_import(vertices, faces, complete_uvs, path, "OBJ")
 }
 
 /// Resolve a 1-based OBJ face index (positive or negative-relative).
@@ -471,7 +611,7 @@ pub fn read_ply(path: &Path) -> Result<ImportedMesh> {
         PlyEncoding::Ascii => ply_parse_ascii(&bytes, &header, path)?,
         PlyEncoding::BinaryLittleEndian => ply_parse_binary(&bytes, &header, path)?,
     };
-    finalize_import(vertices, faces, path, "PLY")
+    finalize_import(vertices, faces, None, path, "PLY")
 }
 
 fn parse_ply_header(bytes: &[u8], path: &Path) -> Result<PlyHeader> {
@@ -1022,6 +1162,7 @@ struct GltfAccessor {
     buffer_view: Option<usize>,
     byte_offset: usize,
     component_type: u32,
+    normalized: bool,
     count: usize,
     #[serde(rename = "type")]
     ty: String,
@@ -1053,13 +1194,31 @@ fn glb_u32(bytes: &[u8], offset: usize, path: &Path) -> Result<u32> {
     Ok(u32::from_le_bytes(chunk.try_into().expect("4-byte slice")))
 }
 
+/// Aggregated `TEXCOORD_0` state across every gathered triangle primitive.
+///
+/// UVs are carried only when EVERY primitive has a usable, complete
+/// `TEXCOORD_0` accessor; any primitive without one (or with an unusable
+/// accessor) collapses the whole mesh to `Partial`, the documented
+/// fallback-to-unwrap rule.
+enum GlbUvState {
+    /// No `TEXCOORD_0` seen yet; `saw_without` records a primitive that
+    /// already lacked one (a later UV-carrying primitive would be partial).
+    NotSeen { saw_without: bool },
+    /// Corner UVs accumulated in traversal order, aligned with `faces`.
+    Complete(Vec<[f32; 2]>),
+    /// Some primitive carried no usable UVs: drop the whole set.
+    Partial,
+}
+
 /// Read a glTF 2.0 binary (`.glb`) triangle mesh.
 ///
 /// Triangle primitives from the active scene (or every mesh at identity when
 /// the file has no scene graph) are concatenated with a per-primitive vertex
 /// offset. Static node transforms (`matrix` or TRS) are applied to positions;
-/// winding order is preserved. Draco/meshopt compression, sparse accessors,
-/// external buffers and non-float32 positions are rejected.
+/// winding order is preserved. `TEXCOORD_0` is read when every triangle
+/// primitive carries a usable accessor (see the module UV docs). Draco/
+/// meshopt compression, sparse accessors, external buffers and non-float32
+/// positions are rejected.
 pub fn read_glb(path: &Path) -> Result<ImportedMesh> {
     let bytes = read_file(path)?;
     let (json_chunk, bin_chunk) = parse_glb_container(&bytes, path)?;
@@ -1068,8 +1227,20 @@ pub fn read_glb(path: &Path) -> Result<ImportedMesh> {
     glb_reject_unsupported_extensions(&document, path)?;
     let mut vertices = Vec::new();
     let mut faces = Vec::new();
-    glb_collect_meshes(&document, bin_chunk, &mut vertices, &mut faces, path)?;
-    finalize_import(vertices, faces, path, "GLB")
+    let mut uv_state = GlbUvState::NotSeen { saw_without: false };
+    glb_collect_meshes(
+        &document,
+        bin_chunk,
+        &mut vertices,
+        &mut faces,
+        &mut uv_state,
+        path,
+    )?;
+    let corner_uvs = match uv_state {
+        GlbUvState::Complete(rows) => Some(rows),
+        GlbUvState::NotSeen { .. } | GlbUvState::Partial => None,
+    };
+    finalize_import(vertices, faces, corner_uvs, path, "GLB")
 }
 
 fn parse_glb_container<'a>(bytes: &'a [u8], path: &Path) -> Result<(&'a [u8], &'a [u8])> {
@@ -1163,6 +1334,7 @@ fn glb_collect_meshes(
     bin: &[u8],
     vertices: &mut Vec<f32>,
     faces: &mut Vec<u32>,
+    uv_state: &mut GlbUvState,
     path: &Path,
 ) -> Result<()> {
     if document
@@ -1190,6 +1362,7 @@ fn glb_collect_meshes(
                     &mut in_stack,
                     vertices,
                     faces,
+                    uv_state,
                     path,
                 )?;
             }
@@ -1206,6 +1379,7 @@ fn glb_collect_meshes(
                     &mut in_stack,
                     vertices,
                     faces,
+                    uv_state,
                     path,
                 )?;
             }
@@ -1220,6 +1394,7 @@ fn glb_collect_meshes(
                     &GLB_IDENTITY,
                     vertices,
                     faces,
+                    uv_state,
                     path,
                 )?;
             }
@@ -1237,6 +1412,7 @@ fn glb_visit_node(
     in_stack: &mut HashSet<usize>,
     vertices: &mut Vec<f32>,
     faces: &mut Vec<u32>,
+    uv_state: &mut GlbUvState,
     path: &Path,
 ) -> Result<()> {
     if depth > 256 {
@@ -1255,7 +1431,9 @@ fn glb_visit_node(
     let local = glb_node_matrix(node, path)?;
     let world = mat4_mul(parent, &local);
     if let Some(mesh_index) = node.mesh {
-        glb_visit_mesh(document, bin, mesh_index, &world, vertices, faces, path)?;
+        glb_visit_mesh(
+            document, bin, mesh_index, &world, vertices, faces, uv_state, path,
+        )?;
     }
     for child in &node.children {
         glb_visit_node(
@@ -1267,6 +1445,7 @@ fn glb_visit_node(
             in_stack,
             vertices,
             faces,
+            uv_state,
             path,
         )?;
     }
@@ -1281,6 +1460,7 @@ fn glb_visit_mesh(
     world: &[f64; 16],
     vertices: &mut Vec<f32>,
     faces: &mut Vec<u32>,
+    uv_state: &mut GlbUvState,
     path: &Path,
 ) -> Result<()> {
     let mesh = document
@@ -1289,7 +1469,8 @@ fn glb_visit_mesh(
         .ok_or_else(|| glb_error(path, format!("mesh index {mesh_index} is out of range")))?;
     for (prim_index, primitive) in mesh.primitives.iter().enumerate() {
         glb_read_primitive(
-            document, bin, primitive, mesh_index, prim_index, world, vertices, faces, path,
+            document, bin, primitive, mesh_index, prim_index, world, vertices, faces, uv_state,
+            path,
         )?;
     }
     Ok(())
@@ -1406,6 +1587,7 @@ fn glb_read_primitive(
     world: &[f64; 16],
     vertices: &mut Vec<f32>,
     faces: &mut Vec<u32>,
+    uv_state: &mut GlbUvState,
     path: &Path,
 ) -> Result<()> {
     // Only TRIANGLES (mode 4, the default) are loaded; points, lines and
@@ -1495,6 +1677,40 @@ fn glb_read_primitive(
         }
         faces.extend_from_slice(&pushed);
     }
+
+    // TEXCOORD_0: per-vertex VEC2 accessor expanded through the same index
+    // buffer as POSITION. Unusable accessors collapse the whole mesh UV set
+    // to the no-UV fallback (documented rule) instead of failing the load.
+    if let Some(&uv_accessor_index) = primitive.attributes.get("TEXCOORD_0") {
+        match glb_read_texcoords(
+            document,
+            bin,
+            uv_accessor_index,
+            position_count,
+            path,
+            &context,
+        ) {
+            Ok(texcoords) => {
+                let corners: Vec<[f32; 2]> =
+                    indices.iter().map(|&index| texcoords[index]).collect();
+                match uv_state {
+                    GlbUvState::NotSeen { saw_without: false } => {
+                        *uv_state = GlbUvState::Complete(corners);
+                    }
+                    GlbUvState::NotSeen { saw_without: true } | GlbUvState::Partial => {
+                        *uv_state = GlbUvState::Partial;
+                    }
+                    GlbUvState::Complete(rows) => rows.extend(corners),
+                }
+            }
+            Err(_) => *uv_state = GlbUvState::Partial,
+        }
+    } else {
+        match uv_state {
+            GlbUvState::NotSeen { saw_without } => *saw_without = true,
+            _ => *uv_state = GlbUvState::Partial,
+        }
+    }
     Ok(())
 }
 
@@ -1527,6 +1743,137 @@ fn glb_read_positions(
         vertices.extend_from_slice(&glb_transform_vertex(world, x, y, z));
     }
     Ok(())
+}
+
+/// glTF `TEXCOORD_0` component layouts this reader accepts (the accessor
+/// types the glTF 2.0 spec allows for texture coordinates).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlbUvComponent {
+    Float32,
+    Unorm8,
+    Unorm16,
+}
+
+impl GlbUvComponent {
+    fn from_component_type(component_type: u32) -> Option<Self> {
+        match component_type {
+            5126 => Some(Self::Float32),
+            5121 => Some(Self::Unorm8),
+            5123 => Some(Self::Unorm16),
+            _ => None,
+        }
+    }
+
+    fn element_size(self) -> usize {
+        match self {
+            Self::Float32 => 8,
+            Self::Unorm8 => 2,
+            Self::Unorm16 => 4,
+        }
+    }
+}
+
+/// Read a per-vertex `TEXCOORD_0` VEC2 accessor and convert glTF's top-left
+/// UV convention to the trimesh-internal lower-left convention (`v' = 1 - v`),
+/// the same flip `trimesh`'s glTF loader applies.
+fn glb_read_texcoords(
+    document: &GltfDocument,
+    bin: &[u8],
+    accessor_index: usize,
+    position_count: usize,
+    path: &Path,
+    context: &str,
+) -> Result<Vec<[f32; 2]>> {
+    let accessor = document.accessors.get(accessor_index).ok_or_else(|| {
+        glb_error(
+            path,
+            format!("{context}: TEXCOORD_0 accessor {accessor_index} is out of range"),
+        )
+    })?;
+    if accessor.ty != "VEC2" {
+        return Err(glb_error(
+            path,
+            format!(
+                "{context}: TEXCOORD_0 accessor must be VEC2, found `{}`",
+                accessor.ty
+            ),
+        ));
+    }
+    if accessor.sparse.is_some() {
+        return Err(glb_error(
+            path,
+            format!("{context}: sparse accessors are not supported"),
+        ));
+    }
+    if accessor.count != position_count {
+        return Err(glb_error(
+            path,
+            format!(
+                "{context}: TEXCOORD_0 count {} does not match the POSITION count {position_count}",
+                accessor.count
+            ),
+        ));
+    }
+    let component = GlbUvComponent::from_component_type(accessor.component_type).ok_or_else(|| {
+        glb_error(
+            path,
+            format!(
+                "{context}: TEXCOORD_0 componentType {} is not supported; use 5126 (float32), 5121 (normalized u8) or 5123 (normalized u16)",
+                accessor.component_type
+            ),
+        )
+    })?;
+    let element_size = component.element_size();
+    let (base, stride) = glb_accessor_span(
+        document,
+        bin,
+        accessor,
+        element_size,
+        path,
+        context,
+        "TEXCOORD_0",
+    )?;
+    let mut uvs = Vec::with_capacity(accessor.count);
+    for item in 0..accessor.count {
+        let start = base + item * stride;
+        let chunk = &bin[start..start + element_size];
+        let (u, v) = match component {
+            GlbUvComponent::Float32 => (
+                f32::from_le_bytes(chunk[0..4].try_into().expect("4-byte slice")),
+                f32::from_le_bytes(chunk[4..8].try_into().expect("4-byte slice")),
+            ),
+            GlbUvComponent::Unorm8 => {
+                let scale = if accessor.normalized {
+                    1.0 / 255.0
+                } else {
+                    1.0
+                };
+                (chunk[0] as f32 * scale, chunk[1] as f32 * scale)
+            }
+            GlbUvComponent::Unorm16 => {
+                let scale = if accessor.normalized {
+                    1.0 / 65535.0
+                } else {
+                    1.0
+                };
+                (
+                    u16::from_le_bytes(chunk[0..2].try_into().expect("2-byte slice")) as f32
+                        * scale,
+                    u16::from_le_bytes(chunk[2..4].try_into().expect("2-byte slice")) as f32
+                        * scale,
+                )
+            }
+        };
+        if !u.is_finite() || !v.is_finite() {
+            return Err(glb_error(
+                path,
+                format!("{context}: TEXCOORD_0 contains a non-finite UV"),
+            ));
+        }
+        // glTF top-left origin -> trimesh-internal lower-left origin.
+        uvs.push([u, 1.0 - v]);
+    }
+    Ok(uvs)
 }
 
 fn glb_read_indices(
@@ -1797,7 +2144,7 @@ fn stl_read_binary(bytes: &[u8], path: &Path) -> Result<ImportedMesh> {
         faces.extend_from_slice(&ids);
         // The 2-byte attribute count at the end of the record is ignored.
     }
-    finalize_import(vertices, faces, path, "STL")
+    finalize_import(vertices, faces, None, path, "STL")
 }
 
 fn stl_read_ascii(bytes: &[u8], path: &Path) -> Result<ImportedMesh> {
@@ -1851,7 +2198,7 @@ fn stl_read_ascii(bytes: &[u8], path: &Path) -> Result<ImportedMesh> {
             "ASCII STL ends with an incomplete facet (vertex count is not a multiple of 3)",
         ));
     }
-    finalize_import(vertices, faces, path, "STL")
+    finalize_import(vertices, faces, None, path, "STL")
 }
 
 // ---------------------------------------------------------------------------
@@ -1861,9 +2208,7 @@ fn stl_read_ascii(bytes: &[u8], path: &Path) -> Result<ImportedMesh> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::export::mesh::{
-        MeshView, ObjStyle, write_glb, write_glb_container, write_ply, write_stl,
-    };
+    use crate::export::mesh::{write_glb, write_glb_container, write_ply, write_stl, MeshView};
 
     fn temp_path(tag: &str, extension: &str) -> std::path::PathBuf {
         let nonce = std::time::SystemTime::now()
@@ -1905,6 +2250,78 @@ mod tests {
             vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0]
         );
         assert_eq!(mesh.faces, vec![0, 1, 2, 0, 2, 3]);
+        // The file references vt indices 2 and 3 with only one `vt` line:
+        // the unusable UV set degrades to no-UV (the geometry still loads).
+        assert_eq!(mesh.uvs, None);
+    }
+
+    #[test]
+    fn obj_reads_vt_per_corner_internal_convention() {
+        // `vt` indices are independent of the `v` indices; OBJ coordinates
+        // pass through as written (lower-left origin, no V flip).
+        let obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\n\
+                   vt 0.25 0.5\nvt 0.75 0.5\nvt 0.5 0.75\n\
+                   f 1/3 2/1 3/2\n";
+        let path = write_temp("obj-vt-permuted", "obj", obj.as_bytes());
+        let mesh = read_obj(&path).expect("read obj with vt");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mesh.faces, vec![0, 1, 2]);
+        assert_eq!(
+            mesh.uvs,
+            Some(vec![0.5, 0.75, 0.25, 0.5, 0.75, 0.5]),
+            "corner UVs follow the face's vt indices"
+        );
+    }
+
+    #[test]
+    fn obj_quad_fan_carries_corner_uvs() {
+        let obj = "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\n\
+                   vt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\n\
+                   f 1/1 2/2 3/3 4/4\n";
+        let path = write_temp("obj-vt-quad", "obj", obj.as_bytes());
+        let mesh = read_obj(&path).expect("read obj quad");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mesh.faces, vec![0, 1, 2, 0, 2, 3]);
+        assert_eq!(
+            mesh.uvs,
+            Some(vec![
+                0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0
+            ])
+        );
+    }
+
+    #[test]
+    fn obj_partial_uvs_collapse_to_none() {
+        // One corner without a `vt` reference.
+        let obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nf 1/1 2/2 3\n";
+        let path = write_temp("obj-vt-partial", "obj", obj.as_bytes());
+        let mesh = read_obj(&path).expect("partial vt still loads");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mesh.uvs, None);
+
+        // One face with UVs, a later face without: the whole set is dropped.
+        let obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\n\
+                   f 1/1 2/2 3/3\nf 1 2 3\n";
+        let path = write_temp("obj-vt-partial-face", "obj", obj.as_bytes());
+        let mesh = read_obj(&path).expect("partially UV-mapped mesh still loads");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mesh.uvs, None);
+    }
+
+    #[test]
+    fn obj_degenerate_faces_drop_their_uvs_with_the_triangle() {
+        let obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\n\
+                   vt 0 0\nvt 1 0\nvt 0 1\nvt 0.2 0.2\nvt 0.3 0.3\nvt 0.4 0.4\n\
+                   f 1/1 2/2 3/3\nf 1/4 1/5 2/6\n";
+        let path = write_temp("obj-vt-degenerate", "obj", obj.as_bytes());
+        let mesh = read_obj(&path).expect("read obj");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mesh.faces, vec![0, 1, 2]);
+        assert_eq!(
+            mesh.uvs,
+            Some(vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0]),
+            "UV corners of the dropped degenerate triangle are dropped too"
+        );
     }
 
     #[test]
@@ -2132,6 +2549,201 @@ mod tests {
             vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
         );
         assert_eq!(mesh.faces, vec![0u32, 1, 2]);
+        assert_eq!(mesh.uvs, None, "no TEXCOORD_0 attribute");
+    }
+
+    /// TRIANGLES primitive (3 positions + u32 indices) with an optional
+    /// `TEXCOORD_0` accessor appended to the BIN chunk.
+    fn glb_with_texcoord(
+        tag: &str,
+        texcoord: Option<serde_json::Value>,
+        uv_bytes: &[u8],
+    ) -> std::path::PathBuf {
+        let mut bin = Vec::new();
+        for vertex in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+            for component in vertex {
+                bin.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        for index in [0u32, 1, 2] {
+            bin.extend_from_slice(&index.to_le_bytes());
+        }
+        let uv_offset = bin.len();
+        bin.extend_from_slice(uv_bytes);
+        let mut attributes = serde_json::json!({ "POSITION": 0 });
+        let mut accessors = vec![
+            serde_json::json!({ "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3" }),
+            serde_json::json!({ "bufferView": 1, "componentType": 5125, "count": 3, "type": "SCALAR" }),
+        ];
+        let mut buffer_views = vec![
+            serde_json::json!({ "buffer": 0, "byteOffset": 0, "byteLength": 36 }),
+            serde_json::json!({ "buffer": 0, "byteOffset": 36, "byteLength": 12 }),
+        ];
+        if let Some(texcoord) = texcoord {
+            attributes["TEXCOORD_0"] = serde_json::json!(2);
+            accessors.push(texcoord);
+            buffer_views.push(serde_json::json!({
+                "buffer": 0,
+                "byteOffset": uv_offset,
+                "byteLength": uv_bytes.len(),
+            }));
+        }
+        let json = serde_json::json!({
+            "asset": { "version": "2.0" },
+            "scene": 0,
+            "scenes": [{ "nodes": [0] }],
+            "nodes": [{ "mesh": 0 }],
+            "meshes": [{ "primitives": [{
+                "attributes": attributes,
+                "indices": 1,
+                "mode": 4,
+            }] }],
+            "accessors": accessors,
+            "bufferViews": buffer_views,
+            "buffers": [{ "byteLength": bin.len() }],
+        });
+        let path = temp_path(tag, "glb");
+        write_glb_container(&path, &serde_json::to_vec(&json).expect("json"), &bin)
+            .expect("write container");
+        path
+    }
+
+    #[test]
+    fn glb_reads_texcoord_0_float_and_flips_to_internal_v() {
+        let mut uv_bytes = Vec::new();
+        for uv in [[0.0f32, 0.0], [1.0, 0.0], [0.0, 1.0]] {
+            for component in uv {
+                uv_bytes.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        let path = glb_with_texcoord(
+            "glb-uv-float",
+            Some(serde_json::json!({
+                "bufferView": 2,
+                "componentType": 5126,
+                "count": 3,
+                "type": "VEC2",
+            })),
+            &uv_bytes,
+        );
+        let mesh = read_glb(&path).expect("read glb with TEXCOORD_0");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mesh.faces, vec![0u32, 1, 2]);
+        assert_eq!(
+            mesh.uvs,
+            Some(vec![0.0, 1.0, 1.0, 1.0, 0.0, 0.0]),
+            "glTF V is flipped into the trimesh-internal lower-left convention"
+        );
+    }
+
+    #[test]
+    fn glb_reads_normalized_u16_texcoord_0() {
+        let mut uv_bytes = Vec::new();
+        for uv in [[0u16, 0u16], [65535, 0], [0, 65535]] {
+            for component in uv {
+                uv_bytes.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        let path = glb_with_texcoord(
+            "glb-uv-u16",
+            Some(serde_json::json!({
+                "bufferView": 2,
+                "componentType": 5123,
+                "normalized": true,
+                "count": 3,
+                "type": "VEC2",
+            })),
+            &uv_bytes,
+        );
+        let mesh = read_glb(&path).expect("read glb with normalized u16 TEXCOORD_0");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mesh.faces, vec![0u32, 1, 2]);
+        assert_eq!(mesh.uvs, Some(vec![0.0, 1.0, 1.0, 1.0, 0.0, 0.0]));
+    }
+
+    /// Two primitives, at most one carrying `TEXCOORD_0`: the incomplete
+    /// per-mesh UV set must collapse to `None` (fallback to unwrap).
+    fn glb_partial_texcoord(uv_on_first: bool) -> std::path::PathBuf {
+        let mut bin = Vec::new();
+        for vertex in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+            for component in vertex {
+                bin.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        for index in [0u32, 1, 2] {
+            bin.extend_from_slice(&index.to_le_bytes());
+        }
+        for vertex in [[2.0f32, 0.0, 0.0], [3.0, 0.0, 0.0], [2.0, 1.0, 0.0]] {
+            for component in vertex {
+                bin.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        for index in [0u32, 1, 2] {
+            bin.extend_from_slice(&index.to_le_bytes());
+        }
+        let uv_offset = bin.len();
+        for uv in [[0.0f32, 0.0], [1.0, 0.0], [0.0, 1.0]] {
+            for component in uv {
+                bin.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        let mut first_attributes = serde_json::json!({ "POSITION": 0 });
+        let mut second_attributes = serde_json::json!({ "POSITION": 2 });
+        if uv_on_first {
+            first_attributes["TEXCOORD_0"] = serde_json::json!(4);
+        } else {
+            second_attributes["TEXCOORD_0"] = serde_json::json!(4);
+        }
+        let json = serde_json::json!({
+            "asset": { "version": "2.0" },
+            "scene": 0,
+            "scenes": [{ "nodes": [0] }],
+            "nodes": [{ "mesh": 0 }],
+            "meshes": [{ "primitives": [
+                { "attributes": first_attributes, "indices": 1, "mode": 4 },
+                { "attributes": second_attributes, "indices": 3, "mode": 4 },
+            ] }],
+            "accessors": [
+                { "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3" },
+                { "bufferView": 1, "componentType": 5125, "count": 3, "type": "SCALAR" },
+                { "bufferView": 2, "componentType": 5126, "count": 3, "type": "VEC3" },
+                { "bufferView": 3, "componentType": 5125, "count": 3, "type": "SCALAR" },
+                { "bufferView": 4, "componentType": 5126, "count": 3, "type": "VEC2" },
+            ],
+            "bufferViews": [
+                { "buffer": 0, "byteOffset": 0, "byteLength": 36 },
+                { "buffer": 0, "byteOffset": 36, "byteLength": 12 },
+                { "buffer": 0, "byteOffset": 48, "byteLength": 36 },
+                { "buffer": 0, "byteOffset": 84, "byteLength": 12 },
+                { "buffer": 0, "byteOffset": uv_offset, "byteLength": 24 },
+            ],
+            "buffers": [{ "byteLength": bin.len() }],
+        });
+        let path = temp_path(
+            if uv_on_first {
+                "glb-uv-partial-first"
+            } else {
+                "glb-uv-partial-second"
+            },
+            "glb",
+        );
+        write_glb_container(&path, &serde_json::to_vec(&json).expect("json"), &bin)
+            .expect("write container");
+        path
+    }
+
+    #[test]
+    fn glb_partial_texcoord_0_collapses_to_none() {
+        for uv_on_first in [true, false] {
+            let path = glb_partial_texcoord(uv_on_first);
+            let mesh = read_glb(&path).expect("partial TEXCOORD_0 must still load");
+            let _ = std::fs::remove_file(&path);
+            assert_eq!(mesh.faces.len(), 6);
+            assert_eq!(
+                mesh.uvs, None,
+                "a primitive without TEXCOORD_0 drops the mesh UV set (uv_on_first={uv_on_first})"
+            );
+        }
     }
 
     fn glb_with_nodes(nodes: serde_json::Value) -> std::path::PathBuf {
