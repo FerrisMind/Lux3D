@@ -1035,6 +1035,7 @@ impl Trellis2Pipeline {
         &self,
         vertices: &[f32],
         faces: &[u32],
+        corner_uvs: Option<&[f32]>,
         image_path: &Path,
         options: &Trellis2TexturingOptions,
         device: &Device,
@@ -1075,7 +1076,7 @@ impl Trellis2Pipeline {
             let raw = Trellis2Preprocess::load_raw_input_from_path(image_path)?;
             (raw, options.clone())
         };
-        self.texture_mesh(vertices, faces, None, &raw, &inner, device)
+        self.texture_mesh(vertices, faces, corner_uvs, &raw, &inner, device)
     }
 }
 

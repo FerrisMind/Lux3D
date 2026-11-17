@@ -1245,7 +1245,16 @@ fn build_trellis2_textured_mesh_impl(
             message: format!("Trellis2 UV unwrap failed: {source}"),
         }
     })?;
-    let normals = area_weighted_vertex_normals(&atlas.vertices, &atlas.indices);
+    // Normals belong to the pre-unwrap surface: compute them on the input
+    // vertices/faces, then gather through the atlas `vmapping`. Recomputing
+    // on atlas vertices would give duplicated seam vertices chart-local
+    // normals, unlike the reference's `vmaps` gather (`postprocess.py:208-216`).
+    let base_normals = area_weighted_vertex_normals(&vertices, &faces);
+    let normals: Vec<[f32; 3]> = atlas
+        .vmapping
+        .iter()
+        .map(|&original| base_normals[original as usize])
+        .collect();
     let texture = match original_surface {
         Some(original_surface) => bake_pbr_texture_with_snap(
             &atlas.vertices,

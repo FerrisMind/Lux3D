@@ -3822,7 +3822,14 @@ fn run_trellis2_texturing(
     let pipeline = load_trellis2_pipeline(&model_assets, rmbg_model_path.as_deref(), device)?;
     let t1 = std::time::Instant::now();
     let textured = pipeline
-        .texture_mesh_from_path(&imported.vertices, &imported.faces, source, options, device)
+        .texture_mesh_from_path(
+            &imported.vertices,
+            &imported.faces,
+            imported.uvs.as_deref(),
+            source,
+            options,
+            device,
+        )
         .map_err(anyhow::Error::from)?;
     if stage_time {
         eprintln!("[stage] texture: {:.2}s", t1.elapsed().as_secs_f64());

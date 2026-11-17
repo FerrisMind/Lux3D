@@ -1226,6 +1226,7 @@ pub async fn spawn_mesh_texturing(
                             .texture_mesh_from_path(
                                 &imported.vertices,
                                 &imported.faces,
+                                imported.uvs.as_deref(),
                                 &image,
                                 &texturing_options,
                                 &device,
