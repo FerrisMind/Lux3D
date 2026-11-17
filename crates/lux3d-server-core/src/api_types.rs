@@ -225,6 +225,21 @@ pub struct MeshGenerationOptions {
     /// (default `1e-5`; `0` keeps every component).
     #[serde(default)]
     pub min_component_area: Option<f32>,
+    /// Rebuild the topology with the upstream narrow-band dual-contouring
+    /// remesh (default `true`, matching the shipped entry points
+    /// `example.py:43` / `app.py:503`); `false` runs the cleanup/simplify
+    /// chain instead.
+    #[serde(default)]
+    pub remesh: Option<bool>,
+    /// Remesh narrow-band half-width in grid cells (default `1`). Only used
+    /// while remeshing.
+    #[serde(default)]
+    pub remesh_band: Option<f32>,
+    /// Remesh project-back lerp factor toward the original surface (default
+    /// `0` = disabled, the shipped value; `1` snaps onto the surface). Only
+    /// used while remeshing.
+    #[serde(default)]
+    pub remesh_project: Option<f32>,
 }
 
 fn default_mc_resolution() -> u32 {
@@ -277,6 +292,9 @@ impl Default for MeshGenerationOptions {
             decimation_target: None,
             fill_hole_perimeter: None,
             min_component_area: None,
+            remesh: None,
+            remesh_band: None,
+            remesh_project: None,
         }
     }
 }

@@ -323,13 +323,32 @@ pub struct RunArgs {
     #[arg(
         long,
         default_value_t = false,
-        help = "TRELLIS.2 disable the mesh post-process (upstream to_glb cleaning: hole filling, decimation, small-component removal, orientation unification; default: enabled)."
+        help = "TRELLIS.2 disable the mesh post-process (upstream to_glb branches: hole filling, remesh or cleanup, decimation; default: enabled)."
     )]
     pub no_postprocess: bool,
 
     #[arg(
         long,
-        help = "TRELLIS.2 post-process decimation target in triangles for both simplify passes (default 1000000; 0 skips simplification and runs cleanup only)."
+        default_value_t = false,
+        help = "TRELLIS.2 skip the upstream to_glb narrow-band dual-contouring remesh and run the previous cleanup/simplify chain instead (byte-identical to the pre-remesh pipeline). The default matches the shipped entry points (example.py:43, app.py:503): remesh on, band 1, project 0."
+    )]
+    pub no_remesh: bool,
+
+    #[arg(
+        long,
+        help = "TRELLIS.2 remesh narrow-band half-width in grid cells (upstream remesh_band; default 1). Only used while remeshing."
+    )]
+    pub remesh_band: Option<f32>,
+
+    #[arg(
+        long,
+        help = "TRELLIS.2 remesh project-back lerp factor toward the original surface (upstream remesh_project; default 0 = disabled, the shipped entry-point value; 1 snaps onto the surface). Only used while remeshing."
+    )]
+    pub remesh_project: Option<f32>,
+
+    #[arg(
+        long,
+        help = "TRELLIS.2 post-process decimation target in triangles (default 1000000; 0 skips simplification and keeps the remeshed/cleaned topology)."
     )]
     pub decimation_target: Option<usize>,
 
@@ -1603,7 +1622,7 @@ fn reject_unsupported_trellis2_options(args: &RunArgs) -> anyhow::Result<()> {
 /// silently ignoring them (same fail-fast pattern as the TripoSG-only and
 /// VGGT-only flags).
 fn reject_trellis2_only_options(args: &RunArgs, family: Family) -> anyhow::Result<()> {
-    let set: [(&str, bool); 28] = [
+    let set: [(&str, bool); 31] = [
         ("--pipeline-type", args.pipeline_type.is_some()),
         ("--max-num-tokens", args.max_num_tokens.is_some()),
         ("--texture", args.texture.is_some()),
@@ -1615,6 +1634,9 @@ fn reject_trellis2_only_options(args: &RunArgs, family: Family) -> anyhow::Resul
         ("--no-preprocess-mesh", args.no_preprocess_mesh),
         ("--no-preprocess-image", args.no_preprocess_image),
         ("--no-postprocess", args.no_postprocess),
+        ("--no-remesh", args.no_remesh),
+        ("--remesh-band", args.remesh_band.is_some()),
+        ("--remesh-project", args.remesh_project.is_some()),
         ("--decimation-target", args.decimation_target.is_some()),
         ("--fill-hole-perimeter", args.fill_hole_perimeter.is_some()),
         ("--min-component-area", args.min_component_area.is_some()),
@@ -1707,6 +1729,25 @@ fn trellis2_run_options_from_args(args: &RunArgs) -> anyhow::Result<Trellis2RunO
     let mut postprocess = Trellis2MeshPostprocessOptions::default();
     if args.no_postprocess {
         postprocess.enabled = false;
+    }
+    if args.no_remesh {
+        postprocess.remesh = false;
+    }
+    if let Some(value) = args.remesh_band {
+        if args.no_remesh {
+            anyhow::bail!(
+                "`--remesh-band` requires the remesh branch; it conflicts with `--no-remesh`"
+            );
+        }
+        postprocess.remesh_band = value;
+    }
+    if let Some(value) = args.remesh_project {
+        if args.no_remesh {
+            anyhow::bail!(
+                "`--remesh-project` requires the remesh branch; it conflicts with `--no-remesh`"
+            );
+        }
+        postprocess.remesh_project = value;
     }
     if let Some(value) = args.decimation_target {
         postprocess.decimation_target = value;
@@ -1828,7 +1869,7 @@ fn validate_trellis2_texturing_mode(args: &RunArgs) -> anyhow::Result<()> {
             args.output.display()
         );
     }
-    let incompatible: [(&str, bool); 9] = [
+    let incompatible: [(&str, bool); 12] = [
         ("--pipeline-type", args.pipeline_type.is_some()),
         ("--max-num-tokens", args.max_num_tokens.is_some()),
         ("--return-latent", args.return_latent.is_some()),
@@ -1836,6 +1877,9 @@ fn validate_trellis2_texturing_mode(args: &RunArgs) -> anyhow::Result<()> {
         ("--no-texture-export", args.no_texture_export),
         ("--no-uv-unwrap", args.no_uv_unwrap),
         ("--no-postprocess", args.no_postprocess),
+        ("--no-remesh", args.no_remesh),
+        ("--remesh-band", args.remesh_band.is_some()),
+        ("--remesh-project", args.remesh_project.is_some()),
         ("--decimation-target", args.decimation_target.is_some()),
         ("--texture false", args.texture == Some(false)),
     ];
@@ -2836,7 +2880,7 @@ fn run_trellis2_texturing(
     let t2 = std::time::Instant::now();
     pipeline
         .export
-        .write_textured_glb(&textured.mesh, output)
+        .write_textured_glb(&textured.mesh, output, true)
         .map_err(anyhow::Error::from)?;
     if stage_time {
         eprintln!("[stage] export: {:.2}s", t2.elapsed().as_secs_f64());
@@ -2902,8 +2946,11 @@ fn run_trellis2(
             // does NOT run over it; the PBR voxel sidecar pair still records
             // the per-voxel attributes next to the GLB.
             let textured = textured.expect("textured mesh checked above");
+            // Upstream `to_glb`: doubleSided = false on the remeshed branch
+            // (postprocess.py:303); true on the cleanup/pass-through paths.
+            let double_sided = !(options.postprocess.enabled && options.postprocess.remesh);
             export
-                .write_textured_glb(textured, &sample_output)
+                .write_textured_glb(textured, &sample_output, double_sided)
                 .map_err(anyhow::Error::from)?;
             eprintln!("[export] textured glb: {}", sample_output.display());
             let stats = &textured.texture.stats;
@@ -4238,10 +4285,11 @@ mod tests {
         assert!(options.with_texture);
     }
 
-    /// Mesh post-process flags default to the upstream `to_glb` parameters
-    /// with the pass enabled.
+    /// Mesh post-process flags default to the shipped entry-point values
+    /// (`example.py:43` / `app.py:503`: remesh on, band 1, project 0) with
+    /// the pass enabled.
     #[test]
-    fn trellis2_postprocess_flags_default_to_upstream_to_glb() {
+    fn trellis2_postprocess_flags_default_to_shipped_entry_points() {
         let cli = Cli::parse_from([
             "lux3d",
             "run",
@@ -4255,6 +4303,9 @@ mod tests {
             panic!("expected run command");
         };
         assert!(!args.no_postprocess);
+        assert!(!args.no_remesh);
+        assert_eq!(None, args.remesh_band);
+        assert_eq!(None, args.remesh_project);
         assert_eq!(None, args.decimation_target);
         assert_eq!(None, args.fill_hole_perimeter);
         assert_eq!(None, args.min_component_area);
@@ -4264,14 +4315,18 @@ mod tests {
             options.postprocess
         );
         assert!(options.postprocess.enabled);
+        assert!(options.postprocess.remesh);
+        assert_eq!(1.0, options.postprocess.remesh_band);
+        assert_eq!(0.0, options.postprocess.remesh_project);
         assert_eq!(3e-2, options.postprocess.fill_hole_perimeter);
         assert_eq!(1_000_000, options.postprocess.decimation_target);
         assert_eq!(1e-5, options.postprocess.min_component_area);
     }
 
-    /// `--no-postprocess` / `--decimation-target` / `--fill-hole-perimeter` /
+    /// `--no-postprocess` / `--no-remesh` / `--remesh-band` /
+    /// `--remesh-project` / `--decimation-target` / `--fill-hole-perimeter` /
     /// `--min-component-area` map onto the run options; a target of 0 means
-    /// "skip simplification" (cleanup-only post-processing) and is valid.
+    /// "skip simplification" and is valid.
     #[test]
     fn trellis2_postprocess_flags_map_cli_overrides() {
         let cli = Cli::parse_from([
@@ -4322,6 +4377,82 @@ mod tests {
         let options = super::trellis2_run_options_from_args(&args).expect("run options");
         assert!(options.postprocess.enabled);
         assert_eq!(0, options.postprocess.decimation_target);
+    }
+
+    /// `--no-remesh` restores the cleanup chain; `--remesh-band` /
+    /// `--remesh-project` override the shipped remesh values; combining
+    /// `--no-remesh` with either remesh knob fails fast.
+    #[test]
+    fn trellis2_remesh_flags_map_and_no_remesh_conflicts() {
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "trellis2",
+            "--source",
+            "image.png",
+            "--output",
+            "out.glb",
+            "--no-remesh",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(args.no_remesh);
+        let options = super::trellis2_run_options_from_args(&args).expect("run options");
+        assert!(options.postprocess.enabled, "post-process stays enabled");
+        assert!(!options.postprocess.remesh, "--no-remesh flips the branch");
+
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "trellis2",
+            "--source",
+            "image.png",
+            "--output",
+            "out.glb",
+            "--remesh-band",
+            "2.5",
+            "--remesh-project",
+            "0.25",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(Some(2.5), args.remesh_band);
+        assert_eq!(Some(0.25), args.remesh_project);
+        let options = super::trellis2_run_options_from_args(&args).expect("run options");
+        assert!(options.postprocess.remesh);
+        assert_eq!(2.5, options.postprocess.remesh_band);
+        assert_eq!(0.25, options.postprocess.remesh_project);
+
+        for flag in ["--remesh-band", "--remesh-project"] {
+            let error = super::trellis2_run_options_from_args(&{
+                let Cli {
+                    command: Command::Run(args),
+                    ..
+                } = Cli::parse_from([
+                    "lux3d",
+                    "run",
+                    "trellis2",
+                    "--source",
+                    "image.png",
+                    "--output",
+                    "out.glb",
+                    "--no-remesh",
+                    flag,
+                    "1",
+                ])
+                else {
+                    panic!("expected run command");
+                };
+                args
+            })
+            .expect_err("conflicting remesh flag must fail");
+            assert!(
+                error.to_string().contains("conflicts with `--no-remesh`"),
+                "unexpected message for {flag}: `{error}`"
+            );
+        }
     }
 
     /// Invalid post-process thresholds fail before any weights load.
@@ -4677,7 +4808,7 @@ mod tests {
     /// every other family instead of being silently ignored.
     #[test]
     fn trellis2_only_flags_rejected_for_other_families() {
-        let flag_options: [(&str, &[&str]); 24] = [
+        let flag_options: [(&str, &[&str]); 27] = [
             ("--pipeline-type", &["--pipeline-type", "512"]),
             ("--max-num-tokens", &["--max-num-tokens", "8192"]),
             ("--texture", &["--texture", "false"]),
@@ -4685,6 +4816,9 @@ mod tests {
             ("--no-texture-export", &["--no-texture-export"]),
             ("--no-uv-unwrap", &["--no-uv-unwrap"]),
             ("--no-postprocess", &["--no-postprocess"]),
+            ("--no-remesh", &["--no-remesh"]),
+            ("--remesh-band", &["--remesh-band", "2"]),
+            ("--remesh-project", &["--remesh-project", "0.5"]),
             ("--decimation-target", &["--decimation-target", "4096"]),
             ("--fill-hole-perimeter", &["--fill-hole-perimeter", "0.05"]),
             ("--min-component-area", &["--min-component-area", "1e-4"]),
@@ -5565,6 +5699,9 @@ mod tests {
             no_preprocess_mesh: false,
             no_preprocess_image: false,
             no_postprocess: false,
+            no_remesh: false,
+            remesh_band: None,
+            remesh_project: None,
             decimation_target: None,
             fill_hole_perimeter: None,
             min_component_area: None,
@@ -5647,6 +5784,9 @@ mod tests {
             no_preprocess_mesh: false,
             no_preprocess_image: false,
             no_postprocess: false,
+            no_remesh: false,
+            remesh_band: None,
+            remesh_project: None,
             decimation_target: None,
             fill_hole_perimeter: None,
             min_component_area: None,
@@ -5731,6 +5871,9 @@ mod tests {
             no_preprocess_mesh: false,
             no_preprocess_image: false,
             no_postprocess: false,
+            no_remesh: false,
+            remesh_band: None,
+            remesh_project: None,
             decimation_target: None,
             fill_hole_perimeter: None,
             min_component_area: None,
@@ -5820,6 +5963,9 @@ mod tests {
             no_preprocess_mesh: false,
             no_preprocess_image: false,
             no_postprocess: false,
+            no_remesh: false,
+            remesh_band: None,
+            remesh_project: None,
             decimation_target: None,
             fill_hole_perimeter: None,
             min_component_area: None,
@@ -5906,6 +6052,9 @@ mod tests {
             no_preprocess_mesh: false,
             no_preprocess_image: false,
             no_postprocess: false,
+            no_remesh: false,
+            remesh_band: None,
+            remesh_project: None,
             decimation_target: None,
             fill_hole_perimeter: None,
             min_component_area: None,

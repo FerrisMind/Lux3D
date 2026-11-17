@@ -10,8 +10,8 @@
 //!   (glTF channel convention: G = roughness, B = metallic),
 //! * `metallicFactor = 1.0`, `roughnessFactor = 1.0`,
 //! * `alphaMode = "OPAQUE"` (default; `"MASK"` with cutoff and `"BLEND"`
-//!   supported), `doubleSided = true` (the reference
-//!   `PBRMaterial(..., doubleSided=True)` for the non-remeshed path).
+//!   supported) and the upstream `to_glb` `doubleSided` flag: `false` for
+//!   remeshed meshes, `true` otherwise (`postprocess.py:303`).
 //!
 //! Upstream export-time conversions applied HERE (not upstream of the
 //! writer), exactly like the reference `to_glb` epilogue:
@@ -39,7 +39,7 @@ use serde_json::json;
 
 use super::mesh::write_glb_container;
 use super::trellis2::to_glb_axes;
-use crate::{Result, error::Lux3dError};
+use crate::{error::Lux3dError, Result};
 
 /// glTF material alpha mode for the textured export.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -78,7 +78,7 @@ impl TexturedAlphaMode {
 /// axis conversion and the UV V flip. Set `already_gltf_axes = true` to skip
 /// the axis conversion (UVs are always V-flipped; pre-flip them and this
 /// writer is not for you).
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TexturedGlbMesh {
     /// Flat `[x, y, z, ...]` positions, reference frame.
     pub vertices: Vec<f32>,
@@ -97,17 +97,43 @@ pub struct TexturedGlbMesh {
     pub texture_size: usize,
     /// Material alpha mode (glTF `OPAQUE` default).
     pub alpha_mode: TexturedAlphaMode,
+    /// Material `doubleSided` flag. Upstream `to_glb` writes
+    /// `doubleSided = True` for the non-remeshed mesh and `False` for the
+    /// remeshed one (`postprocess.py:303`: `True if not remesh else False`).
+    pub double_sided: bool,
     /// Skip the glTF axis conversion (positions/normals already converted).
     pub already_gltf_axes: bool,
+}
+
+impl Default for TexturedGlbMesh {
+    fn default() -> Self {
+        Self {
+            vertices: Vec::new(),
+            normals: Vec::new(),
+            uvs: Vec::new(),
+            faces: Vec::new(),
+            base_color_rgba: Vec::new(),
+            metallic_roughness: Vec::new(),
+            texture_size: 0,
+            alpha_mode: TexturedAlphaMode::default(),
+            // Upstream's non-remeshed `PBRMaterial(..., doubleSided=True)`.
+            double_sided: true,
+            already_gltf_axes: false,
+        }
+    }
 }
 
 impl TexturedGlbMesh {
     /// Build the writer input from a pipeline [`Trellis2TexturedMesh`]
     /// (clones the buffers — the textured mesh stays reusable; the copies
     /// are transient, roughly `vertices + normals + uvs` bytes).
+    ///
+    /// `double_sided` follows the upstream `to_glb` material rule: `false`
+    /// when the mesh was remeshed, `true` otherwise.
     pub fn from_textured_mesh(
         mesh: &crate::runtime::Trellis2TexturedMesh,
         alpha_mode: TexturedAlphaMode,
+        double_sided: bool,
     ) -> Self {
         Self {
             vertices: mesh.vertices.clone(),
@@ -118,6 +144,7 @@ impl TexturedGlbMesh {
             metallic_roughness: mesh.texture.metallic_roughness.clone(),
             texture_size: mesh.texture.size,
             alpha_mode,
+            double_sided,
             already_gltf_axes: false,
         }
     }
@@ -253,7 +280,7 @@ pub fn write_textured_glb(mesh: &TexturedGlbMesh, path: &Path) -> Result<()> {
             "roughnessFactor": 1.0,
         },
         "alphaMode": mesh.alpha_mode.gltf_name(),
-        "doubleSided": true,
+        "doubleSided": mesh.double_sided,
     });
     if let Some(cutoff) = mesh.alpha_mode.alpha_cutoff() {
         material["alphaCutoff"] = json!(cutoff);
@@ -430,6 +457,7 @@ mod tests {
             metallic_roughness: vec![0, 128, 64, 255].repeat(size * size),
             texture_size: size,
             alpha_mode: TexturedAlphaMode::Opaque,
+            double_sided: true,
             already_gltf_axes: false,
         }
     }
@@ -612,16 +640,37 @@ mod tests {
     }
 
     #[test]
+    fn textured_glb_double_sided_follows_remesh_flag() {
+        // Upstream `to_glb`: doubleSided = True for the non-remeshed mesh,
+        // False for the remeshed one (postprocess.py:303).
+        let path = temp_path("double-sided");
+        let mesh = fixture();
+        assert!(mesh.double_sided, "fixture default is non-remeshed");
+        write_textured_glb(&mesh, &path).expect("write double-sided glb");
+        let bytes = std::fs::read(&path).expect("read glb");
+        let _ = std::fs::remove_file(&path);
+        let (json, _bin) = parse_glb(&bytes);
+        assert_eq!(json["materials"][0]["doubleSided"], true);
+
+        let mut remeshed = fixture();
+        remeshed.double_sided = false;
+        let path = temp_path("single-sided");
+        write_textured_glb(&remeshed, &path).expect("write single-sided glb");
+        let bytes = std::fs::read(&path).expect("read glb");
+        let _ = std::fs::remove_file(&path);
+        let (json, _bin) = parse_glb(&bytes);
+        assert_eq!(json["materials"][0]["doubleSided"], false);
+    }
+
+    #[test]
     fn textured_glb_rejects_invalid_inputs_descriptively() {
         let mut mesh = fixture();
         mesh.normals.push(0.0);
         let path = temp_path("bad-normals");
         let error = write_textured_glb(&mesh, &path).expect_err("normal count mismatch");
-        assert!(
-            error
-                .to_string()
-                .contains("matching flat vertex and normal")
-        );
+        assert!(error
+            .to_string()
+            .contains("matching flat vertex and normal"));
         assert!(!path.exists(), "failed writes must not leave a file");
 
         let mut mesh = fixture();

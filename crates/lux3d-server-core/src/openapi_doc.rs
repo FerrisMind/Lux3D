@@ -150,6 +150,9 @@ mod tests {
             "decimation_target",
             "fill_hole_perimeter",
             "min_component_area",
+            "remesh",
+            "remesh_band",
+            "remesh_project",
             "texture_resolution",
             "tex_rescale_t",
         ] {

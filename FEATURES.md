@@ -682,7 +682,7 @@ PBR voxel sidecar pair.
 **Functions:**
 - `runtime/trellis2.rs:Trellis2TextureExportOptions` — `enabled` / `texture_size` (default 2048, multiple of 8 in 8..=8192) / `uv_unwrap`; skips cleanly when disabled, unwrap off, or the mesh carries no 6-channel PBR payload ✅
 - `runtime/trellis2.rs:build_trellis2_textured_mesh()` — xatlas UV unwrap over the post-processed mesh, area-weighted vertex normals, sparse-trilinear PBR bake at `texture_size` into `Trellis2Stages::textured`; `geometry/uv_atlas.rs:uv_unwrap()` welds duplicate-position vertices (relative epsilon 1e-6 of the bbox diagonal) before charting so `repair_non_manifold_edges` vertex splits do not turn every split sheet into its own chart, while `vmapping` still points at the original input indices ✅
-- `export/trellis2.rs:Trellis2ExportStage::write_textured_glb()` — glTF 2.0 binary with POSITION/NORMAL/TEXCOORD_0 + u32 indices, embedded PNG base-color (RGBA) + metallic-roughness textures, reference material (`metallicFactor = 1`, `roughnessFactor = 1`, `alphaMode = "OPAQUE"`, `doubleSided = true`), upstream glTF axis conversion `(x, y, z) -> (x, z, -y)` and UV V flip ✅
+- `export/trellis2.rs:Trellis2ExportStage::write_textured_glb()` — glTF 2.0 binary with POSITION/NORMAL/TEXCOORD_0 + u32 indices, embedded PNG base-color (RGBA) + metallic-roughness textures, reference material (`metallicFactor = 1`, `roughnessFactor = 1`, `alphaMode = "OPAQUE"`, `doubleSided = false` when the mesh was remeshed and `true` otherwise, `postprocess.py:303`), upstream glTF axis conversion `(x, y, z) -> (x, z, -y)` and UV V flip ✅
 - `export/trellis2.rs:write_pbr_vox()` / `write_pbr_json()` — `<stem>.pbrvox.bin` + `<stem>.pbr.json` sidecar pair (sparse PBR voxel grid, 6 channels per voxel) ✅
 - `cli.rs:RunArgs` `--texture-size` (CLI range 64..=8192; upstream reference allows 1024..4096 step 1024) / `--no-texture-export` / `--no-uv-unwrap`, wired through `trellis2_run_options_from_args` -> `Trellis2RunOptions.texture_export`; `reject_trellis2_only_options` rejects the flags for every other family ✅
 - `cli.rs:run_trellis2` export selection — textured atlas + `.glb` output -> `write_textured_glb` (sidecar written next to it, the plain mesh writer does not overwrite it); `.obj`/`.ply`/`.stl` keep the vertex-color/positions-only mesh; geometry-only or disabled runs keep the pre-textured behavior ✅
@@ -762,28 +762,44 @@ As a user, I can export the final SLAT latents for parity/tooling.
 variants) ✅
 
 ### US-16.5: Mesh post-processing
-As a user, I get the upstream `to_glb` mesh cleanup before export.
+As a user, I get the upstream `to_glb` mesh remesh/cleanup before export.
 
 **Functions:**
 - `runtime/trellis2.rs:Trellis2MeshPostprocessOptions` — `enabled` (true),
   `fill_hole_perimeter` (3e-2), `decimation_target` (1,000,000 triangles),
-  `min_component_area` (1e-5) ✅
-- `geometry/mesh_ops.rs:postprocess_mesh()` — fill holes -> simplify -> duplicate-face /
-  non-manifold repair -> small-component removal -> fill holes -> simplify -> cleanup ->
-  fill holes -> orientation unification -> vertex compaction ✅
+  `min_component_area` (1e-5), `remesh` (true), `remesh_band` (1), `remesh_project` (0) —
+  the defaults match the shipped entry points `example.py:43` / `app.py:503` ✅
+- `geometry/trellis2.rs:postprocess_decoded_mesh()` — shared `fill_holes` pre-pass then
+  one of two branches (`postprocess.py:108-186`): the narrow-band dual-contouring remesh
+  (`geometry/remesh_dc.rs:remesh_narrow_band_dc`) on the canonical `[-0.5, 0.5]^3` frame
+  with `resolution = mesh.resolution`, `center = 0`, `scale = (resolution + 3 * band) /
+  resolution` (`geometry/remesh_dc.rs:narrow_band_grid_scale`, remesh quads split into
+  triangles), followed by a single `simplify(decimation_target)` pass; or
+  `geometry/mesh_ops.rs:postprocess_mesh()` — simplify -> duplicate-face / non-manifold
+  repair -> small-component removal -> fill holes -> simplify -> cleanup -> fill holes ->
+  orientation unification -> vertex compaction ✅
 - `geometry/mesh_ops.rs:simplify_mesh()` — deterministic meshopt quadric
   simplifier with `Permissive` collapses (required for the non-manifold
   O-Voxel dual-grid topology; without it meshopt stalls above the target);
-  `decimation_target = 0` skips both simplify passes (cleanup only) ✅
-- CLI `--no-postprocess`, `--decimation-target`, `--fill-hole-perimeter`,
-  `--min-component-area`; applied BEFORE `attach_texture` so PBR sampling sees the final
-  vertices ✅
+  `decimation_target = 0` skips simplification ✅
+- CLI `--no-postprocess`, `--no-remesh`, `--remesh-band`, `--remesh-project`,
+  `--decimation-target`, `--fill-hole-perimeter`, `--min-component-area`; applied BEFORE
+  `attach_texture` so PBR sampling sees the final vertices; server
+  `MeshGenerationOptions` maps `postprocess`/`decimation_target`/`fill_hole_perimeter`/
+  `min_component_area`/`remesh`/`remesh_band`/`remesh_project` ✅
+- `export/glb_textured.rs:TexturedGlbMesh::double_sided` — `false` on remeshed exports,
+  `true` on the non-remeshed/pass-through paths (`postprocess.py:303`) ✅
 
-**Tests:** `mesh_ops` unit suite (26 tests), `pipeline_trellis2`
-(`pipeline_golden_mesh_postprocess_options`), `run_args` postprocess flag tests ✅
+**Tests:** `geometry::trellis2` remesh branch tests (watertight topology rebuild,
+remesh decimation target, pre-attached-color rejection, byte-identical `--no-remesh`
+cleanup path), `mesh_ops` unit suite (26 tests), `pipeline_trellis2`
+(`pipeline_golden_mesh_postprocess_options` covers remesh + cleanup + both decimation
+paths), CLI/server postprocess mapping tests ✅
 
-**Caveat:** cleanup/decimation are clean-room ports driven by the meshopt simplifier, not
-cumesh; topology changes can differ from the reference.
+**Caveat:** the remesh is a clean-room narrow-band dual-contouring port (BVH closest-point
+distance + ray-parity sign + QEF placement), and cleanup/decimation are clean-room ports
+driven by the meshopt simplifier, not cumesh; topology changes can differ from the
+reference.
 
 ---
 
@@ -1005,12 +1021,14 @@ Also touched: `crates/lux3d-core/tests/vggt_export.rs` (fixture gains empty `pos
   quantized canonical-GGUF layout). A package with neither fails with a clear error.
 - **TRELLIS.2 `1536_cascade`:** variant dispatch and token-budget math are tested; no
   real-weight end-to-end run is recorded.
-- **TRELLIS.2 remesh branch:** the cumesh narrow-band dual-contouring remesh path is not
-  implemented. The mesh stays the extracted O-Voxel dual-grid surface plus the cleanup
-  postprocess.
-- **TRELLIS.2 approximations:** meshopt simplification/cleanup vs cumesh; xatlas vs cumesh
-  unwrap; TELEA-approximation inpaint vs `cv2.inpaint`; synthesized occupancy guides vs
-  upstream sparse caches.
+- **TRELLIS.2 remesh branch:** implemented as a clean-room narrow-band dual-contouring
+  port (`geometry/remesh_dc.rs`) and enabled by default, matching the shipped entry
+  points; `--no-remesh` / `remesh = false` restores the previous cleanup chain. The
+  default decodes on fresh topology, so mesh vertex/face counts differ from the
+  pre-remesh pipeline by design.
+- **TRELLIS.2 approximations:** narrow-band DC remesh vs cumesh; meshopt
+  simplification/cleanup vs cumesh; xatlas vs cumesh unwrap; TELEA-approximation inpaint
+  vs `cv2.inpaint`; synthesized occupancy guides vs upstream sparse caches.
 - **TRELLIS.2 backend throughput:** one sampler step on q8\_0 (512, geometry only) takes
   22.0 s on CUDA, 55.9 s on Vulkan and 97.6 s on WGPU. Vulkan's residual gap is WDDM
   submission/fence latency: the shape VAE and DiTs issue tens of thousands of small

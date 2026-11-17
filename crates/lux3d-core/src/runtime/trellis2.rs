@@ -18,10 +18,11 @@
 //!    Euler CFG sampler (strength 7.5, rescale 0.5, interval [0.6, 1.0],
 //!    rescale_t 3.0) -> de-normalize `slat * std + mean`.
 //! 5. shape VAE decode at resolution 512 -> dual-grid head split ->
-//!    O-Voxel mesh extraction -> geometry post-process (`to_glb` mesh
-//!    cleaning: hole filling, decimation, cleanup, orientation
-//!    unification; [`Trellis2MeshPostprocessOptions`], enabled by
-//!    default) -> export.
+//!    O-Voxel mesh extraction -> geometry post-process (upstream `to_glb`
+//!    branches: shared hole filling, then the narrow-band dual-contouring
+//!    remesh + single simplify pass by default, or the cleanup/decimation
+//!    chain with `remesh = false`; [`Trellis2MeshPostprocessOptions`],
+//!    enabled by default) -> export.
 //!
 //! 1024 path (`pipeline_type = "1024"`): the same single-resolution flow at
 //! SS resolution 64, conditioning at 1024 (`shape_dit_1024` /
@@ -141,25 +142,25 @@ use ndarray::Array2;
 use super::trellis2_dino::Trellis2Dino;
 use super::trellis2_dit::{Trellis2SlatConfig, Trellis2SlatDit, Trellis2SsConfig, Trellis2SsDit};
 use super::trellis2_mesh::DualGridMesh;
-use super::trellis2_sampler::{Trellis2SamplerParams, sample_dense, sample_sparse};
-use super::trellis2_ss_dec::{Trellis2SsDecoder, Trellis2SsDecoderConfig, occupancy_coords};
+use super::trellis2_sampler::{sample_dense, sample_sparse, Trellis2SamplerParams};
+use super::trellis2_ss_dec::{occupancy_coords, Trellis2SsDecoder, Trellis2SsDecoderConfig};
 use super::trellis2_tex::{
-    Trellis2TexDecoder, Trellis2TexDit, pbr_attrs_from_raw, query_vertex_colors,
+    pbr_attrs_from_raw, query_vertex_colors, Trellis2TexDecoder, Trellis2TexDit,
 };
-use super::trellis2_vae::{Trellis2ShapeVaeConfig, Trellis2ShapeVaeDecoder, decode_shape_mesh};
-use crate::ModelFamily;
-use crate::Result;
+use super::trellis2_vae::{decode_shape_mesh, Trellis2ShapeVaeConfig, Trellis2ShapeVaeDecoder};
 use crate::contracts::Trellis2PipelineType;
 use crate::error::Lux3dError;
 use crate::export::Trellis2ExportStage;
 use crate::geometry::{
-    Trellis2GeometryStage, area_weighted_vertex_normals, bake_pbr_texture, uv_unwrap,
+    area_weighted_vertex_normals, bake_pbr_texture, uv_unwrap, Trellis2GeometryStage,
 };
 use crate::preprocess::{Trellis2BackgroundRemover, Trellis2Preprocess};
 use crate::runtime::Rmbg2Model;
 use crate::weights::{
-    CanonicalWeightSetPaths, ModelAssetOptions, VarBuilder, load_canonical_weights,
+    load_canonical_weights, CanonicalWeightSetPaths, ModelAssetOptions, VarBuilder,
 };
+use crate::ModelFamily;
+use crate::Result;
 
 /// The voxel margin of the FlexiDualGrid head (`fdg_vae.py` default).
 pub const TRELLIS2_VOXEL_MARGIN: f32 = 0.5;
@@ -574,26 +575,39 @@ pub fn quantize_hr_coords_with_stop(
 }
 
 /// Geometry post-processing options for the assembled TRELLIS.2 dual-grid
-/// mesh (upstream `to_glb` defaults; the reference demo additionally caps the
-/// texture budget at 4096 but keeps the 1e6 decimation target).
+/// mesh (upstream `to_glb` branches; default = the shipped entry points
+/// `example.py:43-45` / `app.py:503-505`, which run `remesh=True`,
+/// `remesh_band=1`, `remesh_project=0`; the reference demo additionally caps
+/// the texture budget at 4096 but keeps the 1e6 decimation target).
 ///
 /// When [`Trellis2MeshPostprocessOptions::enabled`], the assembled mesh runs
-/// `mesh_ops::postprocess_mesh` BEFORE the texture stage attaches per-vertex
-/// colors, so the final (possibly re-topologized) vertices are the ones the
-/// PBR color sampling sees and no vertex-color remap is needed. The pass
-/// mirrors the upstream order, including both simplify passes:
+/// BEFORE the texture stage attaches per-vertex colors, so the final
+/// (possibly re-topologized) vertices are the ones the PBR color sampling
+/// sees and no vertex-color remap is needed. The pass mirrors the upstream
+/// order:
 ///
-/// 1. `fill_holes(fill_hole_perimeter)` — also covers the reference
+/// 0. `fill_holes(fill_hole_perimeter)` — upstream's shared pre-branch
+///    cleaning (`postprocess.py:108-113`); also covers the reference
 ///    decode-time `Mesh.fill_holes()` call inside `decode_latent` (same
 ///    3e-2 default threshold);
-/// 2. aggressive simplify toward `decimation_target * 3` triangles (`0`
-///    skips BOTH simplify passes — cleanup-only post-processing);
-/// 3. `remove_duplicate_faces` / `repair_non_manifold_edges` /
+/// 1. `remesh = true` (default): build the triangle BVH, run
+///    [`crate::geometry::remesh_narrow_band_dc`] on the canonical
+///    `[-0.5, 0.5]^3` frame with `resolution = mesh.resolution`,
+///    `center = 0`, `scale = (resolution + 3 * remesh_band) / resolution`,
+///    `band = remesh_band` and `project_back = remesh_project`, then the
+///    single `simplify(decimation_target)` pass. The upstream remesh branch
+///    skips the duplicate-face / non-manifold / small-component /
+///    orientation-unification chain (`postprocess.py:171-186`);
+/// 2. `remesh = false`: the reference cleanup chain — aggressive simplify
+///    toward `decimation_target * 3` triangles (`0` skips BOTH simplify
+///    passes — cleanup-only post-processing), `remove_duplicate_faces` /
+///    `repair_non_manifold_edges` /
 ///    `remove_small_connected_components(min_component_area)` /
-///    `fill_holes`;
-/// 4. second simplify toward `decimation_target` + the same cleanup;
-/// 5. final `fill_holes` + `unify_face_orientations` + vertex compaction.
+///    `fill_holes`, second simplify toward `decimation_target` + the same
+///    cleanup, final `fill_holes` + `unify_face_orientations` + vertex
+///    compaction.
 ///
+/// `remesh = false` is byte-identical to the pre-remesh-port pipeline.
 /// UV unwrapping / texture baking are a separate workstream and are NOT part
 /// of this pass.
 #[derive(Debug, Clone, PartialEq)]
@@ -606,15 +620,29 @@ pub struct Trellis2MeshPostprocessOptions {
     /// `<` comparison); `0` legitimately disables hole filling.
     pub fill_hole_perimeter: f32,
     /// Final triangle-count target (upstream `to_glb(decimation_target)`,
-    /// default 1_000_000). The reference first simplifies aggressively to
-    /// `3 * decimation_target`, then to this target. `0` skips simplification
-    /// entirely (cleanup-only).
+    /// default 1_000_000). In the remesh branch this is the single
+    /// post-remesh simplify pass; in the cleanup branch the reference first
+    /// simplifies aggressively to `3 * decimation_target`, then to this
+    /// target. `0` skips simplification entirely (topology-only pass).
     pub decimation_target: usize,
     /// Connected components with total triangle area `<` this threshold are
     /// removed (upstream `remove_small_connected_components(1e-5)` keeps
     /// components with `area >= min_area`); `0` keeps every non-degenerate
-    /// component.
+    /// component. Unused in the remesh branch (upstream skips the cleanup
+    /// chain there).
     pub min_component_area: f32,
+    /// Rebuild the topology with upstream's narrow-band dual-contouring
+    /// remesh (true, matching the shipped entry points
+    /// `example.py:43`/`app.py:503`) instead of the cleanup/simplify chain.
+    /// `false` restores the previous non-remesh pipeline byte-for-byte.
+    pub remesh: bool,
+    /// Narrow-band half-width in grid cells (upstream `remesh_band`, shipped
+    /// value `1`). Only used when `remesh` is set.
+    pub remesh_band: f32,
+    /// Project-back lerp factor toward the original surface (upstream
+    /// `remesh_project`; `0` disables, the shipped value; the reference
+    /// signature default `0.9` is not used by either shipped entry point).
+    pub remesh_project: f32,
 }
 
 impl Default for Trellis2MeshPostprocessOptions {
@@ -624,6 +652,9 @@ impl Default for Trellis2MeshPostprocessOptions {
             fill_hole_perimeter: 3e-2,
             decimation_target: 1_000_000,
             min_component_area: 1e-5,
+            remesh: true,
+            remesh_band: 1.0,
+            remesh_project: 0.0,
         }
     }
 }
@@ -631,9 +662,11 @@ impl Default for Trellis2MeshPostprocessOptions {
 impl Trellis2MeshPostprocessOptions {
     /// Validate the options. Disabled post-processing skips the threshold
     /// checks (the values are unused). Enabled runs require finite,
-    /// non-negative thresholds — `0` is a meaningful "off" for both (no hole
-    /// is closed / no component is dropped) — and accept any decimation
-    /// target (`0` = skip simplification, cleanup-only).
+    /// non-negative thresholds — `0` is a meaningful "off" for the hole /
+    /// component thresholds — and accept any decimation target (`0` = skip
+    /// simplification, topology-only). The remesh branch additionally
+    /// requires a finite non-negative `remesh_band` and a finite
+    /// `remesh_project` (the remesher itself validates the derived grid).
     pub fn validate(&self) -> Result<()> {
         if !self.enabled {
             return Ok(());
@@ -649,6 +682,20 @@ impl Trellis2MeshPostprocessOptions {
                 "Trellis2 postprocess min_component_area must be a finite non-negative \
                  threshold (0 keeps every component)",
             ));
+        }
+        if self.remesh {
+            if !self.remesh_band.is_finite() || self.remesh_band < 0.0 {
+                return Err(Lux3dError::InvalidInput(
+                    "Trellis2 postprocess remesh_band must be a finite non-negative \
+                     value in grid cells (the shipped value is 1)",
+                ));
+            }
+            if !self.remesh_project.is_finite() {
+                return Err(Lux3dError::InvalidInput(
+                    "Trellis2 postprocess remesh_project must be finite (0 disables \
+                     project-back)",
+                ));
+            }
         }
         Ok(())
     }
@@ -758,8 +805,9 @@ pub struct Trellis2RunOptions {
     pub num_samples: usize,
     /// Geometry post-process of the assembled mesh, applied BEFORE the
     /// texture stage attaches per-vertex colors (upstream `to_glb` mesh
-    /// cleaning; defaults mirror the reference signature). With
-    /// `enabled = false` the decoded mesh is passed through untouched.
+    /// cleaning / remesh; defaults mirror the shipped entry points:
+    /// remesh on, band 1, project 0). With `enabled = false` the decoded
+    /// mesh is passed through untouched.
     pub postprocess: Trellis2MeshPostprocessOptions,
     /// Textured-GLB export stage (upstream `to_glb` UV unwrap + PBR bake):
     /// UV atlas, area-weighted vertex normals and the baked base-color /
@@ -2100,12 +2148,12 @@ impl Trellis2Pipeline {
     }
 
     /// Geometry post-process of the assembled dual-grid mesh (upstream
-    /// `decode_latent` `fill_holes` + `to_glb` cleaning order, implemented by
-    /// `mesh_ops::postprocess_mesh`). Runs BEFORE `attach_texture` so the
-    /// final (possibly re-topologized) vertices are the ones the texture
-    /// stage samples PBR colors for — no vertex-color remap is needed on the
-    /// production path, because `assemble_mesh` always produces
-    /// `vertex_colors = None`.
+    /// `decode_latent` `fill_holes` + `to_glb` remesh/cleanup branches,
+    /// implemented by `Trellis2GeometryStage::postprocess_decoded_mesh`). Runs
+    /// BEFORE `attach_texture` so the final (possibly re-topologized) vertices
+    /// are the ones the texture stage samples PBR colors for — no
+    /// vertex-color remap is needed on the production path, because
+    /// `assemble_mesh` always produces `vertex_colors = None`.
     ///
     /// With `options.enabled = false` the input buffers are returned
     /// untouched (byte-identical to the pre-postprocess pipeline). The

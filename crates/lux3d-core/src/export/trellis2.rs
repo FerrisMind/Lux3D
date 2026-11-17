@@ -15,7 +15,8 @@
 //! write_textured_glb`] writes a glTF 2.0 binary with POSITION/NORMAL/
 //! TEXCOORD_0 + u32 indices, embedded PNG base-color / metallic-roughness
 //! textures and the reference PBR material (`metallicFactor = 1`,
-//! `roughnessFactor = 1`, `alphaMode = "OPAQUE"`, `doubleSided = true`).
+//! `roughnessFactor = 1`, `alphaMode = "OPAQUE"`, `doubleSided = false` for
+//! remeshed meshes and `true` otherwise, `postprocess.py:303`).
 //! See `export::glb_textured` for the conversion details (axis rotation
 //! `(x, y, z) -> (x, z, -y)` on positions and normals, UV V flip) — the
 //! same conversions the reference `to_glb` epilogue applies
@@ -38,14 +39,14 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::{
-    Result,
     contracts::{ExportPlan, ExportStage, Trellis2Mesh},
     error::Lux3dError,
     geometry::Trellis2MeshBuffers,
     runtime::Trellis2TexturedMesh,
+    Result,
 };
 
-use super::mesh::{MeshFormat, MeshView, ObjStyle, write_mesh, write_obj};
+use super::mesh::{write_mesh, write_obj, MeshFormat, MeshView, ObjStyle};
 
 /// PBR voxel sidecar constants (`L3DPBR1\0` magic, format version 1).
 pub mod pbrvox {
@@ -144,12 +145,20 @@ impl Trellis2ExportStage {
     /// `(x, y, z) -> (x, z, -y)` to positions AND normals and the UV V flip
     /// `v' = 1 - v` (the baked textures use the nvdiffrast row-0 = v = 1
     /// layout). Material: `metallicFactor = 1`, `roughnessFactor = 1`,
-    /// `alphaMode = "OPAQUE"`, `doubleSided = true`. The plain
-    /// [`Self::write_mesh`] behavior for non-textured exports is unchanged.
-    pub fn write_textured_glb(&self, textured: &Trellis2TexturedMesh, path: &Path) -> Result<()> {
+    /// `alphaMode = "OPAQUE"`, and `doubleSided = double_sided` — the
+    /// upstream rule is `false` for remeshed meshes, `true` otherwise
+    /// (`postprocess.py:303`). The plain [`Self::write_mesh`] behavior for
+    /// non-textured exports is unchanged.
+    pub fn write_textured_glb(
+        &self,
+        textured: &Trellis2TexturedMesh,
+        path: &Path,
+        double_sided: bool,
+    ) -> Result<()> {
         let glb_mesh = super::glb_textured::TexturedGlbMesh::from_textured_mesh(
             textured,
             super::glb_textured::TexturedAlphaMode::Opaque,
+            double_sided,
         );
         super::glb_textured::write_textured_glb(&glb_mesh, path)
     }
@@ -314,7 +323,7 @@ fn pbr_io(path: &Path) -> impl Fn(std::io::Error) -> Lux3dError + '_ {
 mod tests {
     use super::*;
     use crate::geometry::Trellis2MeshBuffers;
-    use crate::runtime::{Trellis2TextureExportOptions, build_trellis2_textured_mesh};
+    use crate::runtime::{build_trellis2_textured_mesh, Trellis2TextureExportOptions};
 
     /// Synthetic textured cube: reference-frame `[-0.5, 0.5]^3` unit cube
     /// (12 triangles, outward winding) over a full 2x2x2 PBR voxel grid at
@@ -464,7 +473,7 @@ mod tests {
         let stage = Trellis2ExportStage;
         let path = temp_path("cube");
         stage
-            .write_textured_glb(&textured, &path)
+            .write_textured_glb(&textured, &path, true)
             .expect("write glb");
         let bytes = std::fs::read(&path).expect("read glb");
         let _ = std::fs::remove_file(&path);

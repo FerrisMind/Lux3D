@@ -1299,7 +1299,7 @@ mod tests {
             std::process::id()
         ));
         crate::export::Trellis2ExportStage
-            .write_textured_glb(&textured, &path)
+            .write_textured_glb(&textured, &path, true)
             .expect("write textured glb");
         let imported = crate::export::load_mesh(&path).expect("read textured glb");
         let _ = std::fs::remove_file(&path);

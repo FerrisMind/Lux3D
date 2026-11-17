@@ -542,6 +542,15 @@ fn trellis2_options_from_mesh_options(
     if let Some(value) = options.min_component_area {
         postprocess.min_component_area = value;
     }
+    if let Some(remesh) = options.remesh {
+        postprocess.remesh = remesh;
+    }
+    if let Some(value) = options.remesh_band {
+        postprocess.remesh_band = value;
+    }
+    if let Some(value) = options.remesh_project {
+        postprocess.remesh_project = value;
+    }
     postprocess.validate().map_err(anyhow::Error::from)?;
 
     let mut texture_export = defaults.texture_export.clone();
@@ -764,6 +773,9 @@ fn validate_mesh_generation_request(model: &str, options: &MeshGenerationOptions
         ("decimation_target", options.decimation_target.is_some()),
         ("fill_hole_perimeter", options.fill_hole_perimeter.is_some()),
         ("min_component_area", options.min_component_area.is_some()),
+        ("remesh", options.remesh.is_some()),
+        ("remesh_band", options.remesh_band.is_some()),
+        ("remesh_project", options.remesh_project.is_some()),
     ] {
         ensure!(!present, "`{name}` is not supported for `triposg`");
     }
@@ -920,9 +932,17 @@ pub async fn spawn_mesh_generation(
                                     if let Some(textured) = textured {
                                         // Upstream `to_glb` textured export:
                                         // embedded PBR textures + UVs.
+                                        // `doubleSided = false` on the
+                                        // remeshed branch (`postprocess.py:303`).
+                                        let double_sided = !(run_options.postprocess.enabled
+                                            && run_options.postprocess.remesh);
                                         pipeline
                                             .export
-                                            .write_textured_glb(textured, &sample_output)
+                                            .write_textured_glb(
+                                                textured,
+                                                &sample_output,
+                                                double_sided,
+                                            )
                                             .map_err(anyhow::Error::from)?;
                                         if run_options.with_texture
                                             && mesh.voxel_attr_channels == pbrvox::CHANNELS
@@ -1160,7 +1180,7 @@ pub async fn spawn_mesh_texturing(
                             .map_err(anyhow::Error::from)?;
                         pipeline
                             .export
-                            .write_textured_glb(&textured.mesh, &output_path)
+                            .write_textured_glb(&textured.mesh, &output_path, true)
                             .map_err(anyhow::Error::from)?;
                         Ok(())
                     })?;
@@ -1341,6 +1361,32 @@ mod tests {
             message.contains("is not supported for `triposg`"),
             "unexpected message: `{message}`"
         );
+    }
+
+    #[test]
+    fn triposg_rejects_trellis2_remesh_options() {
+        for options in [
+            MeshGenerationOptions {
+                remesh: Some(false),
+                ..default_mesh_options()
+            },
+            MeshGenerationOptions {
+                remesh_band: Some(2.0),
+                ..default_mesh_options()
+            },
+            MeshGenerationOptions {
+                remesh_project: Some(0.5),
+                ..default_mesh_options()
+            },
+        ] {
+            let error = validate_mesh_generation_request("triposg", &options)
+                .expect_err("trellis2 remesh knobs must be rejected for triposg");
+            let message = error.to_string();
+            assert!(
+                message.contains("remesh") && message.contains("is not supported for `triposg`"),
+                "unexpected message: `{message}`"
+            );
+        }
     }
 
     #[test]
@@ -1674,6 +1720,9 @@ mod tests {
             decimation_target: Some(50_000),
             fill_hole_perimeter: Some(0.05),
             min_component_area: Some(1e-4),
+            remesh: Some(false),
+            remesh_band: Some(2.0),
+            remesh_project: Some(0.5),
             ..default_mesh_options()
         };
         let run = trellis2_options_from_mesh_options(&options).expect("mapped trellis2 options");
@@ -1683,6 +1732,39 @@ mod tests {
         assert_eq!(50_000, run.postprocess.decimation_target);
         assert_eq!(0.05, run.postprocess.fill_hole_perimeter);
         assert_eq!(1e-4, run.postprocess.min_component_area);
+        assert!(!run.postprocess.remesh);
+        assert_eq!(2.0, run.postprocess.remesh_band);
+        assert_eq!(0.5, run.postprocess.remesh_project);
+
+        // The shipped defaults (remesh on, band 1, project 0) apply when the
+        // request omits the fields.
+        let defaults = trellis2_options_from_mesh_options(&default_mesh_options())
+            .expect("default trellis2 options")
+            .postprocess;
+        assert!(defaults.remesh);
+        assert_eq!(1.0, defaults.remesh_band);
+        assert_eq!(0.0, defaults.remesh_project);
+    }
+
+    #[test]
+    fn trellis2_rejects_invalid_remesh_thresholds() {
+        for (band, project) in [
+            (Some(-1.0), None),
+            (Some(f32::NAN), None),
+            (None, Some(f32::NAN)),
+        ] {
+            let options = MeshGenerationOptions {
+                remesh_band: band,
+                remesh_project: project,
+                ..default_mesh_options()
+            };
+            let error = trellis2_options_from_mesh_options(&options)
+                .expect_err("invalid remesh knob must be rejected");
+            assert!(
+                error.to_string().contains("remesh_"),
+                "unexpected message: `{error}`"
+            );
+        }
     }
 
     #[test]

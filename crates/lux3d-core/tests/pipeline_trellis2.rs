@@ -20,8 +20,9 @@ use std::path::PathBuf;
 use candle_core::{Device, Tensor};
 use lux3d_core::contracts::Trellis2PipelineType;
 use lux3d_core::runtime::{
-    TRELLIS2_SHAPE_SLAT_MEAN, TRELLIS2_SHAPE_SLAT_STD, TRELLIS2_VOXEL_MARGIN, Trellis2Pipeline,
-    Trellis2PipelineConfig, Trellis2Rng, Trellis2RunOptions, Trellis2SamplerParams,
+    Trellis2Pipeline, Trellis2PipelineConfig, Trellis2Rng, Trellis2RunOptions,
+    Trellis2SamplerParams, TRELLIS2_SHAPE_SLAT_MEAN, TRELLIS2_SHAPE_SLAT_STD,
+    TRELLIS2_VOXEL_MARGIN,
 };
 use lux3d_core::test_support::workspace_root;
 
@@ -466,8 +467,9 @@ fn pipeline_golden_shape_decode_at_oracle_resolution() {
 /// Gated pipeline-level post-process check: the golden decoded mesh runs
 /// through `Trellis2GeometryStage::postprocess_decoded_mesh` (the exact
 /// helper the run paths apply before `attach_texture`) with the default
-/// upstream options and with decimation; the disabled option must be
-/// byte-identical. Skips without the raw dir or the golden fixture.
+/// shipped options (remesh), with the non-remesh cleanup chain, and with
+/// decimation; the disabled option must be byte-identical. Skips without the
+/// raw dir or the golden fixture.
 #[test]
 fn pipeline_golden_mesh_postprocess_options() {
     use lux3d_core::runtime::Trellis2MeshPostprocessOptions;
@@ -524,40 +526,75 @@ fn pipeline_golden_mesh_postprocess_options() {
         .expect("disabled postprocess");
     assert_eq!(untouched, mesh);
 
-    // Enabled with the upstream defaults (1e6 target >> face count:
-    // cleanup-only in practice) — the payload must survive untouched and
-    // the geometry must stay valid.
+    // Shipped defaults: the remesh branch rebuilds the topology, and the
+    // payload must survive untouched.
+    let default_options = Trellis2MeshPostprocessOptions::default();
+    assert!(default_options.remesh);
+    let remeshed = pipeline
+        .geometry
+        .postprocess_decoded_mesh(mesh.clone(), &default_options)
+        .expect("default remesh postprocess");
+    assert_eq!(remeshed.resolution, mesh.resolution);
+    assert_eq!(remeshed.voxel_coords, mesh.voxel_coords);
+    assert_eq!(remeshed.voxel_attrs, mesh.voxel_attrs);
+    assert_eq!(remeshed.voxel_attr_channels, mesh.voxel_attr_channels);
+    assert_eq!(None, remeshed.vertex_colors, "colors attach AFTER remesh");
+    assert!(remeshed.face_count() > 0);
+    let vertex_count = remeshed.vertex_count();
+    assert!(remeshed
+        .faces
+        .iter()
+        .all(|&i| i >= 0 && (i as usize) < vertex_count));
+    remeshed.validate().expect("remeshed buffers valid");
+    assert_ne!(
+        (original_vertices, original_faces),
+        (remeshed.vertex_count(), remeshed.face_count()),
+        "remesh must change the extracted topology"
+    );
+    println!(
+        "postprocess remesh: {original_vertices} -> {} vertices, {original_faces} -> {} faces",
+        remeshed.vertex_count(),
+        remeshed.face_count()
+    );
+
+    // `--no-remesh` path: the previous cleanup chain (byte-identical
+    // behavior preserved); the payload again survives untouched.
     let cleaned = pipeline
         .geometry
-        .postprocess_decoded_mesh(mesh.clone(), &Trellis2MeshPostprocessOptions::default())
-        .expect("default postprocess");
+        .postprocess_decoded_mesh(
+            mesh.clone(),
+            &Trellis2MeshPostprocessOptions {
+                remesh: false,
+                ..Trellis2MeshPostprocessOptions::default()
+            },
+        )
+        .expect("cleanup postprocess");
     assert_eq!(cleaned.resolution, mesh.resolution);
     assert_eq!(cleaned.voxel_coords, mesh.voxel_coords);
     assert_eq!(cleaned.voxel_attrs, mesh.voxel_attrs);
     assert_eq!(cleaned.voxel_attr_channels, mesh.voxel_attr_channels);
     assert_eq!(None, cleaned.vertex_colors, "colors attach AFTER cleanup");
     let vertex_count = cleaned.vertex_count();
-    assert!(
-        cleaned
-            .faces
-            .iter()
-            .all(|&i| i >= 0 && (i as usize) < vertex_count)
-    );
+    assert!(cleaned
+        .faces
+        .iter()
+        .all(|&i| i >= 0 && (i as usize) < vertex_count));
     cleaned.validate().expect("cleaned buffers valid");
     println!(
-        "postprocess default: {original_vertices} -> {} vertices, {original_faces} -> {} faces",
+        "postprocess cleanup: {original_vertices} -> {} vertices, {original_faces} -> {} faces",
         cleaned.vertex_count(),
         cleaned.face_count()
     );
 
-    // Decimation target is respected on a real mesh.
+    // Decimation target is respected on a real mesh (cleanup branch).
     let target = original_faces / 4;
     let decimated = pipeline
         .geometry
         .postprocess_decoded_mesh(
-            mesh,
+            mesh.clone(),
             &Trellis2MeshPostprocessOptions {
                 decimation_target: target,
+                remesh: false,
                 ..Trellis2MeshPostprocessOptions::default()
             },
         )
@@ -568,6 +605,26 @@ fn pipeline_golden_mesh_postprocess_options() {
         "decimation target {target} respected, got {face_count}"
     );
     decimated.validate().expect("decimated buffers valid");
+
+    // ... and on the remesh branch (single simplify pass).
+    let remeshed_decimated = pipeline
+        .geometry
+        .postprocess_decoded_mesh(
+            mesh,
+            &Trellis2MeshPostprocessOptions {
+                decimation_target: target,
+                ..Trellis2MeshPostprocessOptions::default()
+            },
+        )
+        .expect("remesh + decimation postprocess");
+    let face_count = remeshed_decimated.face_count();
+    assert!(
+        face_count > 0 && face_count <= target,
+        "remesh decimation target {target} respected, got {face_count}"
+    );
+    remeshed_decimated
+        .validate()
+        .expect("remeshed decimated buffers valid");
 }
 
 /// Fully gated real-weight 512 image-to-mesh run. See the module docs for

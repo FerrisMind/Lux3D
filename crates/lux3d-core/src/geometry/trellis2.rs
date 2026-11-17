@@ -11,14 +11,32 @@
 //! When the run options enable mesh post-processing
 //! (`runtime::Trellis2MeshPostprocessOptions`), the pipeline rewrites the
 //! `vertices`/`faces` of the freshly assembled buffers through
-//! [`Trellis2GeometryStage::postprocess_decoded_mesh`] (hole filling,
-//! decimation, cleanup, orientation unification) BEFORE the texture stage
-//! attaches per-vertex colors; the voxel payload and `resolution` are never
-//! touched by that pass.
+//! [`Trellis2GeometryStage::postprocess_decoded_mesh`] BEFORE the texture
+//! stage attaches per-vertex colors; the voxel payload and `resolution` are
+//! never touched by that pass.
+//!
+//! The post-process has two mutually exclusive branches, mirroring upstream
+//! `to_glb` (`postprocess.py:108-186`): the shared pre-branch
+//! `fill_holes(fill_hole_perimeter)`, then either the narrow-band
+//! dual-contouring remesh + single simplify (default; shipped entry-point
+//! values `remesh=True, band=1, project=0`) or the cleanup/simplify chain.
+//! Remesh input is always the canonical `[-0.5, 0.5]^3` frame the dual-grid
+//! extraction produces, with `resolution = mesh.resolution` — exactly the
+//! `aabb`/`grid_size` the official call sites pass (`example.py:33-48`,
+//! `app.py:493-512`).
 
-use crate::geometry::postprocess_mesh;
+use crate::geometry::{
+    compact_mesh, fill_holes_with_centroids, postprocess_mesh, remesh_narrow_band_dc,
+    simplify_mesh, MeshBvh, MeshEditResult, RemeshDcOptions,
+};
 use crate::runtime::Trellis2MeshPostprocessOptions;
-use crate::{ModelFamily, Result, contracts::Trellis2Mesh, error::Lux3dError};
+use crate::{contracts::Trellis2Mesh, error::Lux3dError, ModelFamily, Result};
+
+/// Canonical AABB of the decoded dual-grid mesh (upstream `to_glb` call
+/// sites pass `[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]]`, `example.py:42`,
+/// `app.py:502`). The remesh grid center is its midpoint and its scale the
+/// largest extent (`postprocess.py:166-168`).
+const CANONICAL_AABB: [[f32; 3]; 2] = [[-0.5; 3], [0.5; 3]];
 
 /// CPU mesh + voxel payload produced by the TRELLIS.2 shape decode.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -77,7 +95,11 @@ impl Trellis2MeshBuffers {
                 max[axis] = max[axis].max(vertex[axis]);
             }
         }
-        if any { Some((min, max)) } else { None }
+        if any {
+            Some((min, max))
+        } else {
+            None
+        }
     }
 
     /// True when any vertex is non-finite.
@@ -178,27 +200,36 @@ impl Trellis2GeometryStage {
     }
 
     /// Upstream-style geometry post-process of an assembled TRELLIS.2 mesh:
-    /// `mesh_ops::postprocess_mesh` (the reference `to_glb` cumesh order,
-    /// both simplify passes included) over the decoded dual-grid buffers.
+    /// either the narrow-band dual-contouring remesh + single simplify pass
+    /// (`options.remesh`, the default) or `mesh_ops::postprocess_mesh` (the
+    /// reference `to_glb` cleanup order, both simplify passes included) over
+    /// the decoded dual-grid buffers. Both branches start from the upstream
+    /// shared `fill_holes(fill_hole_perimeter)` pre-pass
+    /// (`postprocess.py:108-113`).
     ///
     /// * `enabled = false` returns the input struct untouched (byte-identical
     ///   to the pre-postprocess pipeline).
     /// * `faces` are converted `i64 -> u32` with a bounds check (a negative
     ///   or out-of-range index fails the call instead of being silently
     ///   dropped).
+    /// * The remesh branch rebuilds the topology from scratch: vertices are
+    ///   QEF-placed in the grid cells, so pre-attached vertex colors cannot
+    ///   be transferred (the call fails descriptively; attach colors after
+    ///   post-processing, as the production path does).
     /// * `voxel_coords` / `voxel_attrs` / `voxel_attr_channels` /
     ///   `resolution` pass through untouched; the post-process only rewrites
     ///   `vertices` / `faces` (and may change their counts — filled holes add
     ///   centroid vertices, decimation and cleanup remove faces and
-    ///   vertices).
+    ///   vertices, remesh replaces the whole topology).
     /// * `vertex_colors` is `None` on the production path (colors attach
     ///   AFTER this pass, so the final vertices are sampled directly). A
     ///   pre-attached color buffer is transferred through
-    ///   `MeshEditResult::vertex_remap`; that remap indexes the post-process
-    ///   intermediate buffer (input vertices plus hole-fill centroids), so a
-    ///   remap entry pointing past the input vertex count (a fill centroid)
-    ///   has no source color and the call fails rather than guessing a
-    ///   color. Attach colors after post-processing instead.
+    ///   `MeshEditResult::vertex_remap` in the cleanup branch; that remap
+    ///   indexes the post-process intermediate buffer (input vertices plus
+    ///   hole-fill centroids), so a remap entry pointing past the input
+    ///   vertex count (a fill centroid) has no source color and the call
+    ///   fails rather than guessing a color. Attach colors after
+    ///   post-processing instead.
     pub fn postprocess_decoded_mesh(
         &self,
         mesh: Trellis2MeshBuffers,
@@ -212,6 +243,12 @@ impl Trellis2GeometryStage {
         if vertex_count > u32::MAX as usize {
             return Err(Lux3dError::InvalidInput(
                 "Trellis2 mesh post-process supports at most u32::MAX vertices",
+            ));
+        }
+        if options.remesh && mesh.vertex_colors.is_some() {
+            return Err(Lux3dError::InvalidInput(
+                "Trellis2 remesh rebuilds the topology, so pre-attached vertex colors cannot \
+                 be transferred; attach colors after post-processing",
             ));
         }
         let mut faces_u32 = Vec::with_capacity(mesh.faces.len());
@@ -228,13 +265,17 @@ impl Trellis2GeometryStage {
             }
             faces_u32.push(index as u32);
         }
-        let edited = postprocess_mesh(
-            &mesh.vertices,
-            &faces_u32,
-            options.fill_hole_perimeter,
-            options.decimation_target,
-            options.min_component_area,
-        );
+        let edited = if options.remesh {
+            postprocess_mesh_remesh(&mesh.vertices, &faces_u32, options, mesh.resolution)?
+        } else {
+            postprocess_mesh(
+                &mesh.vertices,
+                &faces_u32,
+                options.fill_hole_perimeter,
+                options.decimation_target,
+                options.min_component_area,
+            )
+        };
 
         // Defensive transfer of a pre-attached color buffer. `vertex_remap`
         // indexes the post-process intermediate buffer; entries past the
@@ -275,6 +316,55 @@ impl Trellis2GeometryStage {
         out.validate()?;
         Ok(out)
     }
+}
+
+/// Upstream `to_glb` remesh branch (`postprocess.py:171-186`): shared
+/// `fill_holes` pre-pass, triangle BVH build over the cleaned mesh, the
+/// narrow-band dual-contouring remesh on the canonical `[-0.5, 0.5]^3`
+/// frame, then a single `simplify(decimation_target)` pass.
+///
+/// Grid arguments exactly as the official call site: `resolution =
+/// grid_size.max()` (the mesh extraction resolution),
+/// `center = aabb.mean(dim=0)`, `scale = (resolution + 3 * band) / resolution
+/// * (aabb[1] - aabb[0]).max()` — [`RemeshDcOptions::from_aabb`] applies that
+/// arithmetic and [`crate::geometry::narrow_band_grid_scale`] owns the
+/// expansion formula.
+///
+/// The upstream remesh branch skips the duplicate-face / non-manifold /
+/// small-component / orientation-unification chain, so this helper does not
+/// run it. The remesher emits quads; they are split along the 0-2 diagonal
+/// (the same diagonal convention as the O-Voxel quad splitter) because the
+/// meshopt simplifier and the export writers are triangle-only.
+fn postprocess_mesh_remesh(
+    vertices: &[f32],
+    faces: &[u32],
+    options: &Trellis2MeshPostprocessOptions,
+    resolution: u32,
+) -> Result<MeshEditResult> {
+    let (vertices, faces) = fill_holes_with_centroids(vertices, faces, options.fill_hole_perimeter);
+    let bvh = MeshBvh::build(&vertices, &faces)?;
+    let remesh_options = RemeshDcOptions::from_aabb(
+        CANONICAL_AABB,
+        resolution,
+        options.remesh_band,
+        options.remesh_project,
+    );
+    let remeshed = remesh_narrow_band_dc(&vertices, &faces, &bvh, &remesh_options)?;
+    if remeshed.faces.is_empty() {
+        return Err(Lux3dError::InvalidInput(
+            "Trellis2 remesh produced no faces (empty or fully degenerate input surface)",
+        ));
+    }
+    debug_assert_eq!(remeshed.faces.len() % 4, 0, "the remesher emits quads");
+    let mut triangles = Vec::with_capacity(remeshed.faces.len() / 2);
+    for quad in remeshed.faces.chunks_exact(4) {
+        triangles.extend_from_slice(&[quad[0], quad[1], quad[2], quad[0], quad[2], quad[3]]);
+    }
+    Ok(if options.decimation_target > 0 {
+        simplify_mesh(&remeshed.vertices, &triangles, options.decimation_target)
+    } else {
+        compact_mesh(&remeshed.vertices, &triangles)
+    })
 }
 
 #[cfg(test)]
@@ -355,12 +445,17 @@ mod tests {
     }
 
     #[test]
-    fn trellis2_postprocess_options_defaults_match_upstream_to_glb() {
+    fn trellis2_postprocess_options_defaults_match_shipped_entry_points() {
         let options = Trellis2MeshPostprocessOptions::default();
         assert!(options.enabled);
         assert_eq!(3e-2, options.fill_hole_perimeter);
         assert_eq!(1_000_000, options.decimation_target);
         assert_eq!(1e-5, options.min_component_area);
+        // Shipped entry points: example.py:43 / app.py:503 pass
+        // remesh=True, remesh_band=1, remesh_project=0.
+        assert!(options.remesh);
+        assert_eq!(1.0, options.remesh_band);
+        assert_eq!(0.0, options.remesh_project);
         options.validate().expect("defaults valid");
     }
 
@@ -388,18 +483,46 @@ mod tests {
                 min_component_area: f32::NEG_INFINITY,
                 ..Trellis2MeshPostprocessOptions::default()
             },
+            Trellis2MeshPostprocessOptions {
+                remesh_band: -0.5,
+                ..Trellis2MeshPostprocessOptions::default()
+            },
+            Trellis2MeshPostprocessOptions {
+                remesh_band: f32::NAN,
+                ..Trellis2MeshPostprocessOptions::default()
+            },
+            Trellis2MeshPostprocessOptions {
+                remesh_project: f32::NAN,
+                ..Trellis2MeshPostprocessOptions::default()
+            },
+            Trellis2MeshPostprocessOptions {
+                remesh_project: f32::INFINITY,
+                ..Trellis2MeshPostprocessOptions::default()
+            },
         ] {
             options.validate().expect_err("invalid threshold rejected");
             // The same garbage values are allowed while disabled (unused).
             options.enabled = false;
             options.validate().expect("disabled skips checks");
         }
+        // Remesh parameters are unused (and unchecked) when the cleanup
+        // branch is selected.
+        Trellis2MeshPostprocessOptions {
+            remesh: false,
+            remesh_band: f32::NAN,
+            remesh_project: f32::NAN,
+            ..Trellis2MeshPostprocessOptions::default()
+        }
+        .validate()
+        .expect("remesh knobs unused in the cleanup branch");
         // Zero thresholds are the documented "off" values; decimation
-        // target 0 is the documented "skip simplification" value.
+        // target 0 is the documented "skip simplification" value; a zero
+        // remesh band is a valid (sub-cell) band.
         Trellis2MeshPostprocessOptions {
             fill_hole_perimeter: 0.0,
             min_component_area: 0.0,
             decimation_target: 0,
+            remesh_band: 0.0,
             ..Trellis2MeshPostprocessOptions::default()
         }
         .validate()
@@ -436,6 +559,7 @@ mod tests {
                     min_component_area: 0.02,
                     // Far above any face count: no decimation.
                     decimation_target: 1_000_000,
+                    remesh: false,
                     ..Trellis2MeshPostprocessOptions::default()
                 },
             )
@@ -448,12 +572,10 @@ mod tests {
 
         // Every face index is in range and the mesh validates.
         let vertex_count = output.vertex_count();
-        assert!(
-            output
-                .faces
-                .iter()
-                .all(|&i| i >= 0 && (i as usize) < vertex_count)
-        );
+        assert!(output
+            .faces
+            .iter()
+            .all(|&i| i >= 0 && (i as usize) < vertex_count));
         output.validate().expect("buffers valid");
 
         // The voxel payload, resolution and channel count pass through
@@ -477,6 +599,7 @@ mod tests {
                     fill_hole_perimeter: 4.001,
                     min_component_area: 0.02,
                     decimation_target: 8,
+                    remesh: false,
                     ..Trellis2MeshPostprocessOptions::default()
                 },
             )
@@ -487,12 +610,10 @@ mod tests {
             "decimation target respected, got {face_count}"
         );
         let vertex_count = output.vertex_count();
-        assert!(
-            output
-                .faces
-                .iter()
-                .all(|&i| i >= 0 && (i as usize) < vertex_count)
-        );
+        assert!(output
+            .faces
+            .iter()
+            .all(|&i| i >= 0 && (i as usize) < vertex_count));
         assert_eq!(None, output.vertex_colors);
     }
 
@@ -509,6 +630,7 @@ mod tests {
                     fill_hole_perimeter: 4.001,
                     min_component_area: 0.02,
                     decimation_target: 0,
+                    remesh: false,
                     ..Trellis2MeshPostprocessOptions::default()
                 },
             )
@@ -527,11 +649,9 @@ mod tests {
         let error = stage
             .postprocess_decoded_mesh(input, &Trellis2MeshPostprocessOptions::default())
             .expect_err("out-of-range face must fail");
-        assert!(
-            error
-                .to_string()
-                .contains("face index outside the vertex buffer")
-        );
+        assert!(error
+            .to_string()
+            .contains("face index outside the vertex buffer"));
     }
 
     #[test]
@@ -553,6 +673,7 @@ mod tests {
                 input.clone(),
                 &Trellis2MeshPostprocessOptions {
                     decimation_target: 1_000_000,
+                    remesh: false,
                     ..Trellis2MeshPostprocessOptions::default()
                 },
             )
@@ -575,10 +696,149 @@ mod tests {
                 &Trellis2MeshPostprocessOptions {
                     fill_hole_perimeter: 4.001,
                     decimation_target: 1_000_000,
+                    remesh: false,
                     ..Trellis2MeshPostprocessOptions::default()
                 },
             )
             .expect_err("centroid fill has no source color");
         assert!(error.to_string().contains("vertex colors"));
+    }
+
+    /// Closed cube in the canonical `[-0.5, 0.5]^3` frame the dual-grid
+    /// extraction produces (the remesh grid is centered on that AABB).
+    fn canonical_cube_input() -> Trellis2MeshBuffers {
+        let vertices: Vec<f32> = cube_vertices()
+            .chunks_exact(3)
+            .flat_map(|v| [v[0] - 0.5, v[1] - 0.5, v[2] - 0.5])
+            .collect();
+        Trellis2MeshBuffers {
+            resolution: 16,
+            vertices,
+            faces: cube_faces(),
+            voxel_coords: vec![0, 0, 0],
+            voxel_attrs: vec![0.5; 7],
+            voxel_attr_channels: 7,
+            vertex_colors: None,
+        }
+    }
+
+    /// Every undirected triangle edge must be used exactly twice (closed,
+    /// manifold surface).
+    fn assert_closed_triangle_mesh(mesh: &Trellis2MeshBuffers) {
+        use std::collections::HashMap;
+        let mut edges: HashMap<(u32, u32), u32> = HashMap::new();
+        for face in mesh.faces.chunks_exact(3) {
+            let (a, b, c) = (face[0] as u32, face[1] as u32, face[2] as u32);
+            for (u, v) in [(a, b), (b, c), (c, a)] {
+                let key = (u.min(v), u.max(v));
+                *edges.entry(key).or_insert(0) += 1;
+            }
+        }
+        assert!(!edges.is_empty(), "mesh has no edges");
+        for (edge, count) in edges {
+            assert_eq!(2, count, "edge {edge:?} used {count} times");
+        }
+    }
+
+    /// Default branch (remesh) rebuilds the topology: the output vertex /
+    /// face counts differ from the input, the surface stays closed and the
+    /// voxel payload passes through untouched.
+    #[test]
+    fn trellis2_remesh_branch_rebuilds_topology_and_stays_closed() {
+        let stage = Trellis2GeometryStage;
+        let input = canonical_cube_input();
+        let options = Trellis2MeshPostprocessOptions {
+            // Keep every remeshed triangle (no simplification) so the
+            // watertight quad-derived surface is observable.
+            decimation_target: 0,
+            ..Trellis2MeshPostprocessOptions::default()
+        };
+        assert!(options.remesh, "shipped default is remesh on");
+        let output = stage
+            .postprocess_decoded_mesh(input.clone(), &options)
+            .expect("remesh postprocess");
+
+        assert_ne!(input.face_count(), output.face_count());
+        assert_ne!(input.vertex_count(), output.vertex_count());
+        assert!(output.face_count() > 0);
+        assert_eq!(0, output.faces.len() % 3);
+        assert!(output
+            .faces
+            .iter()
+            .all(|&i| i >= 0 && (i as usize) < output.vertex_count()));
+        assert_closed_triangle_mesh(&output);
+        output.validate().expect("buffers valid");
+
+        // Voxel payload, resolution and channel count are untouched.
+        assert_eq!(input.resolution, output.resolution);
+        assert_eq!(input.voxel_coords, output.voxel_coords);
+        assert_eq!(input.voxel_attrs, output.voxel_attrs);
+        assert_eq!(input.voxel_attr_channels, output.voxel_attr_channels);
+        assert_eq!(None, output.vertex_colors);
+    }
+
+    /// `remesh = false` is the pre-remesh-port pipeline, byte-for-byte:
+    /// the same `mesh_ops::postprocess_mesh` call the old code made.
+    #[test]
+    fn trellis2_no_remesh_branch_is_byte_identical_to_cleanup_pipeline() {
+        let stage = Trellis2GeometryStage;
+        let input = holey_cube_with_tiny_component();
+        let options = Trellis2MeshPostprocessOptions {
+            fill_hole_perimeter: 4.001,
+            min_component_area: 0.02,
+            decimation_target: 32,
+            remesh: false,
+            ..Trellis2MeshPostprocessOptions::default()
+        };
+        let output = stage
+            .postprocess_decoded_mesh(input.clone(), &options)
+            .expect("cleanup postprocess");
+
+        let faces_u32: Vec<u32> = input.faces.iter().map(|&i| i as u32).collect();
+        let expected = postprocess_mesh(
+            &input.vertices,
+            &faces_u32,
+            options.fill_hole_perimeter,
+            options.decimation_target,
+            options.min_component_area,
+        );
+        let expected_faces: Vec<i64> = expected.faces.iter().map(|&i| i as i64).collect();
+        assert_eq!(expected.vertices, output.vertices);
+        assert_eq!(expected_faces, output.faces);
+    }
+
+    /// The remesh branch feeds the remeshed surface through a single
+    /// simplify pass toward `decimation_target`.
+    #[test]
+    fn trellis2_remesh_branch_respects_decimation_target() {
+        let stage = Trellis2GeometryStage;
+        let output = stage
+            .postprocess_decoded_mesh(
+                canonical_cube_input(),
+                &Trellis2MeshPostprocessOptions {
+                    decimation_target: 8,
+                    ..Trellis2MeshPostprocessOptions::default()
+                },
+            )
+            .expect("remesh with decimation");
+        let face_count = output.face_count();
+        assert!(
+            face_count > 0 && face_count <= 8,
+            "decimation target respected, got {face_count}"
+        );
+        assert_eq!(None, output.vertex_colors);
+    }
+
+    /// Remesh replaces every vertex, so pre-attached colors have no remap
+    /// source: the call fails descriptively instead of guessing.
+    #[test]
+    fn trellis2_remesh_branch_rejects_pre_attached_colors() {
+        let stage = Trellis2GeometryStage;
+        let mut input = canonical_cube_input();
+        input.vertex_colors = Some(vec![0.5; input.vertex_count() * 3]);
+        let error = stage
+            .postprocess_decoded_mesh(input, &Trellis2MeshPostprocessOptions::default())
+            .expect_err("remesh cannot remap vertex colors");
+        assert!(error.to_string().contains("remesh rebuilds the topology"));
     }
 }
