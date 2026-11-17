@@ -26,6 +26,7 @@ ENV/
 
 # Agent / swarm orchestration logs and inference outputs
 /.swarm/
+/out/
 
 # Logs
 *.log
