@@ -229,6 +229,14 @@ impl SparseConvIndices {
 }
 
 impl SparseConv3d {
+    /// Test-only view of the per-offset kernels (`[Cin, Cout]`, index
+    /// `k = kd*9 + kh*3 + kw`). Hidden from docs; the integration tests use it
+    /// to pin the flex_gemm loader transpose.
+    #[doc(hidden)]
+    pub fn kernels_for_test(&self) -> &[Tensor] {
+        &self.kernels
+    }
+
     /// Load from a VarBuilder rooted at the conv tensors. The checkpoint
     /// stores `weight` as `[Cout, kd, kh, kw, Cin]` (flex_gemm layout); it is
     /// transposed into `[27, Cout, Cin]` in F32.

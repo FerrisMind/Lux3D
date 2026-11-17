@@ -285,16 +285,18 @@ fn sparse_conv_loader_transposes_flex_gemm_layout() {
         &Device::Cpu,
     );
     let conv = SparseConv3d::load(vb, CIN, COUT, false).expect("load");
-    let w27 = conv.weight27().to_vec3::<f32>().expect("w27");
-    assert_eq!(w27.len(), 27);
+    let kernels = conv.kernels_for_test();
+    assert_eq!(kernels.len(), 27);
     for k in 0..27 {
         let kd = k / 9;
         let kh = (k % 9) / 3;
         let kw = k % 3;
+        // The loader stores each offset as `[Cin, Cout]`.
+        let w = kernels[k].to_vec2::<f32>().expect("kernel");
         for o in 0..COUT {
             for c in 0..CIN {
                 let expected = values[(o * 27 + kd * 9 + kh * 3 + kw) * CIN + c];
-                assert_eq!(w27[k][o][c], expected, "k={k} o={o} c={c}");
+                assert_eq!(w[c][o], expected, "k={k} o={o} c={c}");
             }
         }
     }
