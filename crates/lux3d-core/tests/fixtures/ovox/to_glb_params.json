@@ -1,0 +1,62 @@
+{
+ "generator": "scripts/generate_ovox_to_glb_fixture.py",
+ "official_function": "o_voxel.postprocess.to_glb",
+ "official_lines": "postprocess.py:278-336 (material assembly) and 100-336",
+ "remesh": false,
+ "decimation_target": 1000,
+ "texture_size": 64,
+ "grid_size": [
+  8,
+  8,
+  8
+ ],
+ "attr_schema": [
+  [
+   "base_color",
+   3
+  ],
+  [
+   "metallic",
+   1
+  ],
+  [
+   "roughness",
+   1
+  ],
+  [
+   "alpha",
+   1
+  ]
+ ],
+ "attr_seed": 20261118,
+ "aabb": [
+  [
+   -0.5,
+   -0.5,
+   -0.5
+  ],
+  [
+   0.5,
+   0.5,
+   0.5
+  ]
+ ],
+ "attr_volume_sha256": "f1f487793377d327b09f048eb6cb011e91c19cee4a4264cfe037086064ec129d",
+ "output_vertices": 24,
+ "output_faces": 12,
+ "base_color_texture_size": [
+  64,
+  64
+ ],
+ "metallic_roughness_texture_size": [
+  64,
+  64
+ ],
+ "base_color_mode": "RGBA",
+ "metallic_roughness_mode": "RGB",
+ "double_sided": true,
+ "alpha_mode": "OPAQUE",
+ "glb_bytes": 21664,
+ "glb_sha256": "42f12c0af65ccb73be5e10322f2701290cf44e7236f87c60f87432d8ddc621c0",
+ "torch_version": "2.5.1+cu124"
+}
