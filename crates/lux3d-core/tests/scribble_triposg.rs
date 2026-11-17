@@ -1,14 +1,16 @@
 //! TripoSG-scribble tests: CLIP tokenizer goldens generated with the official
-//! `transformers.CLIPTokenizer` from the checkpoint tokenizer files, the CLIP
-//! text encoder `last_hidden_state` shape, and an opt-in CUDA end-to-end
+//! `transformers.CLIPTokenizer` from the checkpoint tokenizer files, a CLIP
+//! text encoder `last_hidden_state` numeric golden generated with PyTorch
+//! (`transformers.CLIPTextModelWithProjection`), and an opt-in CUDA end-to-end
 //! scribble -> GLB run against the locally downloaded
 //! `VAST-AI/TripoSG-scribble` checkpoint.
 //!
 //! Weights are looked up in `LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR` first, then
-//! `<workspace>/candle-3d/models/TripoSG-scribble`. The tokenizer/encoder
-//! tests skip when the checkpoint is absent; the e2e test is additionally
-//! gated behind `LUX3D_TRIPOSG_SCRIBBLE_E2E=1` because it runs the full
-//! 16-step DiT and the dense/hierarchical SDF decode on a GPU.
+//! `<workspace>/candle-3d/models/TripoSG-scribble`. The tokenizer test skips
+//! when the checkpoint is absent; the CLIP numeric test is `#[ignore]`d so CI
+//! reports "not run" instead of a silent pass, and the e2e test is additionally
+//! gated behind `LUX3D_TRIPOSG_SCRIBBLE_E2E=1` because it runs the full 16-step
+//! DiT and the dense/hierarchical SDF decode on a GPU.
 
 use std::path::PathBuf;
 
@@ -94,20 +96,28 @@ fn tokenizer_matches_python_clip_goldens() {
 /// `CLIPTextModelWithProjection(input_ids).last_hidden_state` is the
 /// PRE-projection `[1, 77, 768]` sequence (the scribble DiT consumes it as
 /// `encoder_hidden_states`).
+///
+/// Reference values were generated with PyTorch 2.5.1+cu124 / transformers
+/// 5.17.0 on the checkpoint's `text_encoder` weights, feeding the padded
+/// tokenizer ids for `a photo of a cat` (the first tokenizer golden above) with
+/// no attention mask, matching the official pipeline call
+/// (`pipeline_triposg_scribble.py`: `self.text_encoder(input_ids).last_hidden_state`).
+/// This catches a wrong activation (GELU instead of QuickGELU), a missing final
+/// layer norm, or accidentally consuming the pooled/projected output, none of
+/// which the old shape/finiteness assertions could detect.
 #[test]
-fn clip_text_encoder_returns_pre_projection_last_hidden_state() {
-    let Some(dir) = scribble_model_dir() else {
-        eprintln!("skipping CLIP text encoder test: TripoSG-scribble checkpoint not found");
-        return;
-    };
+#[ignore = "requires the VAST-AI/TripoSG-scribble checkpoint; run with --ignored"]
+fn clip_text_encoder_matches_python_last_hidden_state_golden() {
+    let dir = scribble_model_dir().expect(
+        "TripoSG-scribble checkpoint is required; set LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR or \
+         download models/TripoSG-scribble",
+    );
     let weights = dir.join("text_encoder").join("model.safetensors");
-    if !weights.is_file() {
-        eprintln!(
-            "skipping CLIP text encoder test: {} missing",
-            weights.display()
-        );
-        return;
-    }
+    assert!(
+        weights.is_file(),
+        "missing CLIP text encoder weights at {}",
+        weights.display()
+    );
     let device = Device::Cpu;
     let config: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(dir.join("text_encoder").join("config.json"))
@@ -145,6 +155,43 @@ fn clip_text_encoder_returns_pre_projection_last_hidden_state() {
     assert!(
         values.iter().any(|value| value.abs() > 1e-6),
         "text embeddings must not be all zero"
+    );
+
+    // Tolerance covers f32 reduction-order differences between candle and
+    // torch; observed deltas are far below this on CPU.
+    const TOLERANCE: f32 = 1e-4;
+    const MAX_ABS: f32 = 33.063_736;
+    const MEAN: f32 = -0.108_589_254;
+    // (row, col, PyTorch `last_hidden_state[0, row, col]`).
+    const GOLDEN: [(usize, usize, f32); 8] = [
+        (0, 0, -0.388_473_36),
+        (0, 1, 0.022_983_685),
+        (0, 2, -0.052_085_698),
+        (0, 383, -0.093_034_707),
+        (0, 767, 0.067_426_153),
+        (1, 0, 0.029_088_616),
+        (6, 100, -1.101_109_3),
+        (76, 767, -0.685_138_4),
+    ];
+    for (row, col, expected) in GOLDEN {
+        let actual = values[row * 768 + col];
+        assert!(
+            (actual - expected).abs() <= TOLERANCE,
+            "last_hidden_state[{row}, {col}] = {actual}, expected {expected} \
+             (|delta| <= {TOLERANCE})"
+        );
+    }
+    let max_abs = values
+        .iter()
+        .fold(0.0_f32, |maximum, value| maximum.max(value.abs()));
+    assert!(
+        (max_abs - MAX_ABS).abs() <= TOLERANCE,
+        "last_hidden_state max |v| = {max_abs}, expected {MAX_ABS}"
+    );
+    let mean = values.iter().sum::<f32>() / values.len() as f32;
+    assert!(
+        (mean - MEAN).abs() <= TOLERANCE,
+        "last_hidden_state mean = {mean}, expected {MEAN}"
     );
 }
 

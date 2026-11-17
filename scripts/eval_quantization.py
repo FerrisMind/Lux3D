@@ -51,6 +51,15 @@ Examples:
       --source assets/example_scribble_data/cat_with_wings.png --device cuda \
       --output-dir out/eval-scribble -- \
       --mode scribble --prompt "a cat with wings"
+
+Scribble reference safety:
+  The TripoSG-scribble loader prefers a sibling `transformer/model.gguf` over
+  `transformer/diffusion_pytorch_model.safetensors`. Because the documented
+  quantize command writes that sibling inside the raw checkpoint, a scribble
+  eval would silently compare a quantized artifact against itself and report
+  near-zero drift. This script therefore refuses a `--reference` directory
+  containing `transformer/model.gguf` unless `--allow-reference-gguf` is
+  passed. Use a pristine checkpoint copy (or move the GGUF out) instead.
 """
 
 from __future__ import annotations
@@ -164,8 +173,20 @@ def main() -> int:
             "TripoSG-scribble eval: `--reference` is the raw checkpoint directory and "
             "every `--variant NAME=PATH` is a standalone quantized DiT `.gguf`. The "
             "reference directory is exported as LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR so the "
-            "variant runs find the float text encoder/VAE/DINOv2 weights. Pass "
+            "variant runs find the float text encoder/VAE/DINOv2 weights. The reference "
+            "must not contain `transformer/model.gguf` (the loader prefers it over the "
+            "float safetensors shard); see --allow-reference-gguf. Pass "
             "`-- --mode scribble --prompt <text>` for the run flags."
+        ),
+    )
+    parser.add_argument(
+        "--allow-reference-gguf",
+        action="store_true",
+        help=(
+            "Allow the scribble --reference directory to contain "
+            "`transformer/model.gguf`. Off by default: the loader would prefer that "
+            "sibling GGUF over the float DiT safetensors, making the drift table a "
+            "quantized-vs-quantized comparison."
         ),
     )
     # Model-specific `run` flags (steps, tokens, octree depth, RMBG path, ...)
@@ -174,11 +195,23 @@ def main() -> int:
     args, extra = parser.parse_known_args()
 
     extra = [item for item in extra if item != "--"]
+    if args.allow_reference_gguf and not args.scribble:
+        parser.error("--allow-reference-gguf is only valid with --scribble")
     if args.scribble:
         if args.family != "triposg":
             parser.error("--scribble is only valid with the `triposg` family")
         if not args.reference.is_dir():
             parser.error("--scribble expects --reference to be the raw checkpoint directory")
+        reference_gguf = args.reference / "transformer" / "model.gguf"
+        if reference_gguf.is_file() and not args.allow_reference_gguf:
+            parser.error(
+                f"{reference_gguf} exists. The TripoSG-scribble loader prefers a sibling "
+                "transformer/model.gguf over transformer/diffusion_pytorch_model.safetensors, "
+                "so the reference run would use the quantized DiT and the drift table would "
+                "compare quantized-vs-quantized. Move the GGUF out of the reference "
+                "directory, point --reference at a pristine float checkpoint, or pass "
+                "--allow-reference-gguf if a quantized reference is really intended."
+            )
         os.environ["LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR"] = str(args.reference)
     out_dir = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)

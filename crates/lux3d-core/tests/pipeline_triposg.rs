@@ -1027,6 +1027,239 @@ fn triposg_golden_pipeline_from_path_cuda() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// 5. Batched generation e2e (opt-in CUDA, TS3 contract)
+// ---------------------------------------------------------------------------
+
+fn cpu_f32_values(tensor: &Tensor) -> Vec<f32> {
+    tensor
+        .to_device(&Device::Cpu)
+        .expect("tensor to cpu")
+        .flatten_all()
+        .expect("flatten")
+        .to_vec1::<f32>()
+        .expect("f32 values")
+}
+
+fn cpu_i64_values(tensor: &Tensor) -> Vec<i64> {
+    tensor
+        .to_device(&Device::Cpu)
+        .expect("tensor to cpu")
+        .flatten_all()
+        .expect("flatten")
+        .to_vec1::<i64>()
+        .expect("i64 values")
+}
+
+fn element_max_delta(left: &[f32], right: &[f32]) -> f32 {
+    assert_eq!(left.len(), right.len(), "tensor element count mismatch");
+    left.iter()
+        .zip(right)
+        .fold(0.0_f32, |maximum, (left, right)| {
+            maximum.max((left - right).abs())
+        })
+}
+
+/// Opt-in CUDA batch > 1 e2e for the TS3 contract: two sources x two shapes
+/// -> four meshes in image-major batch order, plus batch=1 equivalence with
+/// the historical single-source path.
+///
+/// Gating (never silently skipped):
+/// - `LUX3D_TRIPOSG_BATCH_E2E=1` must be set (the batched DiT + per-sample
+///   decode is GPU-only in practice);
+/// - the canonical TripoSG package and the canonical RMBG package (needed for
+///   the RGB-only second source) must exist;
+/// - a CUDA device must be available.
+///
+/// Run with:
+/// ```text
+/// LUX3D_TRIPOSG_BATCH_E2E=1 cargo test -p lux3d-core --features cuda \
+///   --test pipeline_triposg -- --test-threads=1 triposg_batch_two_sources_two_shapes_cuda
+/// ```
+#[test]
+fn triposg_batch_two_sources_two_shapes_cuda() {
+    let label = "TripoSG batch e2e (2 sources x 2 shapes, CUDA)";
+    if !std::env::var("LUX3D_TRIPOSG_BATCH_E2E")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+    {
+        eprintln!("SKIP {label}: set LUX3D_TRIPOSG_BATCH_E2E=1 to run it");
+        return;
+    }
+    let options_weights = model_asset_options(ModelFamily::TripoSg);
+    let canonical_dir = options_weights
+        .canonical_dir
+        .clone()
+        .expect("model_asset_options always sets the canonical dir");
+    if !canonical_dir.join("model.safetensors").is_file() {
+        eprintln!(
+            "SKIP {label}: canonical TripoSG weights are missing at {}",
+            canonical_dir.display()
+        );
+        return;
+    }
+    let rmbg_dir = runtime_root()
+        .join("3d")
+        .join("canonical-weights")
+        .join("rmbg-1.4");
+    if !rmbg_dir.join("model.safetensors").is_file() {
+        eprintln!(
+            "SKIP {label}: canonical RMBG weights are missing at {}",
+            rmbg_dir.display()
+        );
+        return;
+    }
+    let sources = vec![
+        repo_root().join("test-assets").join("mesh-input.png"),
+        repo_root().join("test-assets").join("mesh-input-rgb.png"),
+    ];
+    for source in &sources {
+        assert!(source.is_file(), "missing {}", source.display());
+    }
+    let _guard = match GpuTestLock::acquire() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("SKIP {label}: GPU test lock unavailable: {error}");
+            return;
+        }
+    };
+    let device = match Device::new_cuda(0) {
+        Ok(device) => device,
+        Err(error) => {
+            eprintln!("SKIP {label}: no CUDA device available ({error})");
+            return;
+        }
+    };
+
+    let load_started = Instant::now();
+    let pipeline =
+        TripoSgPipeline::load_with_rmbg_and_dtype(options_weights, Some(rmbg_dir), DType::F16)
+            .expect("TripoSG pipeline load");
+    eprintln!("[batch e2e] load: {:?}", load_started.elapsed());
+
+    // Cheap but real settings (matching the TS3 e2e): f16, 4 steps, dense
+    // depth 5, flash off. Two steps left one of the four samples empty, so the
+    // opt-in test uses four to keep every decoded mesh non-empty.
+    let options = TripoSgRunOptions {
+        steps: 4,
+        guidance_scale: 7.0,
+        seed: 42,
+        num_tokens: 512,
+        dense_octree_depth: 6,
+        hierarchical_octree_depth: 6,
+        use_flash_decoder: false,
+        flash_octree_depth: 5,
+        query_chunk_size: 4096,
+        timesteps: None,
+        bounds: None,
+        faces: None,
+    };
+
+    let infer_started = Instant::now();
+    let output = pipeline
+        .infer_batch_from_paths(&sources, &device, 2, &options)
+        .expect("batched TripoSG inference");
+    eprintln!("[batch e2e] infer: {:?}", infer_started.elapsed());
+    assert_eq!(output.image_embeds.dims(), [4, 257, 1024]);
+    assert_eq!(output.latents_init.dims(), [4, 512, 64]);
+    assert_eq!(output.latents.dims(), [4, 512, 64]);
+
+    // Image-major order: [A, A, B, B] conditioning rows.
+    let embeds = cpu_f32_values(&output.image_embeds);
+    let row = |index: usize| embeds[index * 257 * 1024..(index + 1) * 257 * 1024].to_vec();
+    assert_eq!(row(0), row(1), "source A must occupy rows 0 and 1");
+    assert_eq!(row(2), row(3), "source B must occupy rows 2 and 3");
+    assert_ne!(
+        row(0),
+        row(2),
+        "different sources must produce different conditioning"
+    );
+
+    // Map the expanded rows back to the sources: row 0 must match image A's
+    // standalone embeds far better than row 2 does.
+    let prepared_a = pipeline
+        .prepare_inputs_from_path(&sources[0], &device)
+        .expect("prepare source A");
+    let embeds_a = cpu_f32_values(
+        &pipeline
+            .image_embeds(&prepared_a.pixel_values)
+            .expect("source A embeds"),
+    );
+    let delta_a = element_max_delta(&row(0), &embeds_a);
+    let delta_b = element_max_delta(&row(2), &embeds_a);
+    eprintln!("[batch e2e] image-major max delta: A={delta_a}, B={delta_b}");
+    assert!(
+        delta_a < delta_b,
+        "row 0 must track source A (delta {delta_a}) better than row 2 (delta {delta_b})"
+    );
+
+    let mesh_started = Instant::now();
+    let meshes = pipeline
+        .extract_meshes(&output.latents, &options)
+        .expect("batched TripoSG mesh extraction");
+    eprintln!("[batch e2e] meshes: {:?}", mesh_started.elapsed());
+    assert_eq!(meshes.len(), 4, "2 sources x 2 shapes must decode 4 meshes");
+    for (index, mesh) in meshes.iter().enumerate() {
+        let vertex_count = mesh.vertices.dims()[0];
+        let face_count = mesh.faces.dims()[0];
+        eprintln!("[batch e2e] mesh {index}: {vertex_count} vertices, {face_count} faces");
+        assert!(vertex_count > 0, "mesh {index} must have vertices");
+        assert!(face_count > 0, "mesh {index} must have faces");
+        let vertices = cpu_f32_values(&mesh.vertices);
+        assert!(
+            vertices.iter().all(|value| value.is_finite()),
+            "mesh {index} vertices must be finite"
+        );
+        assert!(
+            vertices.iter().all(|value| value.abs() <= 1.0051),
+            "mesh {index} vertices must stay inside the canonical +/-1.005 bounds"
+        );
+        let faces = cpu_i64_values(&mesh.faces);
+        assert!(
+            faces
+                .iter()
+                .all(|&vertex| vertex >= 0 && (vertex as usize) < vertex_count),
+            "mesh {index} face indices must reference existing vertices"
+        );
+    }
+
+    // Batch=1 equivalence: the single-source + one-shape path short-circuits
+    // to the historical `infer_from_path` and must stay byte-identical.
+    let single = pipeline
+        .infer_batch_from_paths(&sources[..1], &device, 1, &options)
+        .expect("single-source batch inference");
+    let historical = pipeline
+        .infer_from_path(&sources[0], &device, &options)
+        .expect("historical single-source inference");
+    assert_eq!(
+        cpu_f32_values(&single.latents_init),
+        cpu_f32_values(&historical.latents_init),
+        "batch=1 init latents must equal the historical path"
+    );
+    assert_eq!(
+        cpu_f32_values(&single.latents),
+        cpu_f32_values(&historical.latents),
+        "batch=1 denoised latents must equal the historical path"
+    );
+    let single_meshes = pipeline
+        .extract_meshes(&single.latents, &options)
+        .expect("batch=1 extract_meshes");
+    let historical_mesh = pipeline
+        .extract_mesh(&historical.latents, &options)
+        .expect("historical extract_mesh");
+    assert_eq!(single_meshes.len(), 1);
+    assert_eq!(
+        cpu_f32_values(&single_meshes[0].vertices),
+        cpu_f32_values(&historical_mesh.vertices),
+        "batch=1 mesh vertices must equal the historical path"
+    );
+    assert_eq!(
+        cpu_i64_values(&single_meshes[0].faces),
+        cpu_i64_values(&historical_mesh.faces),
+        "batch=1 mesh faces must equal the historical path"
+    );
+}
+
 fn max_abs_delta_stats(expected: &Tensor, actual: &Tensor) -> (f32, f32) {
     let expected = expected
         .to_dtype(DType::F32)

@@ -115,11 +115,14 @@ pub const TRIPOSG_SCRIBBLE_HIERARCHICAL_OCTREE_DEPTH: u32 = 8;
 pub const TRIPOSG_SCRIBBLE_DEFAULT_DIR: &str = "models/TripoSG-scribble";
 /// Environment override for the local scribble checkpoint directory.
 pub const TRIPOSG_SCRIBBLE_MODEL_DIR_ENV: &str = "LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR";
-/// Files the raw diffusers-style scribble checkpoint must provide.
+/// Files the raw diffusers-style scribble checkpoint must provide. When a
+/// quantized DiT GGUF is resolved (explicit `--dit-gguf` or the sibling
+/// `transformer/model.gguf`), the float DiT shard
+/// ([`TRIPOSG_SCRIBBLE_DIT_SHARD`]) is not required.
 pub const TRIPOSG_SCRIBBLE_REQUIRED_FILES: [&str; 12] = [
     "model_index.json",
     "transformer/config.json",
-    "transformer/diffusion_pytorch_model.safetensors",
+    TRIPOSG_SCRIBBLE_DIT_SHARD,
     "vae/config.json",
     "vae/diffusion_pytorch_model.safetensors",
     "image_encoder_dinov2/config.json",
@@ -130,6 +133,14 @@ pub const TRIPOSG_SCRIBBLE_REQUIRED_FILES: [&str; 12] = [
     "tokenizer/merges.txt",
     "tokenizer/tokenizer_config.json",
 ];
+
+/// Float DiT shard (3.13 GiB in the shipped checkpoint); replaced by a GGUF
+/// override when one is resolved.
+pub const TRIPOSG_SCRIBBLE_DIT_SHARD: &str = "transformer/diffusion_pytorch_model.safetensors";
+
+/// Sibling quantized DiT package preferred over the float shard by the loader
+/// (`weights quantize --scribble` default output).
+pub const TRIPOSG_SCRIBBLE_DIT_GGUF: &str = "transformer/model.gguf";
 
 /// Per-run options for the TripoSG-scribble pipeline. Defaults replicate the
 /// shipped `run_triposg_scribble` call
@@ -288,23 +299,53 @@ impl TripoSgScribbleRunOptions {
 /// Resolve the local `VAST-AI/TripoSG-scribble` checkpoint directory: an
 /// explicit path wins, then `LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR`, then
 /// [`TRIPOSG_SCRIBBLE_DEFAULT_DIR`] relative to the current directory.
+///
+/// A sibling `transformer/model.gguf` satisfies the DiT requirement, so a
+/// checkpoint whose float DiT shard was replaced by the quantized package (the
+/// documented `weights quantize --scribble` output) still resolves.
 pub fn resolve_triposg_scribble_model_dir(explicit: Option<&Path>) -> Result<PathBuf> {
-    let candidate = match explicit {
+    let candidate = scribble_model_dir_candidate(explicit);
+    if !candidate.is_dir() {
+        return Err(scribble_model_dir_missing_error());
+    }
+    // The loader prefers an explicit or sibling GGUF over the safetensors
+    // shard, so do not require the 3.13 GiB float DiT file when one exists.
+    let require_dit_safetensors = scribble_sibling_dit_gguf(&candidate).is_none();
+    resolve_scribble_model_dir_with(&candidate, require_dit_safetensors)
+}
+
+fn scribble_model_dir_missing_error() -> Lux3dError {
+    Lux3dError::InvalidInput(
+        "TripoSG scribble weights were not found; download the Hugging Face \
+         `VAST-AI/TripoSG-scribble` checkpoint and pass --model-path (or set \
+         LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR). Expected the diffusers-style directory \
+         with transformer/, vae/, image_encoder_dinov2/, text_encoder/ and tokenizer/.",
+    )
+}
+
+fn scribble_model_dir_candidate(explicit: Option<&Path>) -> PathBuf {
+    match explicit {
         Some(path) => path.to_path_buf(),
         None => std::env::var_os(TRIPOSG_SCRIBBLE_MODEL_DIR_ENV)
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(TRIPOSG_SCRIBBLE_DEFAULT_DIR)),
-    };
-    if !candidate.is_dir() {
-        return Err(Lux3dError::InvalidInput(
-            "TripoSG scribble weights were not found; download the Hugging Face \
-             `VAST-AI/TripoSG-scribble` checkpoint and pass --model-path (or set \
-             LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR). Expected the diffusers-style directory \
-             with transformer/, vae/, image_encoder_dinov2/, text_encoder/ and tokenizer/.",
-        ));
     }
+}
+
+fn scribble_sibling_dit_gguf(dir: &Path) -> Option<PathBuf> {
+    let sibling = dir.join(TRIPOSG_SCRIBBLE_DIT_GGUF);
+    sibling.is_file().then_some(sibling)
+}
+
+/// Validate a resolved scribble checkpoint directory. `require_dit_safetensors`
+/// is false when an explicit or sibling GGUF supplies the DiT weights.
+fn resolve_scribble_model_dir_with(
+    candidate: &Path,
+    require_dit_safetensors: bool,
+) -> Result<PathBuf> {
     let missing = TRIPOSG_SCRIBBLE_REQUIRED_FILES
         .iter()
+        .filter(|relative| require_dit_safetensors || **relative != TRIPOSG_SCRIBBLE_DIT_SHARD)
         .map(|relative| candidate.join(relative))
         .filter(|path| !path.is_file())
         .collect::<Vec<_>>();
@@ -321,7 +362,7 @@ pub fn resolve_triposg_scribble_model_dir(explicit: Option<&Path>) -> Result<Pat
             ),
         });
     }
-    Ok(candidate)
+    Ok(candidate.to_path_buf())
 }
 
 /// Surface points the reference `load_surface` draws before encoding
@@ -332,25 +373,31 @@ pub(crate) const TRIPOSG_SURFACE_POINT_COUNT: usize = 204_800;
 /// Deterministic surface-point subset selection for `--surface-input`.
 ///
 /// The reference `load_surface` draws `num_pc` indices with
-/// `np.random.default_rng().choice(n, num_pc, replace=False)`. Lux3D replaces
-/// that draw with the documented SplitMix64 RNG (same distribution, not
-/// draw-identical). Inputs smaller than `count` (test fixtures) are upsampled
-/// with replacement instead of raising like the reference, because the
-/// shipped demo is the only 204800-point file.
-fn surface_selection_indices(total: usize, count: usize, seed: u64) -> Vec<usize> {
-    let mut rng = SeededNormalRng::new(seed);
-    if total >= count {
-        // Partial Fisher-Yates: `count` uniform draws without replacement.
-        let mut pool: Vec<usize> = (0..total).collect();
-        for index in 0..count {
-            let swap = index + rng.next_index(total - index);
-            pool.swap(index, swap);
-        }
-        pool.truncate(count);
-        pool
-    } else {
-        (0..count).map(|_| rng.next_index(total)).collect()
+/// `np.random.default_rng().choice(n, num_pc, replace=False)`, which raises
+/// when the input has fewer than `num_pc` points. Lux3D replaces that draw
+/// with the documented SplitMix64 RNG (same distribution, not
+/// draw-identical) and mirrors the reference precondition: inputs with fewer
+/// than `count` points are rejected instead of being silently upsampled with
+/// replacement.
+fn surface_selection_indices(total: usize, count: usize, seed: u64) -> Result<Vec<usize>> {
+    if total < count {
+        return Err(Lux3dError::CanonicalWeightsValidation {
+            message: format!(
+                "TripoSG surface input contains {total} points, but at least {count} are \
+                 required (the reference num_pc = {TRIPOSG_SURFACE_POINT_COUNT} samples \
+                 without replacement and cannot upsample a smaller input)"
+            ),
+        });
     }
+    let mut rng = SeededNormalRng::new(seed);
+    // Partial Fisher-Yates: `count` uniform draws without replacement.
+    let mut pool: Vec<usize> = (0..total).collect();
+    for index in 0..count {
+        let swap = index + rng.next_index(total - index);
+        pool.swap(index, swap);
+    }
+    pool.truncate(count);
+    Ok(pool)
 }
 
 /// Per-run options for the TripoSG pipeline. Defaults replicate the reference
@@ -891,10 +938,7 @@ fn scribble_dit_var_builder(
 ) -> Result<VarBuilder<'static>> {
     let gguf_path = match dit_gguf {
         Some(path) => Some(path.to_path_buf()),
-        None => {
-            let sibling = dir.join("transformer").join("model.gguf");
-            sibling.is_file().then_some(sibling)
-        }
+        None => scribble_sibling_dit_gguf(dir),
     };
     if let Some(path) = gguf_path {
         return VarBuilder::from_gguf(&path, dtype, device).map_err(|source| {
@@ -906,17 +950,13 @@ fn scribble_dit_var_builder(
             }
         });
     }
-    raw_safetensors_var_builder(
-        dir,
-        "transformer/diffusion_pytorch_model.safetensors",
-        dtype,
-        device,
-    )
+    raw_safetensors_var_builder(dir, TRIPOSG_SCRIBBLE_DIT_SHARD, dtype, device)
 }
 
 /// Resolve a scribble run source: a raw checkpoint directory, or a standalone
 /// DiT `.gguf` (the remaining weights then come from
-/// [`TRIPOSG_SCRIBBLE_MODEL_DIR_ENV`]/[`TRIPOSG_SCRIBBLE_DEFAULT_DIR`]).
+/// [`TRIPOSG_SCRIBBLE_MODEL_DIR_ENV`]/[`TRIPOSG_SCRIBBLE_DEFAULT_DIR`]). The
+/// float DiT shard is not required when the explicit GGUF supplies the DiT.
 pub fn resolve_triposg_scribble_model_source(
     explicit: Option<&Path>,
 ) -> Result<(PathBuf, Option<PathBuf>)> {
@@ -928,8 +968,12 @@ pub fn resolve_triposg_scribble_model_source(
                      pass the raw checkpoint directory or a quantized DiT `.gguf`",
                 ));
             }
+            let fallback = scribble_model_dir_candidate(None);
+            if !fallback.is_dir() {
+                return Err(scribble_model_dir_missing_error());
+            }
             return Ok((
-                resolve_triposg_scribble_model_dir(None)?,
+                resolve_scribble_model_dir_with(&fallback, false)?,
                 Some(path.to_path_buf()),
             ));
         }
@@ -973,12 +1017,19 @@ impl TripoSgScribblePipeline {
         dtype: DType,
     ) -> Result<Self> {
         let model_dir = model_dir.into();
-        let resolved = resolve_triposg_scribble_model_dir(Some(&model_dir))?;
         if let Some(path) = dit_gguf.as_ref() {
             if !path.is_file() {
                 return Err(Lux3dError::MissingCanonicalArtifact { path: path.clone() });
             }
         }
+        if !model_dir.is_dir() {
+            return Err(scribble_model_dir_missing_error());
+        }
+        // An explicit GGUF or the sibling `transformer/model.gguf` replaces the
+        // float DiT shard; every other (small) file is still required.
+        let require_dit_safetensors =
+            dit_gguf.is_none() && scribble_sibling_dit_gguf(&model_dir).is_none();
+        let resolved = resolve_scribble_model_dir_with(&model_dir, require_dit_safetensors)?;
         Ok(Self {
             model_dir: resolved,
             dit_gguf,
@@ -1600,6 +1651,11 @@ impl TripoSgPipeline {
     /// reference `num_pc = 204800` subset, run the VAE encoder and sample the
     /// latent distribution (`vae.encode(surface).latent_dist.sample()`).
     ///
+    /// Inputs with fewer than [`TRIPOSG_SURFACE_POINT_COUNT`] points are
+    /// rejected with an explicit error: the reference draws without
+    /// replacement and raises for undersized inputs, so silently duplicating
+    /// points would bias the encoded latent.
+    ///
     /// The image-to-3D preprocess, DINOv2 conditioning and denoise stages are
     /// skipped entirely; the returned latent feeds [`Self::extract_mesh`]
     /// directly. The sampled latent uses the Lux3D seeded RNG (documented RNG
@@ -1625,7 +1681,7 @@ impl TripoSgPipeline {
             ));
         }
         let indices =
-            surface_selection_indices(surface.len(), TRIPOSG_SURFACE_POINT_COUNT, options.seed);
+            surface_selection_indices(surface.len(), TRIPOSG_SURFACE_POINT_COUNT, options.seed)?;
         let mut features = Vec::with_capacity(TRIPOSG_SURFACE_POINT_COUNT * 6);
         for &index in &indices {
             let base = index * 3;
@@ -2019,16 +2075,16 @@ mod surface_selection_tests {
 
     #[test]
     fn selection_is_deterministic_and_seed_sensitive() {
-        let first = surface_selection_indices(1_000, 64, 42);
-        let second = surface_selection_indices(1_000, 64, 42);
+        let first = surface_selection_indices(1_000, 64, 42).expect("enough points");
+        let second = surface_selection_indices(1_000, 64, 42).expect("enough points");
         assert_eq!(first, second, "same seed must reproduce the subset");
-        let other = surface_selection_indices(1_000, 64, 43);
+        let other = surface_selection_indices(1_000, 64, 43).expect("enough points");
         assert_ne!(first, other, "different seeds must change the subset");
     }
 
     #[test]
     fn selection_is_without_replacement_when_enough_points() {
-        let selected = surface_selection_indices(10_000, 4_096, 7);
+        let selected = surface_selection_indices(10_000, 4_096, 7).expect("enough points");
         assert_eq!(selected.len(), 4_096);
         let mut sorted = selected.clone();
         sorted.sort_unstable();
@@ -2038,15 +2094,31 @@ mod surface_selection_tests {
     }
 
     #[test]
-    fn selection_upsamples_small_fixtures() {
-        let selected = surface_selection_indices(3, 16, 7);
-        assert_eq!(selected.len(), 16);
-        assert!(selected.iter().all(|index| *index < 3));
-        // A small pool must repeat points (with-replacement path).
+    fn selection_accepts_exactly_reference_count() {
+        let selected = surface_selection_indices(4_096, 4_096, 7).expect("exact count");
+        assert_eq!(selected.len(), 4_096);
         let mut sorted = selected;
         sorted.sort_unstable();
-        sorted.dedup();
-        assert!(sorted.len() <= 3);
+        assert_eq!(sorted, (0..4_096).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn selection_rejects_small_inputs_instead_of_upsampling() {
+        let error =
+            surface_selection_indices(3, TRIPOSG_SURFACE_POINT_COUNT, 7).expect_err("small input");
+        let message = error.to_string();
+        assert!(
+            message.contains("204800"),
+            "error must name the reference point count: {message}"
+        );
+        assert!(
+            message.contains("contains 3 points"),
+            "error must name the actual point count: {message}"
+        );
+        assert!(
+            message.contains("without replacement"),
+            "error must explain the reference sampling contract: {message}"
+        );
     }
 }
 
@@ -2263,6 +2335,76 @@ mod scribble_dit_loader_tests {
             Err(error) => error,
         };
         assert!(err.to_string().contains("missing.gguf"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Create every required scribble file except the float DiT shard.
+    fn placeholder_scribble_checkpoint_without_dit(dir: &Path) {
+        for relative in TRIPOSG_SCRIBBLE_REQUIRED_FILES {
+            if relative == TRIPOSG_SCRIBBLE_DIT_SHARD {
+                continue;
+            }
+            let path = dir.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"{}").unwrap();
+        }
+    }
+
+    #[test]
+    fn scribble_pipeline_loads_with_sibling_gguf_without_dit_safetensors() {
+        let dir = scratch_dir("gguf-sibling");
+        placeholder_scribble_checkpoint_without_dit(&dir);
+        let (source, _gguf) = tiny_transformer_checkpoint(&dir);
+        // The quantized sibling replaces the float shard: remove it and show
+        // that the checkpoint still resolves and the pipeline still loads.
+        fs::remove_file(&source).unwrap();
+
+        let resolved = resolve_triposg_scribble_model_dir(Some(&dir)).unwrap();
+        assert_eq!(resolved, dir);
+        let pipeline = TripoSgScribblePipeline::load(&dir).unwrap();
+        assert_eq!(pipeline.model_dir, dir);
+        assert!(
+            pipeline.dit_gguf.is_none(),
+            "sibling GGUF is resolved lazily by the bundle, not as an explicit override"
+        );
+
+        // Without the sibling GGUF the float DiT shard is required again.
+        fs::remove_file(dir.join(TRIPOSG_SCRIBBLE_DIT_GGUF)).unwrap();
+        let error = TripoSgScribblePipeline::load(&dir).unwrap_err();
+        assert!(
+            error.to_string().contains(TRIPOSG_SCRIBBLE_DIT_SHARD),
+            "missing DiT shard must be named when no GGUF is present: {error}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scribble_pipeline_loads_with_explicit_gguf_without_dit_safetensors() {
+        let dir = scratch_dir("gguf-explicit-standalone");
+        placeholder_scribble_checkpoint_without_dit(&dir);
+        let (source, gguf) = tiny_transformer_checkpoint(&dir);
+        let explicit = dir.join("explicit-q8_0.gguf");
+        fs::copy(&gguf, &explicit).unwrap();
+        fs::remove_file(&source).unwrap();
+        fs::remove_file(&gguf).unwrap();
+
+        let pipeline = TripoSgScribblePipeline::load_with_dit_gguf_and_dtype(
+            &dir,
+            Some(explicit.clone()),
+            DType::F32,
+        )
+        .unwrap();
+        assert_eq!(pipeline.dit_gguf.as_deref(), Some(explicit.as_path()));
+
+        // Every other small weight/config file is still enforced.
+        fs::remove_file(dir.join("tokenizer/vocab.json")).unwrap();
+        let error =
+            TripoSgScribblePipeline::load_with_dit_gguf_and_dtype(&dir, Some(explicit), DType::F32)
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("vocab.json"),
+            "non-DiT required files must still be validated: {error}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

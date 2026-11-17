@@ -413,6 +413,12 @@ enum StackItem {
     Mark,
 }
 
+/// Hard cap on memo slots for the restricted pickle reader. A NumPy surface
+/// pickle memoizes only a handful of objects (the dict, one dtype, two
+/// ndarray builders), so this is far above what a legitimate surface input
+/// needs.
+const MAX_PICKLE_MEMO_SLOTS: usize = 1 << 20;
+
 struct PickleParser<'a> {
     data: &'a [u8],
     pos: usize,
@@ -749,6 +755,19 @@ impl<'a> PickleParser<'a> {
     }
 
     fn memo_put(&mut self, index: usize) -> Result<()> {
+        // A legitimate stream can only define a memo slot by consuming at
+        // least one opcode byte, and surface pickles use a handful of slots.
+        // Rejecting absurd indices here keeps `resize(index + 1)` bounded: a
+        // 6-byte `NONE; LONG_BINPUT 0xffffffff; STOP` pickle must not be able
+        // to request a multi-gigabyte memo vector.
+        let bound = self.data.len().min(MAX_PICKLE_MEMO_SLOTS);
+        if index > bound {
+            bail!(
+                "malformed pickle: memo index {index} exceeds the allowed bound {bound} \
+                 (payload length {})",
+                self.data.len()
+            );
+        }
         let value = self.pop_value()?;
         if self.memo.len() <= index {
             self.memo.resize(index + 1, Value::None);
@@ -1531,6 +1550,50 @@ mod tests {
             "unexpected: {error}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_long_binput_memo_index_above_payload_bound() {
+        // `NONE; LONG_BINPUT 0xffffffff; STOP` used to resize the memo vector
+        // to roughly 4.3 billion `Value` slots on a 7-byte payload.
+        let mut payload = vec![b'N', b'r'];
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        payload.push(b'.');
+        let error = parse_pickle(&payload).expect_err("oversized LONG_BINPUT index");
+        let message = error.to_string();
+        assert!(
+            message.contains("memo index 4294967295"),
+            "error must name the offending index: {message}"
+        );
+        assert!(
+            message.contains("allowed bound"),
+            "error must name the enforced bound: {message}"
+        );
+        assert!(
+            message.contains("payload length"),
+            "error must tie the bound to the payload: {message}"
+        );
+    }
+
+    #[test]
+    fn rejects_binput_memo_index_above_payload_bound() {
+        // 4-byte stream: NONE, BINPUT 255, STOP.
+        let payload = vec![b'N', b'q', 0xff, b'.'];
+        let error = parse_pickle(&payload).expect_err("oversized BINPUT index");
+        assert!(
+            error.to_string().contains("memo index 255"),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_text_put_memo_index_above_payload_bound() {
+        let payload = b"Np4294967295\n.".to_vec();
+        let error = parse_pickle(&payload).expect_err("oversized PUT index");
+        assert!(
+            error.to_string().contains("memo index 4294967295"),
+            "unexpected: {error}"
+        );
     }
 
     #[test]
