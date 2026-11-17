@@ -11,8 +11,11 @@
 //!   outputs (inference tensors, tracks, exports) stay F32 exactly as in the
 //!   F32 pipeline, so no caller-side dtype handling is needed.
 //! * `preprocess_mode` — [`VggtPreprocessMode::Crop`] (upstream default,
-//!   width-518 + center crop) or [`VggtPreprocessMode::Pad`] (largest side
-//!   518, center-pad to 518x518 with white; no pixels discarded).
+//!   width-518 + center crop), [`VggtPreprocessMode::Pad`] (largest side
+//!   518, center-pad to 518x518 with white; no pixels discarded) or
+//!   [`VggtPreprocessMode::Square`] (official COLMAP demo path: black-pad to
+//!   a 1024 square, then bilinear downsample to the 518x518 model input; the
+//!   official `[x1, y1, x2, y2, width, height]` tuple is carried per frame).
 //! * `interval` — frame sampling interval (`None` = source default: 10 for
 //!   videos, 1 otherwise).
 //! * `batch_size` — sequential frame chunking (see below).
@@ -90,7 +93,8 @@ pub struct VggtRunOptions {
     /// reference mode; F16 halves weight memory. Public outputs remain F32
     /// either way. Ignored after load.
     pub dtype: Option<DType>,
-    /// Preprocess mode for [`VggtPreprocessStage::prepare_inputs_from_path_with_mode`].
+    /// Preprocess mode for [`VggtPreprocessStage::prepare_inputs_from_path_with_mode`]
+    /// (crop/pad/square; square carries the official 1024-loaded coords).
     pub preprocess_mode: VggtPreprocessMode,
     /// Frame sampling interval; `None` uses the source default (10 for
     /// videos, 1 for directories and single images).
@@ -717,7 +721,8 @@ impl VggtPipeline {
     }
 
     /// [`Self::prepare_inputs_from_path`] with an explicit preprocess mode
-    /// (crop = upstream default, pad = lossless white-padded square).
+    /// (crop = upstream default, pad = lossless white-padded square,
+    /// square = official 1024-loaded COLMAP preprocessing).
     pub fn prepare_inputs_from_path_with_mode(
         &self,
         source: &Path,
@@ -1804,6 +1809,7 @@ mod tests {
                     content_width: 518,
                     content_height: 392,
                     mode: VggtPreprocessMode::Pad,
+                    square: None,
                 })
                 .collect(),
         };

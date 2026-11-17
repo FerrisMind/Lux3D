@@ -1,11 +1,11 @@
-use candle_core::{D, DType, Device, IndexOp, Tensor};
+use candle_core::{DType, Device, IndexOp, Tensor, D};
 
 use crate::{
-    Result,
     contracts::{GeometryStage, ModelFamily, VggtPointCloud, VggtSceneCode},
     error::Lux3dError,
     preprocess::{VggtOriginalCoords, VggtPreprocessMode},
     runtime::VggtInferenceOutput,
+    Result,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -144,6 +144,13 @@ fn squeeze_leading_batch(tensor: &Tensor) -> candle_core::Result<Tensor> {
 ///   preserves the aspect ratio, so they differ only by the `/14` rounding of
 ///   the shorter side); the principal point and homogeneous row follow the
 ///   reference replacement.
+/// * Square mode (official COLMAP chain): model-input intrinsics (518 space)
+///   are first rescaled by `load_size / model_size` (the official
+///   `intrinsic[:, :2, :] *= 1024 / 518` step, `demo_colmap.py:168-169`) and
+///   then by the loaded-space ratio `max(real_w, real_h) / load_size`
+///   (`demo_colmap.py:270-272`); the principal point and homogeneous row
+///   follow the reference replacement. `img_size` is the model input size the
+///   intrinsics are expressed in.
 pub fn rescale_intrinsics_to_original(
     intrinsics: &Tensor,
     original_coords: &[VggtOriginalCoords],
@@ -179,10 +186,9 @@ fn rescale_intrinsics_to_original_inner(
         .flatten_all()?
         .to_vec1::<f64>()?;
 
-    Ok(flat
-        .chunks_exact(9)
+    flat.chunks_exact(9)
         .zip(original_coords)
-        .map(|(values, coords)| {
+        .map(|(values, coords)| -> candle_core::Result<[[f64; 3]; 3]> {
             let mut k = match coords.mode {
                 VggtPreprocessMode::Crop => {
                     let ratio = coords.resize_ratio(img_size);
@@ -210,14 +216,39 @@ fn rescale_intrinsics_to_original_inner(
                         [values[6], values[7], values[8]],
                     ]
                 }
+                // Square mode: official model(518) -> loaded(1024) -> original
+                // chain. Rows 0 and 1 are scaled by the loaded-square factor
+                // first (`intrinsic[:, :2, :] *= 1024 / 518`) and then by the
+                // official loaded-space ratio, in this order, so the rounding
+                // mirrors the reference sequence.
+                VggtPreprocessMode::Square => {
+                    let square = coords.square.ok_or_else(|| candle_core::Error::Msg(
+                        "square preprocess mode requires the official [x1, y1, x2, y2, width, height] coordinate payload".to_string(),
+                    ))?;
+                    let model_to_loaded = square.model_to_loaded_scale(img_size);
+                    let ratio = square.resize_ratio();
+                    [
+                        [
+                            values[0] * model_to_loaded * ratio,
+                            values[1] * model_to_loaded * ratio,
+                            values[2] * model_to_loaded * ratio,
+                        ],
+                        [
+                            values[3] * model_to_loaded * ratio,
+                            values[4] * model_to_loaded * ratio,
+                            values[5] * model_to_loaded * ratio,
+                        ],
+                        [values[6], values[7], values[8]],
+                    ]
+                }
             };
             let (cx, cy) = coords.original_principal_point();
             k[0][2] = cx;
             k[1][2] = cy;
             k[2] = [0.0, 0.0, 1.0];
-            k
+            Ok(k)
         })
-        .collect())
+        .collect::<candle_core::Result<Vec<_>>>()
 }
 
 /// Reference `shift_point2d_to_original_res`: shift a 2D pixel coordinate by
@@ -228,6 +259,11 @@ fn rescale_intrinsics_to_original_inner(
 ///   `max(real_w, real_h) / img_size` on both axes.
 /// * Pad mode (exact per-axis): `(x - offset_x) * real_w / content_w`,
 ///   `(y - offset_y) * real_h / content_h`.
+/// * Square mode (official COLMAP chain): the model-input pixel is first
+///   rescaled to the 1024-pixel loaded square (`x * load_size / model_size`,
+///   the official `1024 / 518` step), then shifted by the official `(x1, y1)`
+///   tuple and scaled by `max(real_w, real_h) / load_size`
+///   (`demo_colmap.py:280-285`). `img_size` is the model input size.
 pub fn shift_point2d_to_original(
     x: f64,
     y: f64,
@@ -243,6 +279,21 @@ pub fn shift_point2d_to_original(
         VggtPreprocessMode::Pad => {
             let (scale_x, scale_y) = coords.axis_scales_to_original();
             ((x - top_left_x) * scale_x, (y - top_left_y) * scale_y)
+        }
+        VggtPreprocessMode::Square => {
+            if let Some(square) = coords.square {
+                let model_to_loaded = square.model_to_loaded_scale(img_size);
+                let ratio = square.resize_ratio();
+                (
+                    (x * model_to_loaded - square.x1) * ratio,
+                    (y * model_to_loaded - square.y1) * ratio,
+                )
+            } else {
+                // Hand-built coords without the official payload: fall back to
+                // the crop-formula mapping (preprocessing always fills it).
+                let ratio = coords.resize_ratio(img_size);
+                ((x - top_left_x) * ratio, (y - top_left_y) * ratio)
+            }
         }
     }
 }
@@ -376,6 +427,7 @@ fn normalize_depth_grid(depth: &Tensor) -> candle_core::Result<Tensor> {
 #[cfg(test)]
 mod geometry_tests {
     use super::*;
+    use crate::preprocess::VggtSquareOriginalCoords;
 
     /// Synthetic pinhole roundtrip: build a depth map from known 3D world
     /// points, unproject, and expect the original world points back (<1e-5).
@@ -527,6 +579,7 @@ mod geometry_tests {
             content_width: 518,
             content_height: 392,
             mode: VggtPreprocessMode::Crop,
+            square: None,
         };
         let intrinsics = Tensor::from_vec(
             vec![
@@ -571,6 +624,7 @@ mod geometry_tests {
             content_width: 518,
             content_height: 392,
             mode: VggtPreprocessMode::Pad,
+            square: None,
         };
         let intrinsics = Tensor::from_vec(
             vec![
@@ -604,5 +658,127 @@ mod geometry_tests {
         let (sx, sy) = shift_point2d_to_original(270.0, 300.0, &coords, 518.0);
         assert!((sx - 270.0 * scale_x).abs() < 1e-9);
         assert!((sy - (300.0 - 63.0) * scale_y).abs() < 1e-9);
+    }
+
+    /// Square mode reproduces the official 518 -> 1024 -> original chain: the
+    /// model intrinsics are rescaled by `1024 / 518`, then the loaded-space
+    /// `max(w, h) / 1024` ratio is applied; 2D points first move to loaded
+    /// space, then shift by `(x1, y1)` and scale (`demo_colmap.py:168-169,
+    /// 270-285`).
+    #[test]
+    fn rescale_intrinsics_and_shift_point2d_follow_square_chain() {
+        let device = Device::Cpu;
+        // 1024x768 in square mode: max_dim 1024, top 128, scale 1.0.
+        let square = VggtSquareOriginalCoords {
+            x1: 0.0,
+            y1: 128.0,
+            x2: 1024.0,
+            y2: 896.0,
+            width: 1024,
+            height: 768,
+            load_size: 1024,
+            model_size: 518,
+        };
+        let coords = VggtOriginalCoords {
+            width: 1024,
+            height: 768,
+            offset_x: 0,
+            offset_y: 0,
+            content_width: 518,
+            content_height: 518,
+            mode: VggtPreprocessMode::Square,
+            square: Some(square),
+        };
+        let intrinsics = Tensor::from_vec(
+            vec![
+                361.0f32, 0.0, 259.0, //
+                0.0, 361.0, 259.0, //
+                0.0, 0.0, 1.0,
+            ],
+            (1, 1, 3, 3),
+            &device,
+        )
+        .expect("intrinsics");
+
+        let rescaled =
+            rescale_intrinsics_to_original(&intrinsics, &[coords], 518.0).expect("rescale");
+        let model_to_loaded = 1024.0f64 / 518.0;
+        let loaded_ratio = 1024.0f64 / 1024.0;
+        let expected = 361.0 * model_to_loaded * loaded_ratio;
+        let k = rescaled[0];
+        assert!(
+            (k[0][0] - expected).abs() < 1e-9,
+            "fx must follow the 518 -> 1024 -> original chain"
+        );
+        assert!(
+            (k[1][1] - expected).abs() < 1e-9,
+            "fy follows the same chain"
+        );
+        assert!((k[0][2] - 512.0).abs() < 1e-9, "cx must be real_w / 2");
+        assert!((k[1][2] - 384.0).abs() < 1e-9, "cy must be real_h / 2");
+        assert_eq!(k[2], [0.0, 0.0, 1.0]);
+
+        // Model input centre (259, 259) -> loaded (512, 512) -> minus (0, 128).
+        let (sx, sy) = shift_point2d_to_original(259.0, 259.0, &coords, 518.0);
+        assert!((sx - 512.0).abs() < 1e-9);
+        assert!((sy - 384.0).abs() < 1e-9);
+
+        // Missing payload is an invalid square-mode coordinate set.
+        let broken = VggtOriginalCoords {
+            square: None,
+            ..coords
+        };
+        assert!(rescale_intrinsics_to_original(&intrinsics, &[broken], 518.0).is_err());
+    }
+
+    /// Odd original sizes keep the official fractional loaded-space tuple: a
+    /// 3x2 image has `x2 = 1024`, `y2 = 2048/3`, so loaded pixels scale by
+    /// `3 / 1024` on both axes.
+    #[test]
+    fn square_shift_uses_loaded_ratio_for_odd_sizes() {
+        let device = Device::Cpu;
+        let square = VggtSquareOriginalCoords {
+            x1: 0.0,
+            y1: 0.0,
+            x2: 1024.0,
+            y2: 2048.0 / 3.0,
+            width: 3,
+            height: 2,
+            load_size: 1024,
+            model_size: 518,
+        };
+        let coords = VggtOriginalCoords {
+            width: 3,
+            height: 2,
+            offset_x: 0,
+            offset_y: 0,
+            content_width: 518,
+            content_height: 518,
+            mode: VggtPreprocessMode::Square,
+            square: Some(square),
+        };
+        let (sx, sy) = shift_point2d_to_original(259.0, 259.0, &coords, 518.0);
+        assert!((sx - 1.5).abs() < 1e-9);
+        assert!((sy - 1.5).abs() < 1e-9);
+        let (scale_x, scale_y) = square.axis_scales_to_original();
+        assert!((scale_x - 3.0 / 1024.0).abs() < 1e-12);
+        assert!((scale_y - 2.0 / (2048.0 / 3.0)).abs() < 1e-12);
+
+        let intrinsics = Tensor::from_vec(
+            vec![
+                100.0f32, 0.0, 259.0, //
+                0.0, 100.0, 259.0, //
+                0.0, 0.0, 1.0,
+            ],
+            (1, 1, 3, 3),
+            &device,
+        )
+        .expect("intrinsics");
+        let rescaled =
+            rescale_intrinsics_to_original(&intrinsics, &[coords], 518.0).expect("rescale");
+        // 100 * (1024 / 518) * (3 / 1024) == 100 * 3 / 518.
+        assert!((rescaled[0][0][0] - 100.0 * 3.0 / 518.0).abs() < 1e-9);
+        assert!((rescaled[0][0][2] - 1.5).abs() < 1e-9);
+        assert!((rescaled[0][1][2] - 1.0).abs() < 1e-9);
     }
 }

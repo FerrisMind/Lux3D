@@ -535,8 +535,9 @@ impl From<DTypeKind> for candle_core::DType {
     }
 }
 
-/// VGGT input preprocessing mode (`--preprocess-mode`); names mirror the
-/// upstream `load_and_preprocess_images` `mode` strings.
+/// VGGT input preprocessing mode (`--preprocess-mode`); `crop`/`pad` mirror
+/// the upstream `load_and_preprocess_images` `mode` strings, `square` is the
+/// official COLMAP demo's `load_and_preprocess_images_square` path.
 #[derive(Debug, Clone, Copy, Default, clap::ValueEnum, PartialEq, Eq)]
 pub enum VggtPreprocessKind {
     /// Upstream default: resize to width 518, center-crop rows taller than
@@ -546,6 +547,12 @@ pub enum VggtPreprocessKind {
     /// Lossless: resize so the largest side is 518 (aspect preserved) and
     /// center-pad to a white 518x518 square; no pixels are discarded.
     Pad,
+    /// Official `demo_colmap.py` path: black-pad to a 1024x1024 square
+    /// (integer `// 2` offsets, no pixels discarded), load at 1024, then
+    /// bilinear-downsample to the 518x518 model input; the official
+    /// `[x1, y1, x2, y2, width, height]` coordinates drive the
+    /// original-resolution export.
+    Square,
 }
 
 impl From<VggtPreprocessKind> for VggtPreprocessMode {
@@ -553,6 +560,7 @@ impl From<VggtPreprocessKind> for VggtPreprocessMode {
         match kind {
             VggtPreprocessKind::Crop => Self::Crop,
             VggtPreprocessKind::Pad => Self::Pad,
+            VggtPreprocessKind::Square => Self::Square,
         }
     }
 }
@@ -600,7 +608,7 @@ pub struct VggtRunArgs {
         long,
         value_enum,
         default_value_t = VggtPreprocessKind::Crop,
-        help = "VGGT input preprocessing (vggt only): `crop` (upstream default: width 518 + center crop, then batch white pad) or `pad` (largest side 518, center-padded white 518x518 square, no pixels discarded)."
+        help = "VGGT input preprocessing (vggt only): `crop` (upstream default: width 518 + center crop, then batch white pad), `pad` (largest side 518, center-padded white 518x518 square, no pixels discarded) or `square` (official COLMAP demo: black-pad to a 1024 square, model input is its 518x518 bilinear downsample, and the official x1/y1/x2/y2/width/height coordinates drive the original-resolution export)."
     )]
     pub preprocess_mode: VggtPreprocessKind,
 
@@ -3282,6 +3290,51 @@ mod tests {
             ],
             queries
         );
+    }
+
+    /// `--preprocess-mode square` parses, maps to the core square mode and is
+    /// rejected for the other families (it differs from the crop default).
+    #[test]
+    fn vggt_square_preprocess_mode_parses_and_maps() {
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "vggt",
+            "--source",
+            "frames",
+            "--preprocess-mode",
+            "square",
+            "--output",
+            "out.ply",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(super::VggtPreprocessKind::Square, args.vggt.preprocess_mode);
+        super::reject_unsupported_vggt_options(&args).expect("vggt accepts square");
+        let options = super::vggt_run_options_from_args(&args).expect("run options");
+        assert_eq!(
+            lux3d_core::preprocess::VggtPreprocessMode::Square,
+            options.preprocess_mode
+        );
+
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "pi3",
+            "--source",
+            "input",
+            "--preprocess-mode",
+            "square",
+            "--output",
+            "out",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        let error = super::reject_vggt_only_options(&args, args.family)
+            .expect_err("square must be rejected for pi3");
+        assert!(error.to_string().contains("--preprocess-mode"));
     }
 
     /// Defaults keep the historical behavior: f32, crop mode, a single forward

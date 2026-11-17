@@ -934,6 +934,7 @@ mod tests {
                     content_width: 4,
                     content_height: 4,
                     mode: VggtPreprocessMode::Crop,
+                    square: None,
                 },
                 VggtOriginalCoords {
                     width: 500,
@@ -943,6 +944,7 @@ mod tests {
                     content_width: 4,
                     content_height: 4,
                     mode: VggtPreprocessMode::Crop,
+                    square: None,
                 },
             ],
         };

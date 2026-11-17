@@ -15,8 +15,17 @@
 //!   tensor conversion, exactly like upstream (`F.pad(..., value=1.0)`, with
 //!   `pad_top = h_padding // 2`, `pad_left = w_padding // 2`). No pixels are
 //!   discarded in this mode.
+//! * [`VggtPreprocessMode::Square`] — the reference
+//!   `load_and_preprocess_images_square(target_size=1024)` recipe
+//!   (`vggt/utils/load_fn.py:13-94`, the COLMAP demo path): pad the shorter
+//!   side to a black `max(w, h)` square (integer `// 2` offsets), resize to
+//!   1024x1024 with Pillow bicubic, and bilinearly downsample to the 518x518
+//!   model input (`F.interpolate(..., mode="bilinear", align_corners=False)`,
+//!   `demo_colmap.py:65-72, 129-139`). No pixels are discarded. The official
+//!   `[x1, y1, x2, y2, width, height]` coordinate tuple is returned per frame
+//!   in [`VggtSquareOriginalCoords`].
 //!
-//! Both modes composite RGBA input over opaque white before the RGB conversion
+//! All modes composite RGBA input over opaque white before the RGB conversion
 //! and normalize with the ImageNet mean/std afterwards.
 //!
 //! # Original-coordinate mapping
@@ -27,6 +36,10 @@
 //! rectangle inside the prepared 518x518 frame, and per-axis scales follow the
 //! actual resize factors. Crop mode keeps the upstream uniform
 //! `max(w, h) / img_size` ratio in [`crate::geometry`] helpers for bit-parity.
+//! Square mode uses the official 1024-loaded tuple: model pixels are first
+//! rescaled by `load_size / model_size` (the official `1024 / 518` step) and
+//! the loaded-space tuple then feeds the stock
+//! `max(w, h) / load_size` ratio and `(xy - x1, y1)` shift.
 //!
 //! # Sources
 //!
@@ -50,18 +63,24 @@ use candle_core::{Device, Tensor};
 use image::{Rgb, RgbImage};
 
 use crate::{
-    Result,
     contracts::{
         ModelFamily, PreprocessStage, RgbRange, SpatialSize, VggtPreparedBatch, VggtRawInput,
     },
     error::Lux3dError,
+    Result,
 };
 
 const TARGET_WIDTH: u32 = 518;
 const PATCH_MULTIPLE: u32 = 14;
+/// Official square preprocess target (`img_load_resolution = 1024`,
+/// `demo_colmap.py:130`).
+const SQUARE_LOAD_SIZE: u32 = 1024;
+/// Official model input resolution the loaded square is downsampled to
+/// (`vggt_fixed_resolution = 518`, `demo_colmap.py:129`).
+const SQUARE_MODEL_SIZE: u32 = 518;
 
 /// VGGT input preprocessing mode (upstream `load_and_preprocess_images`
-/// `mode="crop"` / `mode="pad"`).
+/// `mode="crop"` / `mode="pad"` plus the COLMAP demo's square preprocessor).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VggtPreprocessMode {
     /// Resize to width 518, center-crop rows taller than 518, then center-pad
@@ -72,6 +91,91 @@ pub enum VggtPreprocessMode {
     /// rounded to a multiple of 14) and center-pad to 518x518 with white. No
     /// pixels are discarded.
     Pad,
+    /// Official `load_and_preprocess_images_square(target_size=1024)`: pad the
+    /// shorter side to a black `max(w, h)` square (integer `// 2` offsets),
+    /// resize to 1024x1024 with Pillow bicubic, then bilinearly downsample to
+    /// the 518x518 model input (`align_corners=False`). No pixels are
+    /// discarded; the official `[x1, y1, x2, y2, width, height]` tuple is
+    /// carried in [`VggtOriginalCoords::square`].
+    Square,
+}
+
+/// Official square-mode coordinate tuple from
+/// `load_and_preprocess_images_square` (`vggt/utils/load_fn.py:13-94`):
+/// `[x1, y1, x2, y2, width, height]`.
+///
+/// With `max_dim = max(width, height)`, integer black-pad offsets
+/// `left = (max_dim - width) // 2` and `top = (max_dim - height) // 2`, and
+/// `scale = load_size / max_dim`, the original image occupies
+/// `[x1, x2) x [y1, y2)` inside the loaded square, where
+/// `x1 = left * scale`, `y1 = top * scale`,
+/// `x2 = (left + width) * scale` and `y2 = (top + height) * scale`.
+/// The values are fractional loaded-space pixels (exactly as upstream computes
+/// them in Python).
+///
+/// The model sees the `model_size`-pixel bilinear downsample of that loaded
+/// square. Mapping a model pixel back to the original image therefore first
+/// rescales by `load_size / model_size` (official `intrinsic *= 1024 / 518`,
+/// `demo_colmap.py:168-169`) and then applies the official
+/// `resize_ratio = max(width, height) / load_size` and the `(xy - top_left)`
+/// shift (`demo_colmap.py:254-292`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VggtSquareOriginalCoords {
+    /// Left edge of the original content inside the loaded square.
+    pub x1: f64,
+    /// Top edge of the original content inside the loaded square.
+    pub y1: f64,
+    /// Right edge of the original content inside the loaded square.
+    pub x2: f64,
+    /// Bottom edge of the original content inside the loaded square.
+    pub y2: f64,
+    /// Original image width in pixels.
+    pub width: u32,
+    /// Original image height in pixels.
+    pub height: u32,
+    /// Loaded square size (`img_load_resolution`, 1024).
+    pub load_size: u32,
+    /// Model input size the loaded square is downsampled to
+    /// (`vggt_fixed_resolution`, 518).
+    pub model_size: u32,
+}
+
+impl VggtSquareOriginalCoords {
+    /// Official `resize_ratio = max(real_image_size) / img_size` with
+    /// `img_size` = the loaded square size (`demo_colmap.py:270-272`).
+    pub fn resize_ratio(&self) -> f64 {
+        if self.load_size == 0 {
+            return 0.0;
+        }
+        f64::from(self.width.max(self.height)) / f64::from(self.load_size)
+    }
+
+    /// Model-input pixel -> loaded-square pixel scale (`load_size / size`).
+    /// A non-positive `size` yields `0.0` instead of a division by zero.
+    pub fn model_to_loaded_scale(&self, model_size: f64) -> f64 {
+        if model_size <= 0.0 {
+            return 0.0;
+        }
+        f64::from(self.load_size) / model_size
+    }
+
+    /// Loaded-square -> original pixel scale per axis
+    /// `(width / (x2 - x1), height / (y2 - y1))`.
+    pub fn axis_scales_to_original(&self) -> (f64, f64) {
+        let span_x = self.x2 - self.x1;
+        let span_y = self.y2 - self.y1;
+        let scale_x = if span_x == 0.0 {
+            0.0
+        } else {
+            f64::from(self.width) / span_x
+        };
+        let scale_y = if span_y == 0.0 {
+            0.0
+        } else {
+            f64::from(self.height) / span_y
+        };
+        (scale_x, scale_y)
+    }
 }
 
 /// Per-frame mapping from the prepared (padded) VGGT frame back to the original
@@ -93,7 +197,7 @@ pub enum VggtPreprocessMode {
 /// helper, while [`VggtOriginalCoords::axis_scales_to_original`] gives the
 /// exact per-axis factors and matches what the crop recipe actually does per
 /// axis.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VggtOriginalCoords {
     /// Original image width in pixels.
     pub width: u32,
@@ -119,6 +223,10 @@ pub struct VggtOriginalCoords {
     /// geometry helpers pick the exact per-axis mapping (pad) or the reference
     /// uniform ratio (crop).
     pub mode: VggtPreprocessMode,
+    /// Official square-mode `[x1, y1, x2, y2, width, height]` payload; `Some`
+    /// exactly when `mode == VggtPreprocessMode::Square` (see
+    /// [`VggtSquareOriginalCoords`]). Crop/pad frames keep `None`.
+    pub square: Option<VggtSquareOriginalCoords>,
 }
 
 impl VggtOriginalCoords {
@@ -128,7 +236,14 @@ impl VggtOriginalCoords {
     /// This is the *crop-formula* compatibility helper: upstream applies it to
     /// both axes even in crop mode where the vertical scale actually differs.
     /// For the exact per-axis factors use [`VggtOriginalCoords::axis_scales_to_original`].
+    /// Square mode returns the official loaded-space ratio
+    /// `max(width, height) / load_size` (the caller's `img_size` is the model
+    /// input size, which the square helpers bridge with
+    /// [`VggtSquareOriginalCoords::model_to_loaded_scale`]).
     pub fn resize_ratio(&self, img_size: f64) -> f64 {
+        if let (VggtPreprocessMode::Square, Some(square)) = (self.mode, self.square.as_ref()) {
+            return square.resize_ratio();
+        }
         if img_size <= 0.0 {
             return 0.0;
         }
@@ -141,9 +256,14 @@ impl VggtOriginalCoords {
     /// Exact for pad mode (no cropping ever happens) and for crop frames whose
     /// resized height was not center-cropped; crop frames with a height crop
     /// keep the uniform reference ratio instead (see [`Self::resize_ratio`]).
+    /// Square mode returns the loaded-space factors
+    /// `width / (x2 - x1), height / (y2 - y1)`.
     /// A degenerate zero content dimension yields `0.0` on that axis rather
     /// than a division by zero.
     pub fn axis_scales_to_original(&self) -> (f64, f64) {
+        if let (VggtPreprocessMode::Square, Some(square)) = (self.mode, self.square.as_ref()) {
+            return square.axis_scales_to_original();
+        }
         let scale_x = if self.content_width == 0 {
             0.0
         } else {
@@ -158,7 +278,12 @@ impl VggtOriginalCoords {
     }
 
     /// Top-left corner of the original content inside the prepared frame.
+    /// Square mode returns the official `(x1, y1)` tuple entries (loaded-space
+    /// pixels); crop/pad modes return the integer prepared-frame offsets.
     pub fn top_left(&self) -> (f64, f64) {
+        if let (VggtPreprocessMode::Square, Some(square)) = (self.mode, self.square.as_ref()) {
+            return (square.x1, square.y1);
+        }
         (f64::from(self.offset_x), f64::from(self.offset_y))
     }
 
@@ -248,20 +373,30 @@ impl VggtPreprocessStage {
         // Size of the resized original content (equals `shape` in crop mode;
         // smaller than the 518x518 frame in pad mode).
         let mut content_sizes = Vec::with_capacity(sampled_paths.len());
+        // Official square-mode coordinate payload (`None` for crop/pad).
+        let mut squares = Vec::with_capacity(sampled_paths.len());
         for path in sampled_paths {
             let image = load_rgb_frame(path)?;
             original_dims.push(image.dimensions());
-            let (shape, offset, content, chw) = match mode {
+            let (shape, offset, content, chw, square) = match mode {
                 VggtPreprocessMode::Crop => {
                     let (shape, crop_start_y, chw) = self.resize_and_crop_frame(&image)?;
-                    (shape, (0, crop_start_y), shape, chw)
+                    (shape, (0, crop_start_y), shape, chw, None)
                 }
-                VggtPreprocessMode::Pad => self.resize_and_pad_frame(&image)?,
+                VggtPreprocessMode::Pad => {
+                    let (shape, offset, content, chw) = self.resize_and_pad_frame(&image)?;
+                    (shape, offset, content, chw, None)
+                }
+                VggtPreprocessMode::Square => {
+                    let (shape, chw, square) = self.resize_square_frame(&image)?;
+                    (shape, (0, 0), shape, chw, Some(square))
+                }
             };
             shapes.push(shape);
             content_offsets.push(offset);
             content_sizes.push(content);
             frames.push(chw);
+            squares.push(square);
         }
 
         let max_height = shapes.iter().map(|shape| shape.height).max().unwrap_or(0);
@@ -279,15 +414,19 @@ impl VggtPreprocessStage {
             .zip(&original_dims)
             .zip(&content_offsets)
             .zip(&content_sizes)
+            .zip(&squares)
             .map(
-                |(((shape, (width, height)), &(offset_x, offset_y)), content)| VggtOriginalCoords {
-                    width: *width,
-                    height: *height,
-                    offset_x: offset_x + (max_width - shape.width) / 2,
-                    offset_y: offset_y + (max_height - shape.height) / 2,
-                    content_width: content.width,
-                    content_height: content.height,
-                    mode,
+                |((((shape, (width, height)), &(offset_x, offset_y)), content), square)| {
+                    VggtOriginalCoords {
+                        width: *width,
+                        height: *height,
+                        offset_x: offset_x + (max_width - shape.width) / 2,
+                        offset_y: offset_y + (max_height - shape.height) / 2,
+                        content_width: content.width,
+                        content_height: content.height,
+                        mode,
+                        square: *square,
+                    }
                 },
             )
             .collect();
@@ -352,7 +491,8 @@ impl VggtPreprocessStage {
     /// Prepared frame size for `mode` (see [`Self::target_size_for`] for the
     /// crop formula). Pad mode returns the `/14`-rounded resized content size;
     /// the frame is additionally white-padded to a `target_width` square
-    /// afterwards.
+    /// afterwards. Square mode always returns the 518x518 model input size
+    /// (the 1024-pixel loaded square is downsampled by bilinear interpolation).
     pub fn target_size_for_mode(
         &self,
         original: SpatialSize,
@@ -369,6 +509,12 @@ impl VggtPreprocessStage {
                     self.patch_multiple,
                 )?;
                 Ok(SpatialSize::new(width, height))
+            }
+            VggtPreprocessMode::Square => {
+                if original.width == 0 || original.height == 0 {
+                    return Err(Lux3dError::InvalidInput("original size must be non-zero"));
+                }
+                Ok(SpatialSize::new(SQUARE_MODEL_SIZE, SQUARE_MODEL_SIZE))
             }
         }
     }
@@ -447,6 +593,64 @@ impl VggtPreprocessStage {
             (offset_x, offset_y),
             content,
             padded,
+        ))
+    }
+
+    /// Returns `(model frame size, CHW pixels, official square coords)` for
+    /// [`VggtPreprocessMode::Square`]. Mirrors
+    /// `load_and_preprocess_images_square` (`load_fn.py:13-94`): build a black
+    /// `max(width, height)` square, paste the image at the integer
+    /// `((max_dim - width) // 2, (max_dim - height) // 2)` offset, resize to
+    /// 1024x1024 with Pillow bicubic, convert to a `[0, 1]` CHW tensor, then
+    /// bilinearly downsample to 518x518 with torch's `align_corners=False`
+    /// formula (`demo_colmap.py:65-72`).
+    fn resize_square_frame(
+        &self,
+        image: &RgbImage,
+    ) -> Result<(SpatialSize, Vec<f32>, VggtSquareOriginalCoords)> {
+        let (width, height) = image.dimensions();
+        if width == 0 || height == 0 {
+            return Err(Lux3dError::InvalidInput("original size must be non-zero"));
+        }
+
+        let max_dim = width.max(height);
+        let left = (max_dim - width) / 2;
+        let top = (max_dim - height) / 2;
+        let scale = f64::from(SQUARE_LOAD_SIZE) / f64::from(max_dim);
+        let square_coords = VggtSquareOriginalCoords {
+            x1: f64::from(left) * scale,
+            y1: f64::from(top) * scale,
+            x2: f64::from(left + width) * scale,
+            y2: f64::from(top + height) * scale,
+            width,
+            height,
+            load_size: SQUARE_LOAD_SIZE,
+            model_size: SQUARE_MODEL_SIZE,
+        };
+
+        // `Image.new("RGB", (max_dim, max_dim), (0, 0, 0))` then
+        // `square_img.paste(img, (left, top))` (`load_fn.py:74-75`).
+        let mut square = RgbImage::from_pixel(max_dim, max_dim, Rgb([0, 0, 0]));
+        image::imageops::replace(&mut square, image, i64::from(left), i64::from(top));
+
+        // Pillow BICUBIC resize to the loaded square size (`load_fn.py:78`).
+        let loaded = resize_bicubic_pillow(&square, SQUARE_LOAD_SIZE, SQUARE_LOAD_SIZE);
+        let loaded_chw = rgb_to_chw(&loaded);
+
+        // Official `run_VGGT` input step: bilinear 1024 -> 518.
+        let model_chw = resize_chw_bilinear_torch(
+            &loaded_chw,
+            3,
+            SQUARE_LOAD_SIZE as usize,
+            SQUARE_LOAD_SIZE as usize,
+            SQUARE_MODEL_SIZE as usize,
+            SQUARE_MODEL_SIZE as usize,
+        );
+
+        Ok((
+            SpatialSize::new(SQUARE_MODEL_SIZE, SQUARE_MODEL_SIZE),
+            model_chw,
+            square_coords,
         ))
     }
 }
@@ -702,6 +906,64 @@ fn resize_bicubic_pillow(image: &RgbImage, out_width: u32, out_height: u32) -> R
     }
 
     RgbImage::from_raw(out_width, out_height, output).expect("resized buffer dimensions")
+}
+
+/// `TF.ToTensor()` equivalent for an 8-bit RGB image: planar CHW f32 in
+/// `[0, 1]`.
+fn rgb_to_chw(image: &RgbImage) -> Vec<f32> {
+    let (width, height) = image.dimensions();
+    let plane = (width as usize) * (height as usize);
+    let mut chw = vec![0.0_f32; 3 * plane];
+    for (x, y, pixel) in image.enumerate_pixels() {
+        let offset = (y as usize) * (width as usize) + x as usize;
+        for channel in 0..3 {
+            chw[channel * plane + offset] = f32::from(pixel[channel]) / 255.0;
+        }
+    }
+    chw
+}
+
+/// CHW f32 bilinear resize with torch's `F.interpolate(mode="bilinear",
+/// align_corners=False)` sampling formula: source coordinate
+/// `(dst + 0.5) * src / dst - 0.5`, clamped to `[0, src - 1]`, then bilinear
+/// weights. Official VGGT uses exactly this call for the 1024 -> 518 model
+/// input (`demo_colmap.py:72`).
+fn resize_chw_bilinear_torch(
+    src: &[f32],
+    channels: usize,
+    src_h: usize,
+    src_w: usize,
+    dst_h: usize,
+    dst_w: usize,
+) -> Vec<f32> {
+    if (src_h, src_w) == (dst_h, dst_w) {
+        return src.to_vec();
+    }
+
+    let scale_y = src_h as f64 / dst_h as f64;
+    let scale_x = src_w as f64 / dst_w as f64;
+    let mut out = vec![0.0_f32; channels * dst_h * dst_w];
+    for dy in 0..dst_h {
+        let sy = ((dy as f64 + 0.5) * scale_y - 0.5).clamp(0.0, (src_h - 1) as f64);
+        let y0 = sy.floor() as usize;
+        let y1 = (y0 + 1).min(src_h - 1);
+        let wy = (sy - y0 as f64) as f32;
+        for dx in 0..dst_w {
+            let sx = ((dx as f64 + 0.5) * scale_x - 0.5).clamp(0.0, (src_w - 1) as f64);
+            let x0 = sx.floor() as usize;
+            let x1 = (x0 + 1).min(src_w - 1);
+            let wx = (sx - x0 as f64) as f32;
+            for channel in 0..channels {
+                let plane = channel * src_h * src_w;
+                let top =
+                    src[plane + y0 * src_w + x0] * (1.0 - wx) + src[plane + y0 * src_w + x1] * wx;
+                let bottom =
+                    src[plane + y1 * src_w + x0] * (1.0 - wx) + src[plane + y1 * src_w + x1] * wx;
+                out[channel * dst_h * dst_w + dy * dst_w + dx] = top * (1.0 - wy) + bottom * wy;
+            }
+        }
+    }
+    out
 }
 
 /// PIL parity: an RGBA image is alpha-composited over opaque white before the
@@ -1020,6 +1282,7 @@ mod tests {
                 content_width: 518,
                 content_height: 392,
                 mode: VggtPreprocessMode::Crop,
+                square: None,
             }
         );
         assert_eq!(
@@ -1032,6 +1295,7 @@ mod tests {
                 content_width: 518,
                 content_height: 518,
                 mode: VggtPreprocessMode::Crop,
+                square: None,
             }
         );
 
@@ -1093,6 +1357,23 @@ mod tests {
                 .expect("pad portrait target"),
             SpatialSize::new(392, 518)
         );
+        // Square mode always prepares the 518x518 model input, independent of
+        // the original aspect ratio.
+        assert_eq!(
+            stage
+                .target_size_for_mode(landscape, 518, VggtPreprocessMode::Square)
+                .expect("square landscape target"),
+            SpatialSize::new(518, 518)
+        );
+        assert_eq!(
+            stage
+                .target_size_for_mode(SpatialSize::new(480, 640), 518, VggtPreprocessMode::Square)
+                .expect("square portrait target"),
+            SpatialSize::new(518, 518)
+        );
+        assert!(stage
+            .target_size_for_mode(SpatialSize::new(0, 8), 518, VggtPreprocessMode::Square)
+            .is_err());
     }
 
     /// Pad-mode golden values for 1024x768: content 518x392, centered with 63
@@ -1140,6 +1421,7 @@ mod tests {
                 content_width: 518,
                 content_height: 392,
                 mode: VggtPreprocessMode::Pad,
+                square: None,
             }
         );
 
@@ -1214,6 +1496,7 @@ mod tests {
                 content_width: 392,
                 content_height: 518,
                 mode: VggtPreprocessMode::Pad,
+                square: None,
             }
         );
 
@@ -1295,6 +1578,7 @@ mod tests {
                 content_width: 518,
                 content_height: 392,
                 mode: VggtPreprocessMode::Crop,
+                square: None,
             }
         );
     }
@@ -1307,5 +1591,292 @@ mod tests {
         assert!(!is_image_extension("mp4"));
         assert!(!is_image_extension("txt"));
         assert!(!is_image_extension(""));
+    }
+
+    /// Official `load_and_preprocess_images_square` arithmetic
+    /// (`load_fn.py:51-71`): black-pad the shorter side with integer `// 2`
+    /// offsets, then `scale = 1024 / max(w, h)` gives the
+    /// `[x1, y1, x2, y2, w, h]` tuple. Covers landscape, a portrait image and
+    /// odd dimensions (where the extra pad pixel stays on the bottom/right,
+    /// exactly like Python `//`).
+    #[test]
+    fn square_mode_coords_match_official_padding_arithmetic() {
+        let dir = std::env::temp_dir().join(format!(
+            "lux3d-vggt-square-coords-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create frame dir");
+        // 1024x768: max_dim 1024, left 0, top 128, scale 1.0.
+        RgbImage::from_pixel(1024, 768, Rgb([1, 2, 3]))
+            .save(dir.join("a.png"))
+            .expect("save landscape");
+        // 3x2 (odd, landscape): max_dim 3, left 0, top 0, scale 1024/3.
+        RgbImage::from_pixel(3, 2, Rgb([4, 5, 6]))
+            .save(dir.join("b.png"))
+            .expect("save odd landscape");
+        // 5x8 (odd, portrait): max_dim 8, left (8-5)//2 = 1, top 0, scale 128.
+        RgbImage::from_pixel(5, 8, Rgb([7, 8, 9]))
+            .save(dir.join("c.png"))
+            .expect("save odd portrait");
+
+        let stage = VggtPreprocessStage::default();
+        let prepared = stage
+            .prepare_inputs_from_path_with_mode(
+                &dir,
+                Some(1),
+                VggtPreprocessMode::Square,
+                &Device::Cpu,
+            )
+            .expect("prepare square inputs");
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(prepared.original_size, SpatialSize::new(1024, 768));
+        assert_eq!(prepared.preprocess_mode, VggtPreprocessMode::Square);
+        assert_eq!(prepared.target_size, SpatialSize::new(518, 518));
+        assert_eq!(prepared.rgb_frames.dims(), &[3, 3, 518, 518]);
+        assert_eq!(prepared.normalized_frames.dims(), &[1, 3, 3, 518, 518]);
+        assert_eq!(prepared.original_coords.len(), 3);
+
+        let landscape = prepared.original_coords[0]
+            .square
+            .expect("landscape square payload");
+        assert_eq!(landscape.width, 1024);
+        assert_eq!(landscape.height, 768);
+        assert_eq!(landscape.load_size, 1024);
+        assert_eq!(landscape.model_size, 518);
+        assert_eq!(landscape.x1, 0.0);
+        assert_eq!(landscape.y1, 128.0);
+        assert_eq!(landscape.x2, 1024.0);
+        assert_eq!(landscape.y2, 896.0);
+        assert_eq!(prepared.original_coords[0].mode, VggtPreprocessMode::Square);
+        assert_eq!(prepared.original_coords[0].top_left(), (0.0, 128.0));
+        // Official loaded-space ratio: max(w, h) / img_size with img_size 1024.
+        assert!((prepared.original_coords[0].resize_ratio(518.0) - 1.0).abs() < 1e-12);
+
+        let odd = prepared.original_coords[1]
+            .square
+            .expect("odd square payload");
+        assert_eq!((odd.width, odd.height), (3, 2));
+        assert_eq!(odd.x1, 0.0);
+        assert_eq!(odd.y1, 0.0);
+        assert!((odd.x2 - 1024.0).abs() < 1e-9);
+        assert!((odd.y2 - 2048.0 / 3.0).abs() < 1e-9);
+        let (scale_x, scale_y) = odd.axis_scales_to_original();
+        assert!((scale_x - 3.0 / 1024.0).abs() < 1e-12);
+        assert!((scale_y - 2.0 / (2048.0 / 3.0)).abs() < 1e-12);
+
+        let portrait = prepared.original_coords[2]
+            .square
+            .expect("portrait square payload");
+        assert_eq!((portrait.width, portrait.height), (5, 8));
+        assert_eq!((portrait.x1, portrait.y1), (128.0, 0.0));
+        assert_eq!((portrait.x2, portrait.y2), (768.0, 1024.0));
+    }
+
+    /// Square mode pads with BLACK (unlike pad mode's white `1.0`) and the
+    /// model input is the 518x518 bilinear downsample of the 1024 square.
+    #[test]
+    fn square_mode_pads_black_and_downsamples_to_model_input() {
+        let dir = std::env::temp_dir().join(format!(
+            "lux3d-vggt-square-pixels-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create frame dir");
+        RgbImage::from_pixel(1024, 768, Rgb([10, 120, 230]))
+            .save(dir.join("a.png"))
+            .expect("save frame");
+
+        let stage = VggtPreprocessStage::default();
+        let prepared = stage
+            .prepare_inputs_from_path_with_mode(
+                &dir,
+                Some(1),
+                VggtPreprocessMode::Square,
+                &Device::Cpu,
+            )
+            .expect("prepare square inputs");
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(prepared.rgb_frames.dims(), &[1, 3, 518, 518]);
+        let channel0 = prepared
+            .rgb_frames
+            .get(0)
+            .expect("frame")
+            .get(0)
+            .expect("channel");
+        let pixel = |x: usize, y: usize| {
+            channel0
+                .get(y)
+                .expect("row")
+                .get(x)
+                .expect("column")
+                .to_scalar::<f32>()
+                .expect("scalar")
+        };
+
+        // Top/bottom 128 loaded rows are the black square; the constant
+        // content survives both resizes.
+        for y in [0usize, 517] {
+            assert!(
+                (pixel(259, y) - 0.0).abs() < 1e-6,
+                "square pad row {y} is not black"
+            );
+        }
+        for (x, y) in [(259usize, 259usize), (0, 259), (517, 259)] {
+            assert!(
+                (pixel(x, y) - 10.0 / 255.0).abs() < 1e-3,
+                "content pixel ({x}, {y}) is not the constant colour"
+            );
+        }
+    }
+
+    /// Recorded Python golden for the official recipe (PIL 12.3 + torch
+    /// 2.5.1): a deterministic 37x23 pattern (`r=(7x+13y)%256`,
+    /// `g=(3x+5y)%256`, `b=(x+2y)%256`) through
+    /// `load_and_preprocess_images_square([...], 1024)` followed by
+    /// `F.interpolate(size=(518, 518), mode="bilinear", align_corners=False)`.
+    /// The expected samples below are the official model-input pixels at the
+    /// listed `(x, y)` coordinates (values in `[0, 1]`).
+    #[test]
+    fn square_mode_matches_official_python_golden_samples() {
+        let dir = std::env::temp_dir().join(format!(
+            "lux3d-vggt-square-golden-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create frame dir");
+        RgbImage::from_fn(37, 23, |x, y| {
+            Rgb([
+                ((x * 7 + y * 13) % 256) as u8,
+                ((x * 3 + y * 5) % 256) as u8,
+                ((x + y * 2) % 256) as u8,
+            ])
+        })
+        .save(dir.join("pattern.png"))
+        .expect("save pattern");
+
+        let stage = VggtPreprocessStage::default();
+        let prepared = stage
+            .prepare_inputs_from_path_with_mode(
+                &dir,
+                Some(1),
+                VggtPreprocessMode::Square,
+                &Device::Cpu,
+            )
+            .expect("prepare square inputs");
+        let _ = fs::remove_dir_all(&dir);
+
+        // Official coords: max_dim 37, top (37-23)//2 = 7, scale 1024/37.
+        let square = prepared.original_coords[0].square.expect("square payload");
+        assert_eq!((square.width, square.height), (37, 23));
+        assert_eq!(square.x1, 0.0);
+        assert!((square.y1 - 7.0 * 1024.0 / 37.0).abs() < 1e-9);
+        assert_eq!(square.x2, 1024.0);
+        assert!((square.y2 - 30.0 * 1024.0 / 37.0).abs() < 1e-9);
+
+        let frame = prepared.rgb_frames.get(0).expect("frame");
+        let sample = |x: usize, y: usize| {
+            [0usize, 1, 2].map(|channel| {
+                frame
+                    .get(channel)
+                    .expect("channel")
+                    .get(y)
+                    .expect("row")
+                    .get(x)
+                    .expect("column")
+                    .to_scalar::<f32>()
+                    .expect("scalar")
+            })
+        };
+
+        // Official samples: (x, y) -> (r, g, b).
+        let golden: [(usize, usize, [f32; 3]); 5] = [
+            (0, 0, [0.0, 0.0, 0.0]),
+            (259, 259, [0.052_895_7, 0.427_450_98, 0.156_862_75]),
+            (517, 517, [0.0, 0.0, 0.0]),
+            (100, 300, [0.896_229_7, 0.352_941_2, 0.137_254_91]),
+            (0, 259, [0.558_778_05, 0.215_686_28, 0.086_274_51]),
+        ];
+        for (x, y, expected) in golden {
+            let actual = sample(x, y);
+            for channel in 0..3 {
+                assert!(
+                    (actual[channel] - expected[channel]).abs() <= 1e-6,
+                    "pixel ({x}, {y}) channel {channel}: got {}, official {}",
+                    actual[channel],
+                    expected[channel]
+                );
+            }
+        }
+    }
+
+    /// Grayscale input is expanded to RGB and RGBA is alpha-composited over
+    /// opaque white before the black square padding, matching the official
+    /// `Image.convert("RGB")` path (`load_fn.py:44-49`).
+    #[test]
+    fn square_mode_accepts_grayscale_and_composites_rgba() {
+        let dir = std::env::temp_dir().join(format!(
+            "lux3d-vggt-square-modes-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create frame dir");
+        image::GrayImage::from_pixel(1024, 1024, image::Luma([200_u8]))
+            .save(dir.join("a.png"))
+            .expect("save grayscale");
+        RgbaImage::from_pixel(1024, 1024, Rgba([0, 0, 0, 128]))
+            .save(dir.join("b.png"))
+            .expect("save rgba");
+
+        let stage = VggtPreprocessStage::default();
+        let prepared = stage
+            .prepare_inputs_from_path_with_mode(
+                &dir,
+                Some(1),
+                VggtPreprocessMode::Square,
+                &Device::Cpu,
+            )
+            .expect("prepare square inputs");
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(prepared.original_coords.len(), 2);
+        assert_eq!(prepared.rgb_frames.dims(), &[2, 3, 518, 518]);
+        let center = |frame: usize| {
+            prepared
+                .rgb_frames
+                .get(frame)
+                .expect("frame")
+                .get(0)
+                .expect("channel")
+                .get(259)
+                .expect("row")
+                .get(259)
+                .expect("column")
+                .to_scalar::<f32>()
+                .expect("scalar")
+        };
+        assert!(
+            (center(0) - 200.0 / 255.0).abs() < 1e-6,
+            "grayscale value must be replicated across RGB"
+        );
+        // 0 * (128/255) + 255 * (1 - 128/255) == 127.
+        assert!(
+            (center(1) - 127.0 / 255.0).abs() < 1e-6,
+            "RGBA must composite over opaque white"
+        );
     }
 }
