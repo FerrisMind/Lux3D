@@ -14,12 +14,13 @@
 ## 1. CLI — Entry & Dispatch
 
 ### US-1.1: CLI parses subcommands
-As a user, I can run `lux3d inspect|weights normalize|run <family>` and get correct dispatch.
+As a user, I can run `lux3d inspect|weights normalize|weights quantize|run <family>` or
+`lux3d ovox mesh2ovox|ovox2mesh|ovox2glb` and get correct dispatch.
 
 **Functions:**
 - `main.rs:main()` — Entry point ✅
 - `cli.rs:Cli` — Clap parser struct ✅
-- `cli.rs:Command::Inspect` / `Weights` / `Run` — Subcommand enum ✅
+- `cli.rs:Command::Inspect` / `Weights` / `Run` / `Ovox` — Subcommand enum ✅
 - `cli.rs:Family` — Pi3 / Pi3x / Triposr / Triposg / Vggt / Trellis2 enum ✅
 - `cli.rs:InjectCondition` — Pose / Depth / Ray / Intrinsic enum ✅
 
@@ -510,14 +511,16 @@ the camera head, and the DPT point/depth heads from the canonical package.
 
 ### US-13.2: VGGT preprocess matches the reference loader
 As a user, I get the same crop/resize/pad/normalization as
-`vggt.utils.load_fn.load_and_preprocess_images(mode="crop")`, plus the pad recipe and
-single-image sources.
+`vggt.utils.load_fn.load_and_preprocess_images(mode="crop")`, plus the pad recipe,
+the official square-1024 COLMAP-demo recipe and single-image sources.
 
 **Functions:**
 - `preprocess/vggt.rs:VggtPreprocessStage::prepare_inputs_from_path()` ✅
 - `preprocess/vggt.rs:VggtPreprocessStage::prepare_inputs_from_path_with_mode()` —
-  `--preprocess-mode crop|pad` (pad: largest side 518, white-padded 518x518 square,
-  no pixels discarded) ✅
+  `--preprocess-mode crop|pad|square` (`pad`: largest side 518, white-padded 518x518
+  square, no pixels discarded; `square`: black-pad to the loaded 1024 square, model
+  input is its 518x518 bilinear downsample, `VggtSquareOriginalCoords` carries the
+  official `x1/y1/x2/y2/width/height` mapping) ✅
 - `preprocess/vggt.rs:VggtPreprocessStage::target_size_for()` ✅
 - Single-image file sources (`.png/.jpg/.jpeg/.webp/.bmp/.tif/.tiff` — one-frame scene) ✅
 - Pillow-compatible integer BICUBIC resampler (0.0 delta vs baseline) ✅
@@ -538,51 +541,68 @@ As a user, I can run multi-frame inference and export a confidence-filtered PLY.
 - `geometry/vggt.rs:VggtGeometryStage::assemble_cpu()` — strict `conf > threshold` ✅
 - `export/vggt.rs:VggtExportStage::write_ply()` ✅
 - `export/colmap.rs:write_feedforward_colmap()` — upstream `demo_colmap.py`
-  feedforward mode (`cameras.bin`/`images.bin`/`points3D.bin`, PINHOLE per image,
-  depth-confidence gate + point cap, rescaled intrinsics) ✅
+  feedforward mode (`cameras.bin`/`images.bin`/`points3D.bin` + `points.ply`, PINHOLE
+  per image, depth- or pointmap-sourced points, confidence gate + capped point set) ✅
 - `runtime/vggt.rs:VggtPipeline::export_ply_with_threshold()` ✅
-- `runtime/vggt.rs:VggtPipeline::export_inference_npz()` — includes the stacked
-  `pose_enc_list` `[K, S, 9]` ✅
+- `runtime/vggt.rs:VggtPipeline::export_inference_npz()` — 12-key npz: historical
+  `world_points`/`world_points_conf`/`depth`/`depth_conf`/`extrinsics`/`intrinsics`/
+  `pose_enc`/`pose_enc_list` `[K,S,9]` plus official demo keys `images`/`extrinsic`/
+  `intrinsic`/`world_points_from_depth` (`write_inference_npz`) ✅
 - CLI `run vggt` (see US-13.4); server `vggt` point-cloud jobs ✅
 
 **Tests:** `runtime_vggt` (CUDA parity vs Python baseline; requires a CUDA device),
-`vggt_preprocess` (CPU golden RGB + normalized parity), `vggt_export` (CPU),
-DPT separable-pos-embed/cache unit tests, and `model_spec`/`contracts` VGGT cases ✅
+`vggt_preprocess` (CPU golden RGB + normalized parity, square-mode padding/coords),
+`vggt_export` (CPU), DPT separable-pos-embed/cache unit tests, and
+`model_spec`/`contracts` VGGT cases ✅
 
 CPU and Vulkan numeric parity was verified manually (PLY vertex count and bbox against the
 Python baseline; see `.swarm/results/backends-and-bench.md`). The automated parity test is
 CUDA-only; Metal has no test host in this repository.
 
-**Excluded:** track auto-query/keypoint extraction (ALIKED/SP keypoints, DINO
-query-frame ranking) — tracking requires explicit queries, see US-13.4.
+**Excluded:** the official fine tracker stages B/C (ALIKED/SuperPoint keypoint
+extractors, LightGlue-style refinement) and non-visible track completion. Tracking stage A
+is shipped: DINOv2-reg query-frame ranking + FPS query points feeding the VGGT track head
+(see US-13.5).
 
 ### US-13.4: VGGT CLI run surface (exports + tracking)
 As a user, I can run `lux3d run vggt` with the full VGGT option surface: preprocess mode,
-load dtype, batch chunking, COLMAP feedforward export, depth-unprojected point clouds and
-explicit-query tracking.
+load dtype, batch chunking, COLMAP feedforward or track export, depth-unprojected point
+clouds, explicit or automatic tracking, and the demo-style GLB scene.
 
 **Functions:**
 - `cli.rs:VggtRunArgs` — flattened VGGT-only flag family; every flag is rejected for
   the other families (`reject_vggt_only_options`) ✅
-- `--preprocess-mode crop|pad` (default crop) → `VggtRunOptions.preprocess_mode` ✅
+- `--preprocess-mode crop|pad|square` (default crop) → `VggtRunOptions.preprocess_mode` ✅
 - `--vggt-dtype f32|f16|bf16` (default f32) → `VggtPipeline::load_with_options` ✅
 - `--batch-size N` (default 1; 0 rejected) → sequential frame chunks, NOT one attention
   pass; documented in the flag help ✅
 - `--colmap-dir` + `--colmap-conf-threshold` (default 5.0) + `--colmap-max-points`
-  (default 100000) → `write_feedforward_colmap` + `ColmapExportStats` print ✅
+  (default 100000) + `--colmap-point-source depth|pointmap` (default depth) +
+  `--colmap-seed` (optional; absent = deterministic evenly-spaced subsample) →
+  `write_feedforward_colmap` + `ColmapExportStats` print ✅
 - `--depth-points` + `--depth-conf-threshold` (default 1.0) → depth-unprojected
   PLY/XYZ point cloud from `world_points_from_depth()` ✅
 - `--track-queries '<json>'` (objects or `[frame,x,y]` arrays; frame must be 0,
   x/y in [0, 518); parse: `parse_vggt_track_queries`) + `--track-output` (default
   `<source-stem>_tracks.json`) + `--track-iters` (default 4) →
-  `run_with_tracks` + `{"coords", "visibility", "confidence"}` JSON ✅
+  `run_with_tracks` + `{"coords", "visibility", "confidence", "query_frames"}` JSON ✅
+- `--track-auto` + `--query-frame-num` (default 8) + `--max-query-pts` (default 4096) —
+  tracking stage A (`runtime/vggt_auto_query.rs`: DINOv2-reg frame ranking + FPS query
+  points, confidence gate, query-frame rotation) ✅
 - `--track-points-ply` — one colored vertex per query (frame-0 world point at the
   query pixel) ✅
-- `--dump-npz` includes `pose_enc_list` and works together with the track options ✅
+- `--glb` + `--glb-conf-percentile` (default 50) + `--glb-show-cam` +
+  `--glb-point-source depth|pointmap` (default depth) — demo GLB scene (see US-13.6) ✅
+- `--dump-npz` writes the 12-key inference npz and works together with the
+  track/COLMAP/depth/GLB flags ✅
 - Single-image `--source` accepted for `vggt` ✅
 
-**Excluded:** track auto-query/keypoint extraction is not available in the CLI —
-`--track-queries` requires explicit query points.
+**Guards:** `--track-queries` and `--track-auto` are mutually exclusive;
+`--query-frame-num`/`--max-query-pts` require `--track-auto`; tracking rejects
+`--batch-size > 1`; `--colmap-mode track` requires `--colmap-dir` and `--track-auto`;
+`--vis-thresh`/`--max-reproj-error`/`--shared-camera`/`--colmap-min-inlier-per-frame`
+require track mode; `--glb-*` modifiers require `--glb`; the confidence percentile must be
+finite in `[0, 100]`.
 
 **Tests:** `tests/run_args.rs` (`run_vggt_parses_vggt_flags`,
 `run_vggt_flags_default_to_historical_behavior`,
@@ -591,7 +611,66 @@ explicit-query tracking.
 `run_model_rejects_vggt_batch_size_zero_at_dispatch_before_weights`,
 `run_model_rejects_vggt_only_flag_at_dispatch_before_weights`) and the in-crate
 `cli::tests` VGGT tests (option mapping, query JSON formats, track JSON
-serialization, family rejection, COLMAP image-name listing, default track path) ✅
+serialization, family rejection, COLMAP image-name listing, default track path,
+GLB flag mapping/validation) ✅
+
+### US-13.5: Tracking stage A and track-based COLMAP export
+As a user, I can select query points automatically and export a COLMAP-ready
+track reconstruction for external bundle adjustment.
+
+**Functions:**
+- `runtime/vggt_auto_query.rs:VggtAutoQueryOptions` / `VggtAutoTrackResult` —
+  query-frame ranking (`Dinov2RegRanker::rank_frames`), FPS query points
+  (`fps_query_points`), confidence pruning (`prune_query_points_by_confidence`) and
+  frame rotation (`calculate_index_mappings` / `switch_tensor_order`) ✅
+- DINOv2 ViT-B/14-with-registers encoder (`Dinov2RegEncoder`) resolved from
+  `models/dinov2_reg4/model.safetensors` or `LUX3D_DINOV2_REG_MODEL_PATH` ✅
+- `export/colmap.rs:write_track_colmap()` — `batch_np_matrix_to_pycolmap` semantics:
+  `SIMPLE_PINHOLE` cameras, multi-frame tracks, visibility + reprojection gates,
+  per-frame inlier floor, one shared camera optional ✅
+- `export/colmap.rs:write_track_colmap_from_auto()` + `sample_track_seeds()` —
+  seeds tracks from the selected point source (`Depth` default = official BA seed
+  source, `Pointmap` = point head) ✅
+- CLI `--colmap-mode track --vis-thresh 0.2 --max-reproj-error 8.0
+  --colmap-min-inlier-per-frame 64 --shared-camera` ✅
+
+**Explicit cut lines:**
+- **No bundle adjustment.** Upstream `--use_ba` needs pycolmap/C++; this repository
+  writes the COLMAP-ready reconstruction and leaves BA to external COLMAP/gsplat.
+- **Stage-A-only tracking quality.** The official BA input uses VGGSfM v2 fine
+  tracking with ALIKED/SuperPoint queries; stage A here uses DINO/FPS queries + the
+  VGGT track head, so tracks are coarser and the official default
+  `min_inlier_per_frame = 64` can reject a stage-A export. Stages B/C (VG6/VG8) are
+  not shipped.
+- **No pycolmap reconstruction round-trip.** The `.bin` writer is the only COLMAP
+  surface; `points.ply` is the accompanying visualization cloud.
+
+**Tests:** `vggt_auto_query` unit tests (DINO ranking, FPS, confidence pruning,
+index mappings), `vggt_track` tensor-name/query validation, `export::colmap`
+unit tests (feedforward write + parse-back, seeded point limiting, track gates,
+`>= 2` observations, 3000-coordinate gate) ✅
+
+### US-13.6: VGGT GLB scene export
+As a user, I can write the same downloadable GLB scene as the official Gradio demo.
+
+**Functions:**
+- `export/vggt_glb.rs:VggtGlbOptions` — confidence percentile (50), show cameras
+  (core default true; CLI `--glb-show-cam` opts in), point source, background masks
+  (core-only) ✅
+- `export/vggt_glb.rs:build_vggt_glb_scene()` — confidence-filtered point cloud,
+  first-camera alignment, `gist_rainbow` camera colors, cone meshes ✅
+- `export/vggt_glb.rs:write_vggt_glb()` — single-buffer GLB (points mode 0, camera
+  cones, shared cone index accessor) ✅
+- CLI `--glb <path> --glb-conf-percentile <0..100> --glb-show-cam
+  --glb-point-source depth|pointmap` ✅
+
+**Limits:** the demo's “Show Points from Frame” selector and the black/white
+background-mask CLI flags are not exposed (all frames are exported; the masks exist
+only as core options). `mask_sky` is not ported (see §21).
+
+**Tests:** `export::vggt_glb` 9 unit tests (percentile/filtering, dummy point for an
+empty cloud, camera mesh/scene scale, GLB chunk/JSON parse-back) and CLI flag
+parse/mapping/validation tests ✅
 
 ---
 
@@ -669,6 +748,79 @@ checkerboard cells may resolve differently. The full VAE encoder + `vae.quant` e
 (FPS, quant parameters, `TripoSgLatentDistribution`) is implemented for parity/tooling even
 though the image-to-3D pipeline itself calls only `vae.decode`. The contract has no
 exclusions.
+
+### US-14.4: `--surface-input` VAE surface encode
+As a user, I can encode a sampled surface (points + normals) into a TripoSG latent and
+decode a mesh, reproducing `scripts/inference_vae.py`.
+
+**Functions:**
+- CLI `--surface-input <file.npy>` — conflicts with `--source`; one of the two is
+  required; rejected for every non-TripoSG family ✅
+- `runtime/npy.rs:read_surface_arrays()` — reads the keyed dict written by
+  `np.save(path, {"surface_points": [N,3], "surface_normals": [N,3]})` (a pickled
+  dict, not an `.npz`) ✅
+- `runtime/triposg.rs:TripoSgPipeline::encode_surface_from_path()` — reference
+  `num_pc = 204800` subset, VAE encoder, latent-distribution sample; skips
+  preprocess/DINO/denoise ✅
+- Decode defaults follow the reference script (`flash decoder off`, dense depth 8,
+  hierarchical depth 9) unless the corresponding flags override them ✅
+
+**Limits:** `--num-shapes` is rejected with `--surface-input` (one latent); the
+sampled latent uses the Lux3D seeded RNG, so it is distribution-equivalent, not
+torch-draw-identical.
+
+**Tests:** `npy` reader unit tests, `vae_encode_triposg` FPS/quant tests, CLI
+surface-input mapping/conflict/family-rejection cases ✅
+
+### US-14.5: TripoSG-scribble mode
+As a user, I can run the TripoSG-scribble dual-conditioning pipeline (CLIP prompt +
+scribble image) from the raw `VAST-AI/TripoSG-scribble` checkpoint or a quantized DiT.
+
+**Functions:**
+- CLI `--mode image|scribble` (default image), `--prompt` (required in scribble mode),
+  `--scribble-conf` (`cross_attention_2_scale`, default 0.4) and `--prompt-conf`
+  (`cross_attention_scale`, default 1.0) ✅
+- `runtime/triposg.rs:TripoSgScribblePipeline` — raw safetensors loader, CLIP text
+  encoder + hand-ported BPE tokenizer (`runtime/triposg_text.rs`), DINOv2-large
+  scribble encoder, dual-cross-attention DiT forward, dense/hierarchical decode ✅
+- `preprocess/triposg.rs:prepare_scribble_inputs_from_path()` — official
+  RGB-only BitImageProcessor recipe (shortest edge 256, center crop 224, BICUBIC,
+  ImageNet normalization; alpha is dropped, no RMBG/composite/square padding) ✅
+- `weights quantize triposg --scribble` — quantizes only the dual-cross-attention
+  DiT; `--source` accepts the raw checkpoint directory or its transformer shard;
+  text encoder, VAE and DINOv2 stay float; output may be written to
+  `<checkpoint>/transformer/model.gguf` for automatic pickup ✅
+
+**Limits:** scribble mode rejects `--surface-input`, `--guidance-scale`,
+`--flash-decoder`, `--flash-octree-depth`, `--rmbg-model-path`, `--cache-dir` and
+`--num-shapes`; it accepts exactly one `--source` and uses the reference defaults
+(16 steps, 512 tokens, dense depth 8, hierarchical depth 8). Reference f32 vs quantized
+DiT drift is substantial (voxel IoU 0.17–0.27 across q8_0/q6_k/q5_k/q4_k), so q8_0 is the
+recommended quantized variant. The scribble bicubic resize port can differ on purely
+upscaled synthetic inputs (real scribbles are downscaled).
+
+**Tests:** `scribble_triposg` (tokenizer goldens, CLIP text forward, gated CUDA e2e),
+`preprocess_triposg` (BitImageProcessor golden, alpha-drop), `pipeline_triposg_scribble`
+option validation, CLI scribble flag mapping/guards, quantize `--scribble` CLI tests ✅
+
+### US-14.6: Batched sources and `--num-shapes`
+As a user, I can generate a batch from several images and multiple shapes per prompt.
+
+**Functions:**
+- CLI `--source` is repeatable for TripoSG image mode only; `--num-shapes N`
+  (default 1, 0 rejected) — total batch `N_images * num_shapes` ✅
+- `runtime/triposg.rs:TripoSgPipeline::infer_batch_from_paths()` — one DINOv2
+  conditioning pass, `repeat_interleave_batch()` (image-major order), one
+  `[B, num_tokens, 64]` latent draw, batched DiT denoise ✅
+- One output mesh per sample with `_0`, `_1`, ... suffixes (`sample_output_path`);
+  single-source + `num_shapes = 1` keeps the byte-identical historical path ✅
+
+**Limits:** `--num-shapes` is rejected for scribble, `--surface-input`, pi3/pi3x/
+triposr/vggt and TRELLIS.2 (use `--num-samples`); multiple `--source` values are
+rejected for every non-TripoSG family.
+
+**Tests:** `repeat_interleave_batch` order/factor tests, CLI parse/mapping/family
+rejection, real CUDA batched e2e (two sources × `--num-shapes 2` → four outputs) ✅
 
 ---
 
@@ -811,6 +963,24 @@ distance + ray-parity sign + QEF placement), and cleanup/decimation are clean-ro
 driven by the meshopt simplifier, not cumesh; topology changes can differ from the
 reference.
 
+### US-16.6: Resident stage mode (`--no-low-vram`)
+As a user, I can keep every loaded TRELLIS.2 stage resident instead of the default
+per-stage load/drop.
+
+**Functions:**
+- `runtime/trellis2.rs:Trellis2RunOptions::low_vram` — default `true` (per-stage
+  load/drop); `false` = upstream `low_vram=False` resident mode ✅
+- `runtime/trellis2.rs:resident_stage_load_error()` — actionable failure naming
+  `--no-low-vram`, the stage and the device memory limit; never silently falls back ✅
+- CLI `--no-low-vram` (TRELLIS.2-only; rejected for other families) ✅
+
+**Behavior:** outputs are byte-identical to the default for the same seed; the speed
+benefit is real but GPU-sharing-dependent, and peak VRAM is higher. The default path
+stays the historical load/drop behavior.
+
+**Tests:** `trellis2::tests::resident_load_failure_names_flag_and_device_memory_limit`,
+CLI mapping/rejection cases, real-weights default-vs-resident byte-equality run ✅
+
 ---
 
 ## 17. TRELLIS.2 Texturing Pipeline (Existing Meshes)
@@ -820,7 +990,7 @@ As a user, I can texture an existing mesh from one condition image and write a t
 
 **Functions:**
 - `runtime/trellis2_texture.rs:Trellis2TexturingOptions` — `seed` (42), `resolution`
-  (512|1024, default 1024), `tex_sampler` overrides, `texture_size` (2048),
+  (512|1024|1536, default 1024), `tex_sampler` overrides, `texture_size` (2048),
   `preprocess_image` / `preprocess_mesh` ✅
 - `runtime/trellis2_texture.rs:preprocess_mesh_for_texturing()` — center, scale by
   `0.99999 / max_extent`, y/z swap `(x, y, z) -> (x, -z, y)`; rejects empty, non-finite,
@@ -879,17 +1049,21 @@ As a user, I can texture `.glb`, `.obj`, `.ply` or `.stl` inputs.
 As a user, I know exactly which flags apply and what the output contains.
 
 **Functions:**
-- CLI `--texture-mesh <file>`, `--texture-resolution 512|1024`,
+- CLI `--texture-mesh <file>`, `--texture-resolution 512|1024|1536`,
   `--no-preprocess-mesh`, `--no-preprocess-image`, shared `--seed` / `--texture-size` /
   `--tex-*` overrides; `validate_trellis2_texturing_mode()` rejects `.glb`-incompatible
   output extensions and image-to-3D-only flags ✅
 - Output: one textured `.glb`; no `<stem>.pbrvox.bin` / `<stem>.pbr.json` sidecar ✅
 
 **Limits/approximations:**
-- Existing input UVs are not preserved; the atlas is always re-unwrapped. Duplicate-position
-  vertices (including `repair_non_manifold_edges` splits) are welded before charting, UV seams
-  duplicate vertices, and xatlas' non-parameterizable (zero-area) faces are dropped from the
-  atlas index buffer ✅
+- The core `texture_mesh(..., corner_uvs)` API reuses caller-supplied per-corner UVs
+  (reference UV-reuse branch: no xatlas, `chart_count = 0`), but the CLI
+  `--texture-mesh` and the HTTP texturing job call `texture_mesh_from_path`, which does
+  not pass input UVs, so those surfaces always re-unwrap. Existing input UVs are
+  therefore not preserved on the CLI/server path.
+- Duplicate-position vertices (including `repair_non_manifold_edges` splits) are welded
+  before charting, UV seams duplicate vertices, and xatlas' non-parameterizable
+  (zero-area) faces are dropped from the atlas index buffer ✅
 - No cleanup, decimation, component removal or remeshing in texturing mode; input topology
   is kept except for the UV split ✅
 - The shape encoder runs F32; upstream `use_fp16 = true` casts the block torso. The
@@ -925,6 +1099,28 @@ decoder is 0.6–1.8 s after the layout/kernel fixes.
 
 **Tests:** CLI `run_args` texture-mesh mapping/rejection cases; `trellis2_texture`
 missing-checkpoint test ✅
+
+### US-17.4: 1536 texturing resolution
+As a user, I can texture at the full 1536 grid while sharing the 1024 conditioning/DiT.
+
+**Functions:**
+- `runtime/trellis2_texture.rs:Trellis2TexturingOptions::validate()` — accepts
+  `512 | 1024 | 1536` (rejects other values) ✅
+- `Trellis2TexturingOptions::cond_resolution()` — 512 for the 512 pipeline, 1024 for
+  1024 and 1536 (reference `trellis2_texturing.py:399`) ✅
+- `MeshToDualGridOptions::for_shape_slat_encoder(1536)` — full `[1536,1536,1536]`
+  voxelization/encode grid with a 96-cell latent grid; `tex_dit_1024` weights ✅
+- CLI `--texture-resolution 1536` (HTTP `texture_resolution: 1536`) ✅
+
+**Tests:** `trellis2_texture::tests::texturing_1536_uses_full_grid_with_1024_conditioning`,
+`texturing_existing_resolutions_unchanged`,
+`texturing_resolution_validation_matches_app_choices`, CLI mapping test ✅
+
+**Measured:** real-weights CUDA e2e on a 50k-face mesh at 512 / 1024 / 1536
+(2 tex steps, `--texture-size 1024`): 32 s / 88 s / 179 s wall, decode voxel counts
+425,885 / 1,746,187 / 3,969,109, all three GLBs valid. The full-surface 1536 bake did not
+finish within the 15-minute budget (CPU-bound xatlas at ~4M voxels), so budget wall time
+for dense meshes.
 
 ---
 
@@ -981,7 +1177,52 @@ equality), `flash_triposg::flash_dmc_honors_bounds_override`, `run_args` parse/v
 
 ---
 
-## 19. Working-Tree Test Inventory
+## 19. O-Voxel Volume Commands (`ovox`)
+
+### US-19.1: Mesh <-> o_voxel volume conversion
+As a user, I can voxelize a textured mesh into an o_voxel `.vxz` and reconstruct a mesh
+or textured GLB from it, matching the upstream `o-voxel` examples.
+
+**Functions:**
+- `cli.rs:OvoxCommand` — `mesh2ovox`, `ovox2mesh`, `ovox2glb` subcommands (explicit
+  names, so kebab-casing does not produce `mesh2-ovox`); each prints a JSON stats report ✅
+- `export/ovox/commands.rs:MeshToOvoxOptions` / `mesh2ovox()` — textured GLB PBR or a
+  single default material for OBJ/PLY/STL, official unit-cube normalization
+  (center + `0.99999/max_extent`), grid size (512 default) or explicit voxel size,
+  AABB, mip offset, QEF weights, `.vxz`/`.npz`/`.ply` output dispatch ✅
+- `export/ovox/commands.rs:OvoxDecodeOptions` / `ovox2mesh()` — `.vxz`/`.npz`/`.ply`
+  decode, explicit grid size + AABB (not stored in `.vxz`), ASCII PLY with base-color
+  vertex colors ✅
+- `export/ovox/commands.rs:OvoxToGlbOptions` / `ovox2glb()` — decode, clean, UV unwrap,
+  bake; defaults match `o-voxel/examples/ovox2glb.py` (decimation 100000, texture
+  2048, fill-hole 3e-2, min component area 1e-5) ✅
+- `export/ovox/vxz.rs` — official `.vxz` container read/write, `none`/`deflate`
+  write, LZMA2 read (`lzma2.rs`), z-order/Hilbert/SVO codecs ✅
+
+**CLI flags:** `mesh2ovox`: `--grid-size`, `--voxel-size`, `--aabb`, `--no-normalize`,
+`--mip-level-offset`, `--face-weight`, `--boundary-weight`, `--regularization-weight`,
+`--compression none|deflate`. `ovox2mesh`: `--grid-size` (512), `--aabb`
+(`[-0.5,0.5]^3`). `ovox2glb`: the same plus `--decimation-target`, `--texture-size`,
+`--fill-hole-perimeter`, `--min-component-area`.
+
+**Limits:**
+- `.vxz` **write** supports `none|deflate` only (LZMA write is rejected). LZMA2
+  files are read; zstd-compressed files are rejected because this build has no zstd
+  decoder.
+- `.vxz` does not store grid size or bounds, so decoders require the values used at
+  voxelization (defaults 512 / `[-0.5,0.5]^3`).
+- `mesh2ovox` drops zero-area triangles and requires strictly positive triangle area
+  for the QEF; attribute dtypes are `uint8` (wider/float attributes are rejected).
+- No HTTP route; `ovox` is CLI-only.
+
+**Tests:** `export::ovox` unit suite (z-order/Hilbert/SVO, `.vxz` round-trips for
+`{none,deflate} × {as_is,none,all}`, official LZMA fixtures, multi-chunk LZMA2, NPZ/PLY),
+`tests/ovox_commands.rs` (attribute layout, one-voxel geometry round-trip, res-512 GLB
+e2e) ✅
+
+---
+
+## 20. Working-Tree Test Inventory
 
 Counts are `#[test]` declarations; gated suites skip without their weights/fixtures.
 
@@ -1020,7 +1261,7 @@ Also touched: `crates/lux3d-core/tests/vggt_export.rs` (fixture gains empty `pos
 
 ---
 
-## 20. Known Gaps, Exclusions & Approximations
+## 21. Known Gaps, Exclusions & Approximations
 
 - **Metal:** CI builds `lux3d-core` with `--features metal` and runs the lib/quant-probe
   checks; no model inference parity is validated in this repository.
@@ -1059,25 +1300,50 @@ Also touched: `crates/lux3d-core/tests/vggt_export.rs` (fixture gains empty `pos
   including the K-quant Q8K dispatch limit). Reduced-precision coop-matrix is not used
   for TRELLIS.2 because its O-Voxel occupancy is discrete and f16/TF32 drift changes the
   exported topology.
-- **VGGT tracking:** explicit query points only. Automatic query selection (ALIKED/SP
-  keypoints, DINO query-frame ranking), multi-query-frame reordering and non-visible track
-  completion are not implemented.
+- **VGGT tracking:** stage A is shipped (DINOv2-reg query-frame ranking + FPS query
+  points, confidence gate, query-frame rotation); the official fine tracker stages B/C
+  (ALIKED/SuperPoint keypoint extractors, LightGlue-style refinement) and non-visible
+  track completion are not implemented. Stage-A tracks are coarser and can fail the
+  official `min_inlier_per_frame = 64` gate.
 - **VGGT contract drift:** the static contract has no `track_head` entry (the
   `NeuralSpec::track_head` field deserializes to `None`) and still lists the
   `vggt_track_head` exclusion while `runtime/vggt_track.rs` implements the head;
   `tests/contracts.rs`/`tests/model_spec.rs` assert the old metadata and need
   regeneration/update.
-- **VGGT COLMAP export:** 3D points come from the point-head `world_points` (upstream
-  `demo_colmap.py` unprojects depth), and point limiting is a deterministic evenly-spaced
-  subsample instead of upstream's seeded random choice.
+- **VGGT COLMAP export:** feedforward points default to the depth-unprojected source
+  (`--colmap-point-source depth`, the official demo branch); `pointmap` selects the
+  point-head `world_points`. `--colmap-seed` gives a random point cap
+  (distribution-equivalent to numpy, not bit-identical); without it the cap is a
+  deterministic evenly-spaced subsample.
+- **VGGT BA / pycolmap:** no bundle adjustment and no pycolmap reconstruction
+  round-trip. `--colmap-mode track` writes the `batch_np_matrix_to_pycolmap`
+  reconstruction (SIMPLE_PINHOLE, tracks, no BA) as COLMAP-ready input for external
+  BA/gsplat. Upstream's `--use_ba` path needs pycolmap/C++ and is an explicit cut line.
+- **VGGT GLB:** the demo's `mask_sky` filter is not ported (it needs onnxruntime + the
+  SkySeg ONNX model); the black/white background masks exist as core options but are not
+  CLI flags, and the "Show Points from Frame" selector is not exposed.
 - **VGGT dtypes:** F32 is the parity mode. F16/BF16 are wired but the automated numeric
   suite is F32/CUDA-only; BF16 is unverified.
-- **TripoSG scribble:** not implemented (weights unavailable).
+- **TripoSG scribble:** shipped (`--mode scribble`, dual conditioning, raw checkpoint or
+  quantized DiT). Documented deviations: RGB-only BitImageProcessor preprocessing (alpha
+  dropped, no RMBG), and the bicubic resize port can differ on purely upscaled synthetic
+  inputs. Quantized scribble DiTs are much more topology-sensitive than the image DiT
+  (voxel IoU 0.17–0.27), so use Q8_0 as the compact variant.
+- **TripoSG surface input:** `--surface-input` reproduces `scripts/inference_vae.py`
+  (keyed `.npy` dict, 204800-point subset, VAE encode + latent sample); the sampled
+  latent uses the Lux3D RNG (distribution-equivalent, not torch-draw-identical).
 - **TripoSG `--faces`:** meshopt quadric simplification approximates pymeshlab quadric
   edge collapse.
-- **Server surfaces:** the HTTP mesh API keeps one sample, default postprocess/texture
-  export, and has no `--texture-mesh`/per-stage/`--return-latent` knobs; TRELLIS.2 jobs
-  write the vertex-color mesh + PBR sidecars, not an embedded-texture GLB.
+- **WebP texture payloads:** textured GLBs embed PNG only (`image/png`); WebP encoding
+  would add a libwebp C dependency and is not implemented. WebP is still accepted as a
+  VGGT input image.
+- **Server surfaces:** the HTTP mesh API exposes the TripoSG `timesteps`/`bounds`/`faces`
+  fields, the TRELLIS.2 per-stage sampler/rescale fields, `num_samples`, `texture_size`
+  and the postprocess/remesh fields, and `POST /v1/meshes/texturings` textures an
+  existing mesh. Still CLI-only: TripoSG `--surface-input`/`--mode scribble`/repeatable
+  `--source`/`--num-shapes`, VGGT preprocess/batch/COLMAP/track/GLB flags, and
+  `--return-latent`. `num_samples > 1` serves sample 0 through `/content`; the remaining
+  samples stay in the workspace.
 - **Quantization:** TRELLIS.2 DiT-only GGUF policy is unchanged; the texturing-only
   `shape_enc` checkpoint is outside the canonical package and is never quantized.
 

@@ -45,12 +45,16 @@ Lux3D / candle-3d — это Rust 2024 workspace, который предост�
 - `pi3x`
 - `triposr`
 - `vggt` — VGGT-1B: multi-view point cloud, depth и camera инференс с опциональным
-  COLMAP-экспортом, depth-развёрткой в point cloud и трекингом по явным запросам.
-  Оригинальные веса CC-BY-NC-4.0 (non-commercial); коммерческий checkpoint
-  распространяется отдельно.
+  COLMAP-экспортом в feedforward или track-режиме (без bundle adjustment), depth-развёрткой
+  в point cloud, трекингом по явным запросам или автоматическим выбором запросов stage A
+  и экспортом demo-style GLB-сцены. Оригинальные веса CC-BY-NC-4.0 (non-commercial);
+  коммерческий checkpoint распространяется отдельно.
 - `triposg` — TripoSG: image-to-mesh инференс (DINOv2-large encoder, 21-блочный rectified-flow
-  DiT, SDF VAE decoder/encoder, flash decoder + clean-room DiffDMC по умолчанию). Лицензия MIT;
-  BriaRMBG 1.4 для RGB-входа поставляется отдельным пакетом `rmbg-1.4` под лицензией BRIA.
+  DiT, SDF VAE decoder/encoder, flash decoder + clean-room DiffDMC по умолчанию), плюс
+  TripoSG-scribble с двойным conditioning (`--mode scribble`), батчевые прогоны
+  `--num-shapes` по нескольким изображениям и референсный VAE surface-encode
+  (`--surface-input`). Лицензия MIT; BriaRMBG 1.4 для RGB-входа поставляется отдельным
+  пакетом `rmbg-1.4` под лицензией BRIA.
 - `trellis2` — TRELLIS.2-4B: image-to-3D инференс (DINOv3 ViT-L/16 encoder, SS flow DiT,
   shape/texture SLAT flow-трансформеры, FlexiDualGrid VAE, O-Voxel dual-grid меш с PBR-атрибутами
   вершин) плюс пайплайн текстурирования существующих мешей (`--texture-mesh`).
@@ -62,8 +66,9 @@ Lux3D / candle-3d — это Rust 2024 workspace, который предост�
 ## Ключевые возможности
 
 - `lux3d-core` реализует контракты, загрузку runtime, экспорт и проверку весов.
-- `lux3d-cli` предоставляет команды `inspect`, `weights normalize` и `run`.
-- `lux3d-server-core` предоставляет OpenAI-style async HTTP API для Pi3, Pi3X, TripoSR, VGGT, TripoSG и TRELLIS.2.
+- `lux3d-cli` предоставляет команды `inspect`, `weights normalize`, `weights quantize`,
+  `run` и команды работы с o_voxel-объёмами `ovox mesh2ovox` / `ovox2mesh` / `ovox2glb`.
+- `lux3d-server-core` предоставляет OpenAI-style async HTTP API для генерации Pi3, Pi3X, TripoSR, VGGT, TripoSG и TRELLIS.2, а также текстурирования мешей TRELLIS.2 (`POST /v1/meshes/texturings`).
 - Python baseline tooling описан в [`tools/python_baseline/README.md`](https://github.com/oxide-lab/Lux3d/blob/main/tools/python_baseline/README.md).
 - Лицензирование по каждому семейству моделей можно проверить через CLI перед распространением артефактов.
 - **Экспериментально:** инференс на Vulkan и WGPU через `--device vulkan` / `--device wgpu` (сборка с `--features vulkan` / `--features wgpu`). CUDA — основной бэкенд; для путей Pi3/Pi3X/TripoSR и VGGT есть проверки корректности на Vulkan, а для TripoSG — smoke-проверки Vulkan/WGPU (см. [Производительность](#производительность)). WGPU остаётся экспериментальным — может работать нестабильно, давать неверный результат или не запускаться в зависимости от железа и драйверов.
@@ -561,11 +566,22 @@ cargo run -p lux3d-cli -- run vggt --source <input-sequence> --output <output-fi
 # экспорт + point cloud из depth рядом с основным confidence-filtered PLY
 cargo run -p lux3d-cli -- run vggt --model-path <canonical-vggt-dir> --source <input-sequence> --preprocess-mode pad --vggt-dtype f16 --batch-size 2 --colmap-dir <sparse-dir> --depth-points <depth.ply> --output <output-file.ply>
 
+# VGGT square-1024 препроцессинг (официальный путь demo_colmap.py), feedforward COLMAP-экспорт
+# с point-head источником точек и seeded случайным лимитом точек
+cargo run -p lux3d-cli -- run vggt --model-path <canonical-vggt-dir> --source <input-sequence> --preprocess-mode square --colmap-dir <sparse-dir> --colmap-point-source pointmap --colmap-seed 42 --output <output-file.ply>
+
 # VGGT из одного файла изображения (сцена из одного кадра)
 cargo run -p lux3d-cli -- run vggt --source <image.png> --output <output-file.ply>
 
-# VGGT явные track-запросы -> JSON треков (автоматический выбор запросов НЕ включён)
+# VGGT явные track-запросы -> JSON треков
 cargo run -p lux3d-cli -- run vggt --source <input-sequence> --track-queries '[{"frame":0,"x":259,"y":259}]' --track-output tracks.json --output <output-file.ply>
+
+# VGGT автоматический выбор запросов stage A (DINOv2-reg ranking + FPS-точки) и track-based
+# COLMAP-экспорт без BA (COLMAP-ready вход для внешнего BA)
+cargo run -p lux3d-cli -- run vggt --model-path <canonical-vggt-dir> --source <input-sequence> --track-auto --query-frame-num 8 --max-query-pts 4096 --colmap-dir <sparse-dir> --colmap-mode track --output <output-file.ply>
+
+# VGGT demo-style GLB-сцена (confidence-filtered point cloud + опциональные конусы камер)
+cargo run -p lux3d-cli -- run vggt --model-path <canonical-vggt-dir> --source <input-sequence> --glb <scene.glb> --glb-conf-percentile 50 --glb-show-cam --output <output-file.ply>
 
 # TripoSG -> GLB (по умолчанию: 50 rectified-flow шагов, CFG 7.0, seed 42, flash decoder depth 9)
 cargo run -p lux3d-cli --features cuda -- run triposg --rmbg-model-path <canonical-rmbg-dir> --model-path <canonical-triposg-dir> --source <input-image> --output <output-file.glb>
@@ -576,6 +592,19 @@ cargo run -p lux3d-cli --features cuda -- run triposg --model-path <canonical-tr
 
 # Автоскачивание canonical package TripoSG (oxide-lab/TripoSG); RMBG 1.4 — отдельный пакет
 cargo run -p lux3d-cli --features cuda -- run triposg --source <input-image> --output <output-file.glb>
+
+# Батчевый TripoSG: повторяемый --source (по изображению на источник) и --num-shapes на промпт;
+# общий batch = источники * --num-shapes, выходы получают суффиксы _0, _1, ...
+cargo run -p lux3d-cli --features cuda -- run triposg --model-path <canonical-triposg-dir> --source <image-a.png> --source <image-b.png> --num-shapes 2 --output <output.glb>
+
+# Референсный VAE surface encode TripoSG (scripts/inference_vae.py): .npy с keyed dict
+# {"surface_points": [N,3], "surface_normals": [N,3]}; image/DINO/denoise пропускаются
+cargo run -p lux3d-cli --features cuda -- run triposg --model-path <canonical-triposg-dir> --surface-input <surface.npy> --output <output.glb>
+
+# TripoSG-scribble: двойной conditioning CLIP-промпта и scribble-изображения (сырой
+# checkpoint VAST-AI/TripoSG-scribble или квантованный DiT .gguf); --prompt обязателен,
+# --scribble-conf/--prompt-conf переопределяют веса ветвей (0.4 / 1.0)
+cargo run -p lux3d-cli --features cuda -- run triposg --mode scribble --prompt "a cat with wings" --model-path models/TripoSG-scribble --source <scribble.png> --scribble-conf 0.4 --prompt-conf 1.0 --output <output.glb>
 
 # Опции референсного post-process/загрузки: `--faces <n>` (целевое число граней после merge-close +
 # meshopt quadric simplification — clean-room аппроксимация upstream pymeshlab; 0 = выкл.,
@@ -596,6 +625,12 @@ cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <canonical-t
 cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <canonical-trellis2-dir> --rmbg-model-path <canonical-rmbg2-dir> --source <input-image> --pipeline-type 512 --steps 12 --seed 42 --output <preview.glb>
 # Сырой каталог checkpoint'ов microsoft/TRELLIS.2-4B (pipeline.json + ckpts/) принимается как есть:
 cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <raw-TRELLIS.2-4B-dir> --rmbg-model-path <raw-RMBG-2.0-dir> --source <input-image> --output <output-file.glb>
+# Резидентный режим стадий (upstream low_vram=False): все загруженные стадии остаются на устройстве
+# на весь прогон вместо дефолтной загрузки/выгрузки по стадиям; те же выходы, быстрее, выше пик VRAM
+cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <canonical-trellis2-dir> --rmbg-model-path <canonical-rmbg2-dir> --source <input-image> --no-low-vram --output <output-file.glb>
+# Вернуть pre-remesh cleanup-цепочку или настроить band/project дефолтного narrow-band remesh:
+cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <canonical-trellis2-dir> --rmbg-model-path <canonical-rmbg2-dir> --source <input-image> --no-remesh --output <output-file.glb>
+cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <canonical-trellis2-dir> --rmbg-model-path <canonical-rmbg2-dir> --source <input-image> --remesh-band 1 --remesh-project 0.5 --output <output-file.glb>
 # Переопределение размера запекаемой текстуры (по умолчанию 2048; CLI принимает 64..=8192 кратное 8;
 # `--no-texture-export` полностью пропускает UV unwrap + bake, `--no-uv-unwrap` — только unwrap):
 cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <canonical-trellis2-dir> --rmbg-model-path <canonical-rmbg2-dir> --source <input-image> --texture-size 2048 --output <output-file.glb>
@@ -604,20 +639,20 @@ cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <canonical-t
 # --source — condition-изображение, --texture-mesh принимает .glb/.obj/.ply/.stl, выход обязательно .glb.
 # Shape encoder берётся из сырого `ckpts/shape_enc_next_dc_f16c32_fp16.safetensors`
 # или из `external/shape_enc/model.safetensors` в каталоге canonical/GGUF-пакета.
-# `--texture-resolution` 512|1024 (по умолчанию 1024).
-cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <raw-TRELLIS.2-4B-dir> --rmbg-model-path <raw-RMBG-2.0-dir> --source <condition-image> --texture-mesh <input-mesh.glb> --texture-resolution 1024 --output textured.glb
+# `--texture-resolution` 512|1024|1536 (по умолчанию 1024; 1536 использует conditioning/DiT 1024).
+cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <raw-TRELLIS.2-4B-dir> --rmbg-model-path <raw-RMBG-2.0-dir> --source <condition-image> --texture-mesh <input-mesh.glb> --texture-resolution 1536 --output textured.glb
 
 # Автоскачивание canonical packages из Hugging Face в пользовательский cache
 cargo run -p lux3d-cli -- run pi3 --source <input-sequence> --output <output-file.ply>
 ```
 
-**Форматы вывода:** mesh-команды (`triposr`, `triposg`, `trellis2`) выбирают writer по расширению: `.glb` (основной/по умолчанию), `.obj`, `.ply`, `.stl`. `.stl` бинарный и не хранит цвета вершин, поэтому цветной вывод `trellis2` в `.stl` теряет покраску; writer текстурированного GLB работает только с `.glb` (`--texture-mesh` требует `.glb` на выходе). Point-cloud команды (`pi3`, `pi3x`, `vggt`) — `.ply` (основной) или `.xyz`. HTTP mesh API по умолчанию отдаёт GLB, point-cloud API — PLY; формат задаётся `options.output_format` (`glb`/`obj`/`ply`/`stl` и `ply`/`xyz` соответственно). Текстурированный `.glb`-прогон `trellis2` встраивает запечённые PNG base-color + metallic-roughness с UV и нормалями (parity с upstream `to_glb`) и дополнительно пишет пару sidecar-файлов `<stem>.pbrvox.bin` + `<stem>.pbr.json` рядом с выводом: PBR-атрибуты вершин (6 каналов) на разреженной воксельной сетке не помещаются в форматы GLB/OBJ/PLY/STL, поэтому sidecar сохраняет их без потерь. `.obj`/`.ply`/`.stl` выводы `trellis2` текстуры не встраивают — остаётся меш с цветами вершин (`.ply`), только с позициями (`.obj`) или без цветов (`.stl`). HTTP-сервер не пробрасывает настройки экспорта текстурированного GLB, но маппит postprocess-поля TRELLIS.2 (`postprocess`, `decimation_target`, `fill_hole_perimeter`, `min_component_area`, `remesh`, `remesh_band`, `remesh_project`): `trellis2`-задачи с `.glb` на выходе пишут GLB со встроенными текстурами (плюс PBR-sidecar'ы в workspace задачи; sidecar'ы не раздаются через `/content`). `--texture-mesh` всегда пишет текстурированный `.glb` (и требует `.glb` на выходе) без PBR-sidecar.
+**Форматы вывода:** mesh-команды (`triposr`, `triposg`, `trellis2`) выбирают writer по расширению: `.glb` (основной/по умолчанию), `.obj`, `.ply`, `.stl`. `.stl` бинарный и не хранит цвета вершин, поэтому цветной вывод `trellis2` в `.stl` теряет покраску; writer текстурированного GLB работает только с `.glb` (`--texture-mesh` требует `.glb` на выходе). Point-cloud команды (`pi3`, `pi3x`, `vggt`) — `.ply` (основной) или `.xyz`. HTTP mesh API по умолчанию отдаёт GLB, point-cloud API — PLY; формат задаётся `options.output_format` (`glb`/`obj`/`ply`/`stl` и `ply`/`xyz` соответственно). Текстурированный `.glb`-прогон `trellis2` встраивает запечённые PNG base-color + metallic-roughness с UV и нормалями (parity с upstream `to_glb`) и дополнительно пишет пару sidecar-файлов `<stem>.pbrvox.bin` + `<stem>.pbr.json` рядом с выводом: PBR-атрибуты вершин (6 каналов) на разреженной воксельной сетке не помещаются в форматы GLB/OBJ/PLY/STL, поэтому sidecar сохраняет их без потерь. `.obj`/`.ply`/`.stl` выводы `trellis2` текстуры не встраивают — остаётся меш с цветами вершин (`.ply`), только с позициями (`.obj`) или без цветов (`.stl`). HTTP-сервер маппит postprocess- и texture-export-поля TRELLIS.2 (`postprocess`, `decimation_target`, `fill_hole_perimeter`, `min_component_area`, `remesh`, `remesh_band`, `remesh_project`, `texture`, `texture_size`): `trellis2`-задачи с `.glb` на выходе пишут GLB со встроенными текстурами (плюс PBR-sidecar'ы в workspace задачи; sidecar'ы не раздаются через `/content`). Отдельный endpoint `POST /v1/meshes/texturings` текстурирует существующий меш и всегда пишет `trellis2-textured.glb` (без PBR-sidecar); `--texture-mesh` в CLI работает так же (и требует `.glb` на выходе). `--return-latent` и CLI-only поверхности TripoSG (`--surface-input`, `--mode scribble`, повторяемый `--source`, `--num-shapes`) не имеют HTTP-полей.
 
-> **Заметки по VGGT:** `--source` принимает каталог кадров (`.png`/`.jpg`/`.jpeg`), видеофайл (`.mp4`/`.mov`/`.avi`/`.mkv`) или одно изображение (`.png`/`.jpg`/`.jpeg`/`.webp`/`.bmp`/`.tif`/`.tiff` — сцена из одного кадра). `--preprocess-mode` выбирает `crop` (upstream-дефолт: resize по ширине 518, центральный crop строк выше 518, затем white-pad до максимума в батче) или `pad` (длинная сторона 518, центральный white-pad до квадрата 518x518, без потери пикселей — используйте, когда важна композиция). `--vggt-dtype f32|f16|bf16` задаёт dtype загрузки сети (`f32` — референс; публичные выходы остаются f32; отдельный флаг от TripoSG `--dtype`) — F16/BF16 подключены, но автоматический parity-набор только F32/CUDA, а BF16 не проверен. `--batch-size N` режет список кадров на последовательные чанки по N кадров и гоняет каждый как отдельный B=1 проход: это ограничивает пик VRAM, но НЕ единый attention-проход по всем кадрам — межкадровое внимание видит только кадры своего чанка, поэтому результаты чанкинга отличаются от полного прохода, если сцена занимает несколько чанков (по умолчанию 1; 0 отклоняется; значение >= числа кадров — обычный одиночный проход). `--colmap-dir` пишет бинарную sparse-модель COLMAP (`cameras.bin`/`images.bin`/`points3D.bin`) в upstream-режиме `demo_colmap.py` feedforward: одна PINHOLE-камера на изображение, point-head `world_points` с гейтом `depth_conf >= --colmap-conf-threshold` (по умолчанию 5.0) и лимитом `--colmap-max-points` (по умолчанию 100000, детерминированная равномерная подвыборка — upstream использует seeded `np.random.choice`), интринсики пересчитываются в исходное разрешение; для каталога сохраняются имена кадров, для видео/одного изображения пишется `image_N`; прогон печатает статистику экспорта. `--depth-points <path>` разворачивает depth-карты в world-space point cloud PLY/XYZ (`depth_conf > --depth-conf-threshold`, по умолчанию 1.0). `--track-queries '<json>'` трекает явные query-точки (`{"frame":0,"x":F,"y":F}` или массивы `[0,x,y]`; пиксельные координаты во входном разрешении модели, x/y в [0, 518); query-кадр должен быть 0 — поверните клип так, чтобы нужный кадр шёл первым) и пишет `{"coords": [[[x,y],...],...], "visibility": [[...],...], "confidence": [[...],...]|null}` в `--track-output` (по умолчанию `<source-stem>_tracks.json`) с числом итераций уточнения `--track-iters` (по умолчанию 4; 0 отклоняется). Автоматический выбор запросов (ALIKED/SP keypoints, DINO query-frame ranking) НЕ включён: нужны явные запросы, а `--batch-size` > 1 вместе с трекингом отклоняется (track-проход идёт по всем кадрам сразу). `--track-points-ply <path>` пишет по одной цветной вершине на запрос (world-точка кадра 0 в пикселе запроса). `--dump-npz` сохраняет сырые тензоры инференса (включая стек `pose_enc_list`, `[K, S, 9]`, по записи на итерацию уточнения камеры) и работает вместе с track/COLMAP/depth-флагами.
+> **Заметки по VGGT:** `--source` принимает каталог кадров (`.png`/`.jpg`/`.jpeg`), видеофайл (`.mp4`/`.mov`/`.avi`/`.mkv`) или одно изображение (`.png`/`.jpg`/`.jpeg`/`.webp`/`.bmp`/`.tif`/`.tiff` — сцена из одного кадра). `--preprocess-mode` выбирает `crop` (upstream-дефолт: resize по ширине 518, центральный crop строк выше 518, затем white-pad до максимума в батче), `pad` (длинная сторона 518, центральный white-pad до квадрата 518x518, без потери пикселей — используйте, когда важна композиция) или `square` (официальный путь `demo_colmap.py`: black-pad до квадрата 1024x1024, вход модели — его bilinear-уменьшение до 518x518, а официальные координаты `x1/y1/x2/y2/width/height` управляют COLMAP-экспортом в исходном разрешении). `--vggt-dtype f32|f16|bf16` задаёт dtype загрузки сети (`f32` — референс; публичные выходы остаются f32; отдельный флаг от TripoSG `--dtype`) — F16/BF16 подключены, но автоматический parity-набор только F32/CUDA, а BF16 не проверен. `--batch-size N` режет список кадров на последовательные чанки по N кадров и гоняет каждый как отдельный B=1 проход: это ограничивает пик VRAM, но НЕ единый attention-проход по всем кадрам — межкадровое внимание видит только кадры своего чанка, поэтому результаты чанкинга отличаются от полного прохода, если сцена занимает несколько чанков (по умолчанию 1; 0 отклоняется; значение >= числа кадров — обычный одиночный проход). `--colmap-dir` пишет бинарную sparse-модель COLMAP (`cameras.bin`/`images.bin`/`points3D.bin`) плюс соседний `points.ply`. Дефолтный `--colmap-mode feedforward` повторяет feedforward-ветку upstream `demo_colmap.py`: одна PINHOLE-камера на изображение, источник точек `--colmap-point-source depth` (по умолчанию; гейт `depth_conf >= --colmap-conf-threshold`, по умолчанию 5.0) или `pointmap` (point-head `world_points`), лимит `--colmap-max-points` (по умолчанию 100000). Без `--colmap-seed` лимит оставляет детерминированную равномерную подвыборку; с seed — случайная выборка (распределённо эквивалентна numpy `randomly_limit_trues`, но не бит-идентична). Интринсики пересчитываются в исходное разрешение; для каталога сохраняются имена кадров, для видео/одного изображения пишется `image_N`; прогон печатает статистику экспорта. `--colmap-mode track` пишет track-based реконструкцию `batch_np_matrix_to_pycolmap` (SIMPLE_PINHOLE-камеры, много-кадровые треки, гейт `vis > --vis-thresh` по умолчанию 0.2, ошибка репроекции `< --max-reproj-error` по умолчанию 8.0, `--shared-camera` и порог `--colmap-min-inlier-per-frame` по умолчанию 64 на кадр); режим требует `--colmap-dir` и `--track-auto` и намеренно НЕ выполняет bundle adjustment — это COLMAP-ready вход для внешнего BA/gsplat. `--depth-points <path>` разворачивает depth-карты в world-space point cloud PLY/XYZ (`depth_conf > --depth-conf-threshold`, по умолчанию 1.0). `--track-queries '<json>'` трекает явные query-точки (`{"frame":0,"x":F,"y":F}` или массивы `[0,x,y]`; пиксельные координаты во входном разрешении модели, x/y в [0, 518); query-кадр должен быть 0 — поверните клип так, чтобы нужный кадр шёл первым) и пишет `{"coords": [[[x,y],...],...], "visibility": [[...],...], "confidence": [[...],...]|null}` в `--track-output` (по умолчанию `<source-stem>_tracks.json`), плюс `"query_frames"` для auto-режима, с числом итераций уточнения `--track-iters` (по умолчанию 4; 0 отклоняется). `--track-auto` заменяет явные запросы стадией A трекинга: DINOv2 ViT-B/14-with-registers CLS-сходство + FPS ранжируют `--query-frame-num` кадров (по умолчанию 8; кадр 0 добавляется первым, если его нет), FPS выбирает до `--max-query-pts` точек на query-кадр (по умолчанию 4096), точки проходят confidence-гейт как в `track_predict.py` (conf > 1.2, когда выживает больше 512); нужен safetensors DINOv2-reg в `models/dinov2_reg4/model.safetensors` или `LUX3D_DINOV2_REG_MODEL_PATH`. Stage A НЕ включает официальные ALIKED/SuperPoint keypoint extractors и стадии fine tracker B/C, поэтому автоматические треки грубее официального BA-входа. `--track-queries` и `--track-auto` взаимоисключающие, а `--batch-size` > 1 вместе с любым трекингом отклоняется (track-проход идёт по всем кадрам сразу). `--track-points-ply <path>` пишет по одной цветной вершине на запрос (world-точка кадра 0 в пикселе запроса). `--glb <scene.glb>` пишет demo-gradio GLB-сцену из `predictions_to_glb`: confidence-filtered цветные точки (отбрасывается `--glb-conf-percentile` процентов точек с наименьшей уверенностью, по умолчанию 50; 0 отключает percentile-гейт и оставляет все точки с `conf > 1e-5`) из `--glb-point-source depth` (по умолчанию) или `pointmap`, плюс конусы камер по кадрам с `--glb-show-cam`; сцена выравнивается по первой камере с официальной OpenGL-конвенцией ±y/z. `--dump-npz` сохраняет сырые тензоры инференса: исторические ключи (`world_points`, `world_points_conf`, `depth`, `depth_conf`, `extrinsics`, `intrinsics`, `pose_enc`, `pose_enc_list` `[K, S, 9]`, по записи на итерацию уточнения камеры) плюс официальные demo-ключи `images`, `extrinsic`, `intrinsic` и `world_points_from_depth`; работает вместе с track/COLMAP/depth/GLB-флагами.
 
-> **Заметки по TRELLIS.2:** `--pipeline-type` принимает `512`, `1024`, `1024_cascade` (референсный дефолт) или `1536_cascade` (каскад с целевой сеткой 1536 и жёстким стопом по бюджету токенов на 1024; каскад 1024 всегда декодирует на 1024). Диспетчеризация вариантов и цикл бюджета токенов 1536→…→1024 покрыты тестами, но реального end-to-end прогона parity для `1536_cascade` на боевых весах в этом дереве нет. `--steps` задаёт число шагов всем трём сэмплерам; постадийные override'ы (`--ss-steps/--shape-steps/--tex-steps`, `--ss-guidance/--shape-guidance/--tex-guidance`, `--ss-rescale/--shape-rescale/--tex-rescale`, `--ss-interval/--shape-interval/--tex-interval` в формате `lo,hi`) заменяют дефолты соответствующей стадии (`resolve_stage_params`: `steps` стадии выигрывает у `--steps`). `--num-samples N` повторяет структуру дро (draw structure) upstream `run(num_samples)` (`trellis2_image_to_3d.py:208, 253`): ОДИН совместный тензор шума `[N, 8, R, R, R]` для sparse structure и ОДИН совместный тензор шума на каждую SLAT-стадию по объединённым координатам всех сэмплов (оба из `--seed`), один общий conditioning-проход и по-сэмпловые сэмплинг SLAT/декод/экспорт; выходные файлы и латенты получают суффиксы `_0`, `_1`, ... (`N = 1` сохраняет одиночный путь бит-в-бит). RNG Lux3D не бит-идентичен `torch.randn`, поэтому дро распределённо эквивалентны референсу, а не value-идентичны; `--return-latent <path>` пишет `shape_latent`/`tex_latent`/`coords`/`resolution`/`lr_shape_latent`/`meta` в `.npz` (поверхность upstream `return_latent`). Референсный препроцессинг воспроизведён полностью: LANCZOS-уменьшение длинной стороны, alpha-путь при непустом alpha-канале RGBA, иначе RMBG-2.0/BiRefNet строит маску (отсутствие весов RMBG — ошибка, а не opaque-fallback), затем bbox по alpha>0.8, квадратный crop с Pillow-округлением, premultiply и resize. Постобработка меша включена по умолчанию и повторяет shipped-точки входа `to_glb` (`example.py:43`, `app.py:503`): общая заливка дыр (`--fill-hole-perimeter`, по умолчанию 3e-2; 0 = выкл.), затем narrow-band dual-contouring remesh в каноническом фрейме `[-0.5, 0.5]^3` с `scale = (resolution + 3 * band) / resolution` (`--remesh-band`, по умолчанию 1 ячейка сетки; `--remesh-project`, по умолчанию 0 = выкл.) и один проход simplify до `--decimation-target` (по умолчанию 1000000; 0 = оставить remesh-топологию). `--no-remesh` возвращает прежнюю cleanup-цепочку (агрессивный simplify x3, ремонт дублированных/неманифолдных граней, удаление мелких компонент через `--min-component-area`, по умолчанию 1e-5; 0 = оставить все, унификация ориентации, финальный simplify) байт-в-байт; `--no-postprocess` отключает весь проход. Текстурированные GLB после remesh получают `doubleSided = false` (upstream `postprocess.py:303`), меши без remesh/pass-through сохраняют `true`. Remesh — clean-room порт narrow-band dual contouring, cleanup/decimation — clean-room порты на simplifier'е meshopt, а не cumesh, поэтому топология может отличаться от референса. При включённом `--texture` (по умолчанию) стадия экспорта текстурированного GLB повторяет upstream `to_glb` UV unwrap + PBR bake: `--texture-size <n>` задаёт размер запекаемой текстуры (по умолчанию 2048; CLI принимает 64..=8192, upstream-референс допускает только 1024..4096 шагом 1024, а ядро дополнительно требует кратность 8), и выходной `.glb` встраивает PNG base-color + metallic-roughness с TEXCOORD UV, area-weighted нормалями и upstream-конверсией осей glTF `(x, y, z) -> (x, z, -y)`. `--no-texture-export` пропускает всю стадию, `--no-uv-unwrap` — только xatlas unwrap (оба варианта откатываются к мешу с цветами вершин; `.obj`/`.ply`/`.stl` текстуры не встраивают). xatlas unwrap + bake идут на CPU — измерено ~42 с unwrap + ~9 с bake для сферы в 80k треугольников при 2048 (release-сборка, это дерево), стоимость растёт как `--texture-size` в квадрате. Непокрытые тексели атласа заполняются TELEA-аппроксимацией (итеративный onion-peel ближайшего валидного текселя), а не референсным `cv2.inpaint`; прогон печатает статистику `[bake]` (charts, atlases, atlas size, texture size, valid/inpainted texels). Меш остаётся поверхностью O-Voxel dual-grid, а пара sidecar-файлов `<stem>.pbrvox.bin` + `<stem>.pbr.json` — lossless-записью PBR по вокселям. Стадии весов загружаются последовательно (~7.8 GiB измеренный пик на `1024_cascade` при резидентных текстурных стадиях); инференс на CPU работает, но медленный. Автоскачивание из `oxide-lab/TRELLIS.2-4B` зарезервировано, но репозиторий ещё не опубликован, поэтому передавайте явный `--model-path` (canonical-пакет или сырой каталог checkpoint'ов).
+> **Заметки по TRELLIS.2:** `--pipeline-type` принимает `512`, `1024`, `1024_cascade` (референсный дефолт) или `1536_cascade` (каскад с целевой сеткой 1536 и жёстким стопом по бюджету токенов на 1024; каскад 1024 всегда декодирует на 1024). Диспетчеризация вариантов и цикл бюджета токенов 1536→…→1024 покрыты тестами, но реального end-to-end прогона parity для `1536_cascade` на боевых весах в этом дереве нет. `--steps` задаёт число шагов всем трём сэмплерам; постадийные override'ы (`--ss-steps/--shape-steps/--tex-steps`, `--ss-guidance/--shape-guidance/--tex-guidance`, `--ss-rescale/--shape-rescale/--tex-rescale`, `--ss-interval/--shape-interval/--tex-interval` в формате `lo,hi`) заменяют дефолты соответствующей стадии (`resolve_stage_params`: `steps` стадии выигрывает у `--steps`). `--num-samples N` повторяет структуру дро (draw structure) upstream `run(num_samples)` (`trellis2_image_to_3d.py:208, 253`): ОДИН совместный тензор шума `[N, 8, R, R, R]` для sparse structure и ОДИН совместный тензор шума на каждую SLAT-стадию по объединённым координатам всех сэмплов (оба из `--seed`), один общий conditioning-проход и по-сэмпловые сэмплинг SLAT/декод/экспорт; выходные файлы и латенты получают суффиксы `_0`, `_1`, ... (`N = 1` сохраняет одиночный путь бит-в-бит). RNG Lux3D не бит-идентичен `torch.randn`, поэтому дро распределённо эквивалентны референсу, а не value-идентичны; `--return-latent <path>` пишет `shape_latent`/`tex_latent`/`coords`/`resolution`/`lr_shape_latent`/`meta` в `.npz` (поверхность upstream `return_latent`). Референсный препроцессинг воспроизведён полностью: LANCZOS-уменьшение длинной стороны, alpha-путь при непустом alpha-канале RGBA, иначе RMBG-2.0/BiRefNet строит маску (отсутствие весов RMBG — ошибка, а не opaque-fallback), затем bbox по alpha>0.8, квадратный crop с Pillow-округлением, premultiply и resize. Постобработка меша включена по умолчанию и повторяет shipped-точки входа `to_glb` (`example.py:43`, `app.py:503`): общая заливка дыр (`--fill-hole-perimeter`, по умолчанию 3e-2; 0 = выкл.), затем narrow-band dual-contouring remesh в каноническом фрейме `[-0.5, 0.5]^3` с `scale = (resolution + 3 * band) / resolution` (`--remesh-band`, по умолчанию 1 ячейка сетки; `--remesh-project`, по умолчанию 0 = выкл.) и один проход simplify до `--decimation-target` (по умолчанию 1000000; 0 = оставить remesh-топологию). `--no-remesh` возвращает прежнюю cleanup-цепочку (агрессивный simplify x3, ремонт дублированных/неманифолдных граней, удаление мелких компонент через `--min-component-area`, по умолчанию 1e-5; 0 = оставить все, унификация ориентации, финальный simplify) байт-в-байт; `--no-postprocess` отключает весь проход. Текстурированные GLB после remesh получают `doubleSided = false` (upstream `postprocess.py:303`), меши без remesh/pass-through сохраняют `true`. Remesh — clean-room порт narrow-band dual contouring, cleanup/decimation — clean-room порты на simplifier'е meshopt, а не cumesh, поэтому топология может отличаться от референса. При включённом `--texture` (по умолчанию) стадия экспорта текстурированного GLB повторяет upstream `to_glb` UV unwrap + PBR bake: `--texture-size <n>` задаёт размер запекаемой текстуры (по умолчанию 2048; CLI принимает 64..=8192, upstream-референс допускает только 1024..4096 шагом 1024, а ядро дополнительно требует кратность 8), и выходной `.glb` встраивает PNG base-color + metallic-roughness с TEXCOORD UV, area-weighted нормалями и upstream-конверсией осей glTF `(x, y, z) -> (x, z, -y)`. `--no-texture-export` пропускает всю стадию, `--no-uv-unwrap` — только xatlas unwrap (оба варианта откатываются к мешу с цветами вершин; `.obj`/`.ply`/`.stl` текстуры не встраивают). xatlas unwrap + bake идут на CPU — измерено ~42 с unwrap + ~9 с bake для сферы в 80k треугольников при 2048 (release-сборка, это дерево), стоимость растёт как `--texture-size` в квадрате. Непокрытые тексели атласа заполняются TELEA-аппроксимацией (итеративный onion-peel ближайшего валидного текселя), а не референсным `cv2.inpaint`; прогон печатает статистику `[bake]` (charts, atlases, atlas size, texture size, valid/inpainted texels). Меш остаётся поверхностью O-Voxel dual-grid, а пара sidecar-файлов `<stem>.pbrvox.bin` + `<stem>.pbr.json` — lossless-записью PBR по вокселям. Стадии весов загружаются последовательно (~7.8 GiB измеренный пик на `1024_cascade` при резидентных текстурных стадиях); инференс на CPU работает, но медленный. `--no-low-vram` включает upstream-режим `low_vram=False` и держит все загруженные стадии резидентными на устройстве (один набор загрузки, без выгрузки между стадиями); выходы идентичны дефолтному режиму при том же seed, пик VRAM выше, а не поместившийся резидентный набор завершается ошибкой с именем флага, стадии и лимита памяти устройства вместо тихого fallback. Автоскачивание из `oxide-lab/TRELLIS.2-4B` зарезервировано, но репозиторий ещё не опубликован, поэтому передавайте явный `--model-path` (canonical-пакет или сырой каталог checkpoint'ов).
 
-> **Режим текстурирования TRELLIS.2:** `--texture-mesh <file>` текстурирует существующий меш `.glb`/`.obj`/`.ply`/`.stl` по condition-изображению из `--source` (upstream `Trellis2TexturingPipeline`) вместо image-to-3D. Меш препроцессится в `[-0.5, 0.5]^3` (центрирование/масштаб до 0.99999 + y/z swap; `--no-preprocess-mesh` требует, чтобы вход уже был в этом фрейме), вокселизуется в flexible dual grid при `--texture-resolution` (512 или 1024, по умолчанию 1024), кодирует сырой shape SLAT через `shape_enc_next_dc_f16c32_fp16`, сэмплирует `tex_dit_512`/`tex_dit_1024` с override'ами `--tex-*`, декодирует с синтезированными occupancy-guide'ами и запекает UV-атлас. Входные UV не сохраняются (атлас всегда переразворачивается); cleanup/decimation/remesh не запускаются (UV-швы дублируют вершины, zero-area грани отбрасываются). `--texture-mesh` требует `.glb` на выходе, отклоняет `--pipeline-type`/`--max-num-tokens`/`--num-samples`/`--return-latent`/`--no-postprocess`/`--decimation-target`/`--no-texture-export`/`--no-uv-unwrap`/`--texture false` и пишет только текстурированный GLB (без PBR-sidecar). Применяются только `--tex-*`, `--seed`, `--texture-size`, `--texture-resolution` и `--no-preprocess-image`/`--no-preprocess-mesh`; `--steps`/`--ss-*`/`--shape-*` не отклоняются, но в этом режиме не действуют. Shape encoder берётся из `<model-dir>/ckpts/shape_enc_next_dc_f16c32_fp16.safetensors` (сырой layout checkpoint'а), `<model-dir>/external/shape_enc/model.safetensors` (sidecar рядом с merged canonical/GGUF-пакетом) или из ключей `shape_enc.*` в merged safetensors-пакете; работают и сырой каталог `TRELLIS.2-4B`, и layout canonical `model.gguf` + внешние encoder/`external/dinov3`. `--no-preprocess-image` пропускает RMBG/crop и подаёт квадратное исходное изображение напрямую (RMBG-модель при этом не требуется).
+> **Режим текстурирования TRELLIS.2:** `--texture-mesh <file>` текстурирует существующий меш `.glb`/`.obj`/`.ply`/`.stl` по condition-изображению из `--source` (upstream `Trellis2TexturingPipeline`) вместо image-to-3D. Меш препроцессится в `[-0.5, 0.5]^3` (центрирование/масштаб до 0.99999 + y/z swap; `--no-preprocess-mesh` требует, чтобы вход уже был в этом фрейме), вокселизуется в flexible dual grid при `--texture-resolution` (512, 1024 или 1536, по умолчанию 1024; 1536 вокселизует/кодирует на полной сетке 1536, но использует conditioning 1024 и `tex_dit_1024`), кодирует сырой shape SLAT через `shape_enc_next_dc_f16c32_fp16`, сэмплирует `tex_dit_512`/`tex_dit_1024` с override'ами `--tex-*`, декодирует с синтезированными occupancy-guide'ами и запекает UV-атлас. Core API `texture_mesh` умеет запекать прямо по переданным per-corner UV (референсная ветка UV-reuse в `postprocess_mesh`, без запуска xatlas), но CLI `--texture-mesh` и HTTP-задача текстурирования загружают меш по пути и не передают его входные UV, поэтому эти поверхности всегда переразворачивают атлас; cleanup/decimation/remesh не запускаются (UV-швы дублируют вершины, zero-area грани отбрасываются). `--texture-mesh` требует `.glb` на выходе, отклоняет `--pipeline-type`/`--max-num-tokens`/`--num-samples`/`--return-latent`/`--no-postprocess`/`--decimation-target`/`--no-texture-export`/`--no-uv-unwrap`/`--texture false` и пишет только текстурированный GLB (без PBR-sidecar). Применяются только `--tex-*`, `--seed`, `--texture-size`, `--texture-resolution` и `--no-preprocess-image`/`--no-preprocess-mesh`; `--steps`/`--ss-*`/`--shape-*` не отклоняются, но в этом режиме не действуют. Shape encoder берётся из `<model-dir>/ckpts/shape_enc_next_dc_f16c32_fp16.safetensors` (сырой layout checkpoint'а), `<model-dir>/external/shape_enc/model.safetensors` (sidecar рядом с merged canonical/GGUF-пакетом) или из ключей `shape_enc.*` в merged safetensors-пакете; работают и сырой каталог `TRELLIS.2-4B`, и layout canonical `model.gguf` + внешние encoder/`external/dinov3`. `--no-preprocess-image` пропускает RMBG/crop и подаёт квадратное исходное изображение напрямую (RMBG-модель при этом не требуется).
 
 > **Экспериментальные бэкенды (Vulkan / WGPU):** выбор устройства через `--device`:
 >
@@ -629,9 +664,127 @@ cargo run -p lux3d-cli -- run pi3 --source <input-sequence> --output <output-fil
 >
 > Эти пути экспериментальные и не проверяются в CI. Инференс может работать нестабильно, выдавать некорректный результат или вовсе не запускаться в зависимости от GPU, драйвера и ОС. Для продакшена используй CUDA.
 
+### Команды o_voxel-объёмов
+
+Группа `ovox` конвертирует текстурные меши в разреженный PBR O-Voxel-объём, который использует TRELLIS.2 (примеры upstream `o-voxel`), и обратно. Это CLI-only команды (HTTP-маршрута нет); каждая печатает JSON-отчёт со статистикой.
+
+```powershell
+# Текстурный меш -> разреженный PBR .vxz (по умолчанию 512^3; .npz/.ply тоже принимаются на выходе)
+cargo run -p lux3d-cli -- ovox mesh2ovox <input.glb> <output.vxz>
+
+# .vxz/.npz/.ply -> восстановленный .ply с base-color цветами вершин
+cargo run -p lux3d-cli -- ovox ovox2mesh <input.vxz> <output.ply> --grid-size 512 --aabb -0.5,-0.5,-0.5,0.5,0.5,0.5
+
+# .vxz/.npz/.ply -> очищенный, UV-unwrapped, текстурированный .glb (дефолты официального
+# примера: decimation 100000, texture 2048)
+cargo run -p lux3d-cli -- ovox ovox2glb <input.vxz> <output.glb> --grid-size 512 --texture-size 2048
+```
+
+Флаги `mesh2ovox`: `--grid-size N[,N,N]` (по умолчанию 512), `--voxel-size S[,S,S]`, `--aabb MINX,...,MAXZ`, `--no-normalize` (пропустить официальную нормализацию в unit-cube: центр + `0.99999/max_extent`), `--mip-level-offset` (0.0), `--face-weight` (1.0), `--boundary-weight` (0.2), `--regularization-weight` (1e-2) и `--compression none|deflate` (по умолчанию `deflate`). `.vxz` пишется только с `none` или `deflate`: LZMA-файлы читаются (официальный writer по умолчанию использует LZMA), но запись LZMA не поддерживается, а zstd-сжатые файлы отклоняются с явной ошибкой, потому что в этой сборке нет zstd-декодера. `ovox2mesh`/`ovox2glb` требуют `--grid-size` и `--aabb`, потому что `.vxz` не хранит размер сетки и границы (дефолты 512 и `[-0.5, 0.5]^3`). `ovox2glb` дополнительно принимает `--decimation-target` (100000), `--texture-size` (2048), `--fill-hole-perimeter` (3e-2) и `--min-component-area` (1e-5).
+
 ### Запуск HTTP-Сервера
 
-HTTP-сервер (`cargo run -p lux3d-server --features cuda -- --host 127.0.0.1 --port 8080`): TRELLIS.2 RGB-запросам нужен отдельный пакет RMBG-2.0. Передайте его через `--trellis2-rmbg-model-path <dir>` / `LUX3D_TRELLIS2_RMBG_MODEL_PATH` или положите `rmbg-2.0` (либо сырой `RMBG-2.0`) рядом с явным `--model-path`. Для TripoSG `--rmbg-model-path` / `LUX3D_RMBG_MODEL_PATH` остаётся отдельным пакетом RMBG-1.4; семейства намеренно не делят веса.
+```powershell
+cargo run -p lux3d-server --features cuda -- --host 127.0.0.1 --port 8080
+curl http://127.0.0.1:8080/health
+curl http://127.0.0.1:8080/v1/models
+```
+
+TRELLIS.2 RGB-запросам нужен отдельный пакет RMBG-2.0. Передайте его через
+`--trellis2-rmbg-model-path <dir>` / `LUX3D_TRELLIS2_RMBG_MODEL_PATH` или положите
+`rmbg-2.0` (либо сырой `RMBG-2.0`) рядом с явным `--model-path`. Для TripoSG
+`--rmbg-model-path` / `LUX3D_RMBG_MODEL_PATH` остаётся отдельным пакетом RMBG-1.4;
+семейства намеренно не делят веса.
+
+Флаги серверного бинарника (`crates/lux3d-server/src/main.rs`): `--host` / `--port`
+(по умолчанию `127.0.0.1:8080`), `--model-path` (`LUX3D_MODEL_PATH`), `--cache-dir`
+(`LUX3D_CACHE_DIR`), `--rmbg-model-path` (`LUX3D_RMBG_MODEL_PATH`),
+`--trellis2-rmbg-model-path` (`LUX3D_TRELLIS2_RMBG_MODEL_PATH`), `--cuda-device` (0),
+`--upload-dir`, `--cors-origin` (повторяемый), `--job-ttl-secs` (86400),
+`--cleanup-interval-secs` (300), `--access-log` (true), `--access-log-health` (false),
+`--access-log-format text|json`, `--request-id-header` (true) и `--metrics` (true).
+Бинарник всегда собирается с платформенным дефолтным устройством (CUDA вне macOS,
+Metal на macOS metal-сборках); Vulkan/WGPU (и явный выбор Metal) доступны только через
+`with_device_backend` встраиваемого router builder'а.
+
+Готовые релизы (`.github/workflows/release.yml`): Windows + Ubuntu × cpu/cuda/vulkan.
+Имена по образцу llama.cpp (`lux3d-<tag>-bin-…`). CUDA-сборки не содержат библиотек NVIDIA:
+скачайте соответствующий архив `cudart-lux3d-<tag>-…` и распакуйте рядом с бинарниками
+(в той же директории, что и `.exe`; `$ORIGIN` на Linux). Хосту нужен только драйвер NVIDIA.
+
+Generation-endpoint'ы принимают `multipart/form-data` (или JSON) и возвращают `202 Accepted` с async job object:
+
+| Endpoint | Models | Output |
+|----------|--------|--------|
+| `POST /v1/point-clouds/generations` | `pi3`, `pi3x`, `vggt` | PLY |
+| `POST /v1/meshes/generations` | `triposr`, `triposg`, `trellis2` | GLB |
+| `POST /v1/meshes/texturings` | `trellis2` | GLB (встроенные текстуры) |
+
+`POST /v1/meshes/texturings` текстурирует существующий меш по одному condition-изображению (только TRELLIS.2). Multipart-поля: `source` (condition-изображение), `mesh` (`.glb`/`.obj`/`.ply`/`.stl`), опциональные `model` (по умолчанию `trellis2`) и `options`. JSON-поля: `source_url`/`source_file_id`/`source_base64`/`source_filename`, `mesh_url`/`mesh_file_id`/`mesh_base64`/`mesh_filename`, опциональные `model`, `options`, `webhook_url`; нужен хотя бы один вариант из `source*` и один из `mesh*`. `options` принимает `output_format` (только `glb`; по умолчанию `glb`), `seed` (42), `texture_resolution` (512/1024/1536; по умолчанию 1024), `texture_size` (2048), `tex_steps`, `tex_guidance_strength`, `tex_guidance_rescale`, `tex_guidance_interval` (`[lo, hi]`), `tex_rescale_t`, `preprocess_image` и `preprocess_mesh` (оба по умолчанию true). Задача пишет ровно один `trellis2-textured.glb` (запечённый PBR-атлас встроен, PBR-sidecar нет).
+
+Остальные маршруты: `GET /` и `GET /health`; `GET /metrics` (Prometheus; включён по умолчанию с `--metrics`, при отключении маршрут возвращает 503); `GET`/`POST /v1/files`, `GET`/`DELETE /v1/files/{id}` и `GET /v1/files/{id}/content` (загрузите один раз и передавайте `source_file_id`/`mesh_file_id`); `GET /v1/generations`, `GET`/`DELETE /v1/generations/{id}`, `POST /v1/generations/{id}/cancel` и `GET /v1/generations/{id}/stream` (SSE-обновления статуса); `POST /v1/models/reload`, `POST /v1/models/unload` и `POST /v1/models/status`; `GET /v1/system/info` и `POST /v1/system/doctor`. Swagger UI отдаётся на `/docs`, схема — на `/api-doc/openapi.json` (feature `swagger-ui` включён по умолчанию).
+
+Общие поля:
+
+- `model` — обязателен для point clouds (`pi3`, `pi3x` или `vggt`), опционален для meshes (по умолчанию `triposr`; укажите `triposg` для TripoSG или `trellis2` для TRELLIS.2)
+- `source` — обязательная загрузка (`.zip`-архив кадров, видео (`.mp4`/`.mov`/`.avi`/`.mkv`), изображение (`.png`/`.jpg`/`.jpeg`/`.webp`) или уже распакованный каталог кадров)
+- `conditions` — опциональный файл условий Pi3X
+- `options` — опциональная JSON-строка (или JSON-объект в JSON-запросе) с параметрами семейства.
+  - TripoSG: `steps`, `guidance_scale`, `seed`, `num_tokens`, `use_flash_decoder`, `flash_octree_depth`, `dense_octree_depth`, `hierarchical_octree_depth`, `query_chunk_size`, `timesteps`, `bounds` (`[min_x,min_y,min_z,max_x,max_y,max_z]`), `faces`, `output_format` (`glb` по умолчанию, `obj`, `ply`, `stl`). CLI-only поверхности TripoSG (`--surface-input`, `--mode scribble`, повторяемый `--source`, `--num-shapes`) не имеют полей запроса.
+  - TRELLIS.2: `steps` (все три Euler-сэмплера), `seed`, `pipeline_type` (`512`/`1024`/`1024_cascade`/`1536_cascade`), `max_num_tokens`, `texture`, `output_format` (`glb` по умолчанию, `obj`, `ply`), `num_samples` (значения > 1 используют ту же joint-draw структуру, что и CLI, и пишут выходы `_0`, `_1`, ...; `/content` отдаёт sample 0), `texture_size`, postprocess-поля (`postprocess`, `decimation_target`, `fill_hole_perimeter`, `min_component_area`, `remesh`, `remesh_band`, `remesh_project`) и постадийные override'ы `ss_steps`/`ss_guidance_strength`/`ss_guidance_rescale`/`ss_guidance_interval`/`ss_rescale_t` и соответствующие `shape_*`/`tex_*`. `--return-latent` остаётся CLI-only; текстурирование существующего меша — через `POST /v1/meshes/texturings`.
+  - Point clouds: `output_format` (`ply` по умолчанию, `xyz`), плюс `interval`, `vo`, `chunk_size`, `overlap`, `conf_threshold`, `inject_condition`. Поверхность VGGT `--preprocess-mode`/`--batch-size`/`--colmap-dir`/`--depth-points`/`--track-queries`/`--track-auto`/`--glb` — CLI-only.
+
+Workflow:
+
+```powershell
+# 1. Создать задачу генерации меша
+curl -X POST http://127.0.0.1:8080/v1/meshes/generations `
+  -F "model=triposr" `
+  -F "source=@input.png" `
+  -F "options={\"mc_resolution\":256,\"mc_threshold\":25.0}"
+
+# Задача TripoSG (готовый файл скачивается как triposg.glb)
+curl -X POST http://127.0.0.1:8080/v1/meshes/generations `
+  -F "model=triposg" `
+  -F "source=@input.png" `
+  -F "options={\"steps\":50,\"use_flash_decoder\":true,\"flash_octree_depth\":9}"
+
+# Задача TRELLIS.2 (готовый файл скачивается как trellis2.glb)
+curl -X POST http://127.0.0.1:8080/v1/meshes/generations `
+  -F "model=trellis2" `
+  -F "source=@input.png" `
+  -F "options={\"steps\":12,\"seed\":42,\"pipeline_type\":\"1024_cascade\",\"texture\":true}"
+
+# Текстурирование существующего меша (готовый файл скачивается как trellis2-textured.glb):
+# source = condition-изображение, mesh = меш .glb/.obj/.ply/.stl
+curl -X POST http://127.0.0.1:8080/v1/meshes/texturings `
+  -F "model=trellis2" `
+  -F "source=@condition.png" `
+  -F "mesh=@input.glb" `
+  -F "options={\"texture_resolution\":1024,\"texture_size\":2048,\"tex_steps\":12}"
+
+# 2. Опрос статуса задачи
+curl http://127.0.0.1:8080/v1/generations/gen_...
+
+# 3. Скачивание готового ассета
+curl http://127.0.0.1:8080/v1/generations/gen_.../content --output mesh.glb
+```
+
+Встраивание router'а в другое Axum-приложение:
+
+```rust
+use lux3d_server_core::{
+    lux3d_for_server_builder::Lux3dForServerBuilder,
+    lux3d_server_router_builder::Lux3dServerRouterBuilder,
+};
+
+let lux3d = Lux3dForServerBuilder::new().build()?;
+let routes = Lux3dServerRouterBuilder::new()
+    .with_lux3d(lux3d)
+    .build()
+    .await?;
+let app = axum::Router::new().nest("/api/lux3d", routes);
+```
 
 ## Производительность
 
@@ -690,7 +843,7 @@ grace 2; WGPU: блоки аллокатора 2 MiB) Vulkan укладывае�
 - Бэкенд Metal на macOS в этом репозитории не тестировался, но теоретически может поддерживаться.
 - Директории canonical model package, переданные через `--model-path`, либо автоматически скачанные из Hugging Face в пользовательский cache
 - TripoSG требует примерно 8.3–8.7 GiB на preview с 1024 токенами (9.1 GiB с 2048 токенами) на всех трёх бэкендах; для эталонного прогона на 50 шагов рекомендуется 16 GiB+.
-- TRELLIS.2 загружает stage-checkpoint'ы последовательно и достигает ~7.8 GiB пика при резидентных текстурных стадиях на прогоне `1024_cascade` (прогоны без текстур легче); карта 12 GiB вмещает его с запасом ~4 GiB, инференс на CPU работает, но медленный. Сервер загружает только canonical-пакет; сырой каталог checkpoint'ов `microsoft/TRELLIS.2-4B` — loader только для CLI.
+- TRELLIS.2 загружает stage-checkpoint'ы последовательно и достигает ~7.8 GiB пика при резидентных текстурных стадиях на прогоне `1024_cascade` (прогоны без текстур легче); карта 12 GiB вмещает его с запасом ~4 GiB, инференс на CPU работает, но медленный. `--no-low-vram` держит все стадии резидентными и поэтому требует больше пиковой VRAM (при нехватке — явная ошибка с лимитом памяти, без тихого fallback). Сервер загружает только canonical-пакет; сырой каталог checkpoint'ов `microsoft/TRELLIS.2-4B` — loader только для CLI.
 
 ## Лицензия
 
@@ -698,7 +851,7 @@ grace 2; WGPU: блоки аллокатора 2 MiB) Vulkan укладывае�
 
 Upstream-модельные артефакты и canonical weights сохраняют свои исходные лицензии и ограничения на использование. Перед распространением проверяй условия для конкретного семейства модели.
 
-**VGGT-1B:** оригинальный код и checkpoint `facebook/VGGT-1B` — CC-BY-NC-4.0 (non-commercial). Для коммерческого использования нужен отдельно распространяемый `facebook/VGGT-1B-Commercial`. Canonical package для `--model-path`/автоскачивания публикуется как `oxide-lab/VGGT-1B`; сырой upstream checkpoint остаётся в `facebook/VGGT-1B`. Нативный track head поддерживает только явные query-точки; автоматический выбор запросов (ALIKED/SP keypoints, DINO query-frame ranking) не включён (см. заметки по VGGT в разделе запуска инференса).
+**VGGT-1B:** оригинальный код и checkpoint `facebook/VGGT-1B` — CC-BY-NC-4.0 (non-commercial). Для коммерческого использования нужен отдельно распространяемый `facebook/VGGT-1B-Commercial`. Canonical package для `--model-path`/автоскачивания публикуется как `oxide-lab/VGGT-1B`; сырой upstream checkpoint остаётся в `facebook/VGGT-1B`. Нативный track head поддерживает явные query-точки и автоматический выбор запросов stage A (DINOv2-reg ranking кадров + FPS); официальные стадии fine tracker B/C (ALIKED/SuperPoint, LightGlue-подобное уточнение) не включены (см. заметки по VGGT в разделе запуска инференса).
 
 **TripoSG:** upstream-код и веса — MIT. Сырой checkpoint лежит в `VAST-AI/TripoSG`; canonical package для `--model-path`/автоскачивания публикуется как `oxide-lab/TripoSG`. Upstream `load_image` использует BriaRMBG 1.4, когда нет валидной alpha-маски; Lux3D реализует этот fallback полностью. Веса RMBG не входят в MIT-пакет TripoSG: они нормализованы в отдельный canonical package `rmbg-1.4` (лицензия BRIA, source-available/non-commercial; для коммерческого использования нужна лицензия BRIA) и подключаются через `--rmbg-model-path` или соседнюю папку `rmbg-1.4`. Upstream pipeline по умолчанию использует flash decoder (`use_flash_decoder=True`, `flash_octree_depth=9`); Lux3D реализует тот же flash SDF-планировщик и clean-room Rust DiffDMC. Код и таблицы Diso (CC BY-NC 4.0) не копируются, поэтому на редких ambiguous-ячейках топология может отличаться; non-flash путь остаётся доступен через `--flash-decoder false`. Также реализован полный VAE encode API (FPS-сэмплирование, `vae.quant`, распределение mean/logvar/std), хотя image-to-3D pipeline вызывает только `vae.decode`.
 
