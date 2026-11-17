@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 use lux3d_core::export::{
-    DEFAULT_CONF_THRESHOLD, DEFAULT_MAX_POINTS, VggtColmapOptions, load_mesh,
-    write_feedforward_colmap,
+    load_mesh, write_feedforward_colmap, VggtColmapOptions, DEFAULT_CONF_THRESHOLD,
+    DEFAULT_MAX_POINTS,
 };
 use lux3d_core::geometry::VggtPointCloudCpu;
 use lux3d_core::preprocess::VggtPreprocessMode;
@@ -15,8 +15,8 @@ use lux3d_core::runtime::{
     VggtTrackResult,
 };
 use lux3d_core::{
-    ModelAssetOptions, ModelFamily, QuantizeOptions, Trellis2PipelineType, WeightLocator,
     dtype_from_name, ensure_canonical_weights, quantize_auxiliary_checkpoint, quantize_checkpoint,
+    ModelAssetOptions, ModelFamily, QuantizeOptions, Trellis2PipelineType, WeightLocator,
 };
 
 #[derive(Debug, Parser, PartialEq)]
@@ -529,6 +529,26 @@ impl From<VggtPreprocessKind> for VggtPreprocessMode {
     }
 }
 
+/// VGGT COLMAP 3D-point source (`--colmap-point-source`).
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum, PartialEq, Eq)]
+pub enum VggtColmapPointSourceKind {
+    /// Depth-unprojected points (`unproject_depth_map_to_point_map`), the
+    /// upstream `demo_colmap.py` feedforward source.
+    #[default]
+    Depth,
+    /// Point-head `world_points`.
+    Pointmap,
+}
+
+impl From<VggtColmapPointSourceKind> for lux3d_core::export::colmap::VggtColmapPointSource {
+    fn from(kind: VggtColmapPointSourceKind) -> Self {
+        match kind {
+            VggtColmapPointSourceKind::Depth => Self::Depth,
+            VggtColmapPointSourceKind::Pointmap => Self::Pointmap,
+        }
+    }
+}
+
 /// VGGT-only run flags (flattened into [`RunArgs`]). Every flag is rejected
 /// for the other families; the defaults keep the historical `vggt` behavior:
 /// F32 weights, crop preprocessing, one forward pass over all frames, and a
@@ -559,7 +579,7 @@ pub struct VggtRunArgs {
 
     #[arg(
         long,
-        help = "VGGT COLMAP feedforward export directory (vggt only): writes cameras.bin/images.bin/points3D.bin (upstream demo_colmap.py feedforward mode: one PINHOLE camera per image, depth-confidence-gated world points, intrinsics rescaled to the original resolution)."
+        help = "VGGT COLMAP feedforward export directory (vggt only): writes cameras.bin/images.bin/points3D.bin plus the sibling points.ply visualization cloud (upstream demo_colmap.py feedforward mode: one PINHOLE camera per image, depth-confidence-gated depth-unprojected points, intrinsics rescaled to the original resolution)."
     )]
     pub colmap_dir: Option<PathBuf>,
 
@@ -573,9 +593,29 @@ pub struct VggtRunArgs {
     #[arg(
         long,
         default_value_t = DEFAULT_MAX_POINTS,
-        help = "VGGT COLMAP 3D-point cap as a deterministic evenly-spaced subsample (upstream demo default 100000). Modifies --colmap-dir."
+        help = "VGGT COLMAP 3D-point cap (upstream demo default 100000). Without --colmap-seed the cap keeps a deterministic evenly-spaced subsample; with a seed it samples randomly (upstream `randomly_limit_trues`). Modifies --colmap-dir."
     )]
     pub colmap_max_points: usize,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = VggtColmapPointSourceKind::Depth,
+        help = "VGGT COLMAP 3D-point source (vggt only, upstream demo default `depth`): `depth` unprojects the depth maps (`unproject_depth_map_to_point_map`, official feedforward semantics) or `pointmap` uses the point-head world_points. Modifies --colmap-dir."
+    )]
+    pub colmap_point_source: VggtColmapPointSourceKind,
+
+    #[arg(
+        long,
+        help = "VGGT COLMAP random seed for point limiting (vggt only, upstream demo `--seed` 42): when set, up to --colmap-max-points points are drawn randomly from the confidence candidates; without it the deterministic evenly-spaced subsample is kept. The draw stream is distribution-equivalent to numpy's, not bit-identical. Modifies --colmap-dir."
+    )]
+    pub colmap_seed: Option<u32>,
+
+    #[arg(
+        long,
+        help = "VGGT COLMAP extra `world_points_conf >= threshold` gate on top of --colmap-conf-threshold (vggt only; unset = no extra gate). Modifies --colmap-dir."
+    )]
+    pub colmap_world_conf_threshold: Option<f32>,
 
     #[arg(
         long,
@@ -626,6 +666,9 @@ impl Default for VggtRunArgs {
             colmap_dir: None,
             colmap_conf_threshold: DEFAULT_CONF_THRESHOLD,
             colmap_max_points: DEFAULT_MAX_POINTS,
+            colmap_point_source: VggtColmapPointSourceKind::Depth,
+            colmap_seed: None,
+            colmap_world_conf_threshold: None,
             depth_points: None,
             depth_conf_threshold: 1.0,
             track_queries: None,
@@ -1165,7 +1208,7 @@ fn reject_unsupported_vggt_options(args: &RunArgs) -> anyhow::Result<()> {
 /// `--preprocess-mode crop` on another family is accepted as a no-op.
 fn reject_vggt_only_options(args: &RunArgs, family: Family) -> anyhow::Result<()> {
     let vggt = &args.vggt;
-    let set: [(&str, bool); 12] = [
+    let set: [(&str, bool); 15] = [
         (
             "--preprocess-mode",
             vggt.preprocess_mode != VggtPreprocessKind::Crop,
@@ -1180,6 +1223,15 @@ fn reject_vggt_only_options(args: &RunArgs, family: Family) -> anyhow::Result<()
         (
             "--colmap-max-points",
             vggt.colmap_max_points != DEFAULT_MAX_POINTS,
+        ),
+        (
+            "--colmap-point-source",
+            vggt.colmap_point_source != VggtColmapPointSourceKind::Depth,
+        ),
+        ("--colmap-seed", vggt.colmap_seed.is_some()),
+        (
+            "--colmap-world-conf-threshold",
+            vggt.colmap_world_conf_threshold.is_some(),
         ),
         ("--depth-points", vggt.depth_points.is_some()),
         ("--depth-conf-threshold", vggt.depth_conf_threshold != 1.0),
@@ -1777,7 +1829,9 @@ fn vggt_colmap_options_from_args(vggt: &VggtRunArgs) -> VggtColmapOptions {
     VggtColmapOptions {
         conf_threshold: vggt.colmap_conf_threshold,
         max_points: vggt.colmap_max_points,
-        confidence: None,
+        confidence: vggt.colmap_world_conf_threshold,
+        point_source: vggt.colmap_point_source.into(),
+        seed: vggt.colmap_seed,
     }
 }
 
@@ -2523,11 +2577,9 @@ fn run_trellis2(
     // pre-num_samples behavior); > 1 runs the sequential seed-offset
     // emulation and writes one output per sample with a `_i` suffix.
     let stages_list = if options.num_samples == 1 {
-        vec![
-            pipeline
-                .run_from_path_with_stages(source, device, &options)
-                .map_err(anyhow::Error::from)?,
-        ]
+        vec![pipeline
+            .run_from_path_with_stages(source, device, &options)
+            .map_err(anyhow::Error::from)?]
     } else {
         pipeline
             .run_many_from_path(source, device, &options)
@@ -2673,12 +2725,12 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{Cli, Command, RunArgs, inspect_model, normalize_weights, run_model};
+    use super::{inspect_model, normalize_weights, run_model, Cli, Command, RunArgs};
     use lux3d_core::{
-        ModelFamily,
         test_support::{
-            GpuTestLock, canonical_package_dir, resolve_raw_model_dir_for_tests, runtime_root,
+            canonical_package_dir, resolve_raw_model_dir_for_tests, runtime_root, GpuTestLock,
         },
+        ModelFamily,
     };
 
     fn repo_root() -> PathBuf {
@@ -2792,6 +2844,12 @@ mod tests {
             "2.5",
             "--colmap-max-points",
             "500",
+            "--colmap-point-source",
+            "pointmap",
+            "--colmap-seed",
+            "42",
+            "--colmap-world-conf-threshold",
+            "0.5",
             "--depth-points",
             "depth.ply",
             "--depth-conf-threshold",
@@ -2823,6 +2881,12 @@ mod tests {
         assert_eq!(2.5, args.vggt.colmap_conf_threshold);
         assert_eq!(500, args.vggt.colmap_max_points);
         assert_eq!(
+            super::VggtColmapPointSourceKind::Pointmap,
+            args.vggt.colmap_point_source
+        );
+        assert_eq!(Some(42), args.vggt.colmap_seed);
+        assert_eq!(Some(0.5), args.vggt.colmap_world_conf_threshold);
+        assert_eq!(
             Some(std::path::PathBuf::from("depth.ply")),
             args.vggt.depth_points
         );
@@ -2850,7 +2914,12 @@ mod tests {
         let colmap = super::vggt_colmap_options_from_args(&args.vggt);
         assert_eq!(2.5, colmap.conf_threshold);
         assert_eq!(500, colmap.max_points);
-        assert_eq!(None, colmap.confidence);
+        assert_eq!(Some(0.5), colmap.confidence);
+        assert_eq!(
+            lux3d_core::export::colmap::VggtColmapPointSource::Pointmap,
+            colmap.point_source
+        );
+        assert_eq!(Some(42), colmap.seed);
 
         let queries =
             super::parse_vggt_track_queries(args.vggt.track_queries.as_deref().expect("queries"))
@@ -2887,6 +2956,12 @@ mod tests {
         assert_eq!(None, args.vggt.colmap_dir);
         assert_eq!(5.0, args.vggt.colmap_conf_threshold);
         assert_eq!(100_000, args.vggt.colmap_max_points);
+        assert_eq!(
+            super::VggtColmapPointSourceKind::Depth,
+            args.vggt.colmap_point_source
+        );
+        assert_eq!(None, args.vggt.colmap_seed);
+        assert_eq!(None, args.vggt.colmap_world_conf_threshold);
         assert_eq!(None, args.vggt.depth_points);
         assert_eq!(1.0, args.vggt.depth_conf_threshold);
         assert_eq!(None, args.vggt.track_queries);
@@ -2908,6 +2983,8 @@ mod tests {
         assert_eq!(defaults.conf_threshold, colmap.conf_threshold);
         assert_eq!(defaults.max_points, colmap.max_points);
         assert_eq!(None, colmap.confidence);
+        assert_eq!(defaults.point_source, colmap.point_source);
+        assert_eq!(None, colmap.seed);
     }
 
     /// `--batch-size 0` is rejected before any weights are touched.
@@ -3123,7 +3200,7 @@ mod tests {
     /// the other families instead of being silently ignored.
     #[test]
     fn vggt_only_flags_rejected_for_other_families() {
-        let flag_options: [(&str, &[&str]); 12] = [
+        let flag_options: [(&str, &[&str]); 15] = [
             ("--preprocess-mode", &["--preprocess-mode", "pad"]),
             ("--vggt-dtype", &["--vggt-dtype", "f16"]),
             ("--batch-size", &["--batch-size", "4"]),
@@ -3133,6 +3210,15 @@ mod tests {
                 &["--colmap-conf-threshold", "2.5"],
             ),
             ("--colmap-max-points", &["--colmap-max-points", "500"]),
+            (
+                "--colmap-point-source",
+                &["--colmap-point-source", "pointmap"],
+            ),
+            ("--colmap-seed", &["--colmap-seed", "42"]),
+            (
+                "--colmap-world-conf-threshold",
+                &["--colmap-world-conf-threshold", "0.5"],
+            ),
             ("--depth-points", &["--depth-points", "depth.ply"]),
             (
                 "--depth-conf-threshold",
@@ -3265,9 +3351,7 @@ mod tests {
         assert_eq!(None, args.timesteps);
         let defaults = super::TripoSgRunOptions::default();
         assert_eq!(
-            (
-                50usize, 7.0f32, 42u64, 2048usize, 8u32, 9u32, true, 9u32, 16384usize
-            ),
+            (50usize, 7.0f32, 42u64, 2048usize, 8u32, 9u32, true, 9u32, 16384usize),
             (
                 defaults.steps,
                 defaults.guidance_scale,
@@ -4992,10 +5076,9 @@ mod tests {
         };
 
         let err = run_model(args).expect_err("invalid marching-cubes resolution must fail");
-        assert!(
-            err.to_string()
-                .contains("--mc-resolution must be at least 2")
-        );
+        assert!(err
+            .to_string()
+            .contains("--mc-resolution must be at least 2"));
     }
 
     #[test]

@@ -8,13 +8,17 @@
 //! through the per-frame [`VggtOriginalCoords`].
 //!
 //! Differences from upstream, all deliberate and documented:
-//! * 3D points come from the point-head `world_points` (the task spec) instead
-//!   of `unproject_depth_map_to_point_map`; use
-//!   [`VggtInferenceOutput::world_points_from_depth`] for the depth-based
-//!   source.
-//! * Point limiting is a deterministic evenly-spaced subsample of the
-//!   ascending candidate list (upstream uses `np.random.choice` with a demo
-//!   seed).
+//! * The 3D-point source defaults to the depth-unprojected
+//!   [`VggtInferenceOutput::world_points_from_depth`] (upstream
+//!   `unproject_depth_map_to_point_map`); [`VggtColmapPointSource::Pointmap`]
+//!   selects the point-head `world_points` instead.
+//! * Point limiting without a seed is a deterministic evenly-spaced subsample
+//!   of the ascending candidate list. With [`VggtColmapOptions::seed`] the
+//!   subset is drawn with a seeded SplitMix64 Fisher-Yates shuffle: uniform
+//!   without replacement, distribution-equivalent to upstream's
+//!   `np.random.choice(..., replace=False)` but not draw-identical to numpy.
+//! * `sparse/points.ply` next to the `.bin` files is the ASCII PLY written by
+//!   this crate (upstream delegates to trimesh, which defaults to binary).
 //! * The binary layout matches COLMAP's sparse model format as specified for
 //!   this task (COLMAP 3.8-era `images.bin` still stores the per-point 2D
 //!   `point3D_id`; newer COLMAP releases omit it). Integer ids are written as
@@ -25,12 +29,13 @@ use std::{fs, path::Path};
 
 use candle_core::{Device, Tensor};
 
+use super::point_cloud::{write_ply, PointCloudView};
 use crate::{
-    Result,
     error::Lux3dError,
     geometry::{rescale_intrinsics_to_original, shift_point2d_to_original},
     preprocess::{VggtOriginalCoords, VggtPreparedInputs},
     runtime::VggtInferenceOutput,
+    Result,
 };
 
 /// COLMAP camera model id for `PINHOLE` (params: fx, fy, cx, cy).
@@ -40,16 +45,35 @@ pub const DEFAULT_CONF_THRESHOLD: f32 = 5.0;
 /// Upstream demo `max_points_for_colmap`.
 pub const DEFAULT_MAX_POINTS: usize = 100_000;
 
+/// Source of the exported 3D points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VggtColmapPointSource {
+    /// Depth unprojection `unproject_depth_map_to_point_map`
+    /// ([`VggtInferenceOutput::world_points_from_depth`]) — the upstream
+    /// `demo_colmap.py` feedforward source (`demo_colmap.py:140, 216`).
+    #[default]
+    Depth,
+    /// Point-head `world_points` ([`VggtInferenceOutput::world_points`]).
+    Pointmap,
+}
+
 #[derive(Debug, Clone)]
 pub struct VggtColmapOptions {
     /// Confidence gate `depth_conf >= conf_threshold` (upstream uses `>=` in
     /// the COLMAP demo, versus the PLY export's strict `>`).
     pub conf_threshold: f32,
-    /// Deterministic cap on the number of exported 3D points.
+    /// Cap on the number of exported 3D points.
     pub max_points: usize,
     /// Optional additional gate `world_points_conf >= value` applied on top of
     /// `conf_threshold`. Upstream only gates on depth confidence.
     pub confidence: Option<f32>,
+    /// 3D-point source; `Depth` is the upstream feedforward semantics.
+    pub point_source: VggtColmapPointSource,
+    /// Seeded random point limiting, mirroring upstream `--seed` +
+    /// `randomly_limit_trues` (`demo_colmap.py:45, 98-100`;
+    /// `vggt/utils/helper.py:10-30`). `None` keeps the deterministic
+    /// evenly-spaced subsample.
+    pub seed: Option<u32>,
 }
 
 impl Default for VggtColmapOptions {
@@ -58,6 +82,8 @@ impl Default for VggtColmapOptions {
             conf_threshold: DEFAULT_CONF_THRESHOLD,
             max_points: DEFAULT_MAX_POINTS,
             confidence: None,
+            point_source: VggtColmapPointSource::Depth,
+            seed: None,
         }
     }
 }
@@ -75,15 +101,18 @@ pub struct ColmapExportStats {
 }
 
 /// Write a COLMAP binary sparse model (`cameras.bin`, `images.bin`,
-/// `points3D.bin`) for the VGGT feedforward reconstruction.
+/// `points3D.bin`) plus the sibling `points.ply` visualization cloud for the
+/// VGGT feedforward reconstruction.
 ///
-/// * 3D points: `output.world_points` filtered by the confidence gate.
+/// * 3D points: [`VggtColmapOptions::point_source`] (depth unprojection by
+///   default, matching upstream) filtered by the confidence gate.
 /// * 2D points: the pixel grid `(x, y)` of each sampled pixel, shifted to the
 ///   original resolution via [`shift_point2d_to_original`].
 /// * Colors: prepared RGB frames resampled to the model resolution.
 /// * Cameras: one PINHOLE camera per image, intrinsics rescaled to the
 ///   original resolution via [`rescale_intrinsics_to_original`].
-/// * Ids are 1-based (COLMAP convention); files are deterministic.
+/// * Ids are 1-based (COLMAP convention); files are deterministic unless a
+///   random seed is set.
 pub fn write_feedforward_colmap(
     dir: &Path,
     output: &VggtInferenceOutput,
@@ -110,7 +139,7 @@ pub fn write_feedforward_colmap(
     }
 
     // Points, colors, confidences (all flattened to CPU row-major vectors).
-    let points = tensor_to_cpu_vec::<f32>(&output.world_points, "world points")?;
+    let points = resolve_point_source(output, options.point_source, s, h, w)?;
     let rgb = rgb_frames_at_model_resolution(prepared, s, h, w)?;
     let depth_conf = tensor_to_cpu_vec::<f32>(&squeeze_grid(&output.depth_conf)?, "depth conf")?;
     let world_conf = match options.confidence {
@@ -131,7 +160,10 @@ pub fn write_feedforward_colmap(
                 })
         })
         .collect();
-    let selected = limit_candidates(&candidates, options.max_points);
+    let selected = match options.seed {
+        Some(seed) => limit_candidates_seeded(&candidates, options.max_points, seed),
+        None => limit_candidates(&candidates, options.max_points),
+    };
 
     let intrinsics_rescaled = rescale_intrinsics_to_original(&output.intrinsics, coords, img_size)?;
     let extrinsics =
@@ -147,6 +179,10 @@ pub fn write_feedforward_colmap(
     }
     let mut per_frame_points2d: Vec<Vec<(usize, f64, f64)>> = vec![Vec::new(); s];
     let mut points3d = Vec::with_capacity(selected.len());
+    // `sparse/points.ply` payload: the same selected points/colors as the
+    // `points3D.bin` entries, in export order.
+    let mut ply_points = Vec::with_capacity(selected.len() * 3);
+    let mut ply_colors = Vec::with_capacity(selected.len() * 3);
     for (rank, &idx) in selected.iter().enumerate() {
         let frame = idx / (h * w);
         let rem = idx % (h * w);
@@ -162,6 +198,8 @@ pub fn write_feedforward_colmap(
             rgb_u8(rgb[(frame * 3 + 1) * h * w + y * w + x]),
             rgb_u8(rgb[(frame * 3 + 2) * h * w + y * w + x]),
         ];
+        ply_points.extend_from_slice(&[points[idx * 3], points[idx * 3 + 1], points[idx * 3 + 2]]);
+        ply_colors.extend_from_slice(&color);
         let (px, py) = shift_point2d_to_original(x as f64, y as f64, &coords[frame], img_size);
         let point2d_idx = per_frame_points2d[frame].len();
         per_frame_points2d[frame].push((rank + 1, px, py));
@@ -254,6 +292,14 @@ pub fn write_feedforward_colmap(
         let path = dir.join(name);
         fs::write(&path, bytes).map_err(|source| Lux3dError::ModelAssetIo { path, source })?;
     }
+    // Upstream writes the visualization cloud next to the sparse model
+    // (`demo_colmap.py:249`).
+    let ply_path = dir.join("points.ply");
+    let ply_view = PointCloudView {
+        points: &ply_points,
+        colors: &ply_colors,
+    };
+    write_ply(&ply_view, &ply_path)?;
 
     Ok(ColmapExportStats {
         camera_count: s,
@@ -266,7 +312,8 @@ pub fn write_feedforward_colmap(
 
 /// Deterministic point cap: keep an evenly spaced subset of the ascending
 /// candidate list (`candidates[j * len / max]` for `j in 0..max`), which
-/// preserves order and uniqueness. Replaces upstream's seeded random choice.
+/// preserves order and uniqueness. Replaces upstream's seeded random choice
+/// when [`VggtColmapOptions::seed`] is `None`.
 fn limit_candidates(candidates: &[usize], max_points: usize) -> Vec<usize> {
     let count = candidates.len();
     if count <= max_points {
@@ -275,6 +322,71 @@ fn limit_candidates(candidates: &[usize], max_points: usize) -> Vec<usize> {
     (0..max_points)
         .map(|j| candidates[j * count / max_points])
         .collect()
+}
+
+/// Seeded point cap: `max_points` distinct candidate positions drawn
+/// uniformly without replacement (partial Fisher-Yates over a SplitMix64
+/// stream), returned in ascending candidate order so the output stays
+/// deterministic for a fixed seed. This is distribution-equivalent to
+/// upstream `np.random.choice(true_indices, replace=False)`
+/// (`helper.py:10-30`); the draw stream itself differs from numpy.
+fn limit_candidates_seeded(candidates: &[usize], max_points: usize, seed: u32) -> Vec<usize> {
+    let count = candidates.len();
+    if count <= max_points {
+        return candidates.to_vec();
+    }
+    let mut state = u64::from(seed);
+    let mut positions: Vec<usize> = (0..count).collect();
+    for slot in 0..max_points {
+        let remaining = count - slot;
+        let offset = (splitmix64_next(&mut state) % remaining as u64) as usize;
+        positions.swap(slot, slot + offset);
+    }
+    let mut picked = positions[..max_points].to_vec();
+    picked.sort_unstable();
+    picked
+        .into_iter()
+        .map(|position| candidates[position])
+        .collect()
+}
+
+/// One SplitMix64 output; the same scrambler used by the deterministic
+/// sampling RNGs elsewhere in the crate (no external RNG dependency).
+fn splitmix64_next(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Flatten the configured 3D-point source to CPU row-major `[x, y, z, ...]`
+/// values for the `(s, h, w)` grid.
+fn resolve_point_source(
+    output: &VggtInferenceOutput,
+    point_source: VggtColmapPointSource,
+    s: usize,
+    h: usize,
+    w: usize,
+) -> Result<Vec<f32>> {
+    let points = match point_source {
+        VggtColmapPointSource::Depth => output.world_points_from_depth()?,
+        VggtColmapPointSource::Pointmap => output.world_points.clone(),
+    };
+    let dims = points.dims();
+    let grid_ok = match dims.len() {
+        4 => dims == [s, h, w, 3],
+        5 => dims == [1, s, h, w, 3],
+        _ => false,
+    };
+    if !grid_ok {
+        return Err(Lux3dError::CanonicalWeightsValidation {
+            message: format!(
+                "VGGT {point_source:?} COLMAP point source shape {dims:?} does not match grid {s}x{h}x{w}"
+            ),
+        });
+    }
+    tensor_to_cpu_vec::<f32>(&points, "world points")
 }
 
 /// Resolve the `(frames, height, width)` grid from the output tensors and
@@ -862,6 +974,8 @@ mod tests {
             conf_threshold: 1.5,
             max_points: 10,
             confidence: None,
+            point_source: VggtColmapPointSource::Pointmap,
+            seed: None,
         };
 
         let stats = write_feedforward_colmap(
@@ -1019,6 +1133,47 @@ mod tests {
             assert_eq!(element.point2d_idx, position);
         }
 
+        // --- points.ply sibling (`demo_colmap.py:249`) ---
+        let ply = fs::read_to_string(dir.join("points.ply")).expect("points.ply");
+        let mut ply_lines = ply.lines();
+        for expected in [
+            "ply",
+            "format ascii 1.0",
+            "element vertex 10",
+            "property float x",
+            "property float y",
+            "property float z",
+            "property float nx",
+            "property float ny",
+            "property float nz",
+            "property uchar red",
+            "property uchar green",
+            "property uchar blue",
+            "end_header",
+        ] {
+            assert_eq!(ply_lines.next(), Some(expected), "points.ply header");
+        }
+        let ply_rows: Vec<&str> = ply_lines.collect();
+        assert_eq!(ply_rows.len(), 10, "points.ply vertex rows");
+        for (rank, row) in ply_rows.iter().enumerate() {
+            let fields: Vec<&str> = row.split_whitespace().collect();
+            assert_eq!(fields.len(), 9, "points.ply row fields");
+            let point = &points[rank];
+            for axis in 0..3 {
+                let value: f64 = fields[axis].parse().expect("points.ply coordinate");
+                assert!(
+                    (value - point.xyz[axis]).abs() < 1e-6,
+                    "points.ply xyz mismatch at rank {rank}"
+                );
+                let normal: f64 = fields[3 + axis].parse().expect("points.ply normal");
+                assert_eq!(normal, 0.0, "points.ply normals stay zero");
+            }
+            for channel in 0..3 {
+                let value: u8 = fields[6 + channel].parse().expect("points.ply color");
+                assert_eq!(value, point.rgb[channel], "points.ply rgb mismatch");
+            }
+        }
+
         // Deterministic output: a second write is byte-identical.
         let dir2 = dir.with_extension("again");
         write_feedforward_colmap(
@@ -1029,7 +1184,7 @@ mod tests {
             &options,
         )
         .expect("write colmap again");
-        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+        for name in ["cameras.bin", "images.bin", "points3D.bin", "points.ply"] {
             assert_eq!(
                 fs::read(dir.join(name)).expect("first write"),
                 fs::read(dir2.join(name)).expect("second write"),
@@ -1064,6 +1219,8 @@ mod tests {
                 conf_threshold: 0.5,
                 max_points: 100_000,
                 confidence: Some(2.0),
+                point_source: VggtColmapPointSource::Depth,
+                seed: None,
             },
         )
         .expect("write colmap with conf gate");
@@ -1082,6 +1239,8 @@ mod tests {
                 conf_threshold: 0.5,
                 max_points: 0,
                 confidence: None,
+                point_source: VggtColmapPointSource::Depth,
+                seed: None,
             },
         )
         .expect("write colmap with zero cap");
@@ -1093,7 +1252,170 @@ mod tests {
         let points =
             reader::parse_points3d(&fs::read(dir.join("points3D.bin")).expect("points.bin"));
         assert!(points.is_empty());
+        // The visualization cloud is written even when empty.
+        let ply = fs::read_to_string(dir.join("points.ply")).expect("points.ply");
+        assert!(ply.contains("element vertex 0"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "lux3d-vggt-colmap-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
+
+    /// The default point source is the upstream depth unprojection
+    /// (`unproject_depth_map_to_point_map`), not the point head.
+    #[test]
+    fn vggt_colmap_default_point_source_unprojects_depth() {
+        assert_eq!(
+            VggtColmapPointSource::Depth,
+            VggtColmapOptions::default().point_source
+        );
+        assert_eq!(None, VggtColmapOptions::default().seed);
+
+        let fixture = fixture();
+        let dir = temp_dir("depth-source");
+        let options = VggtColmapOptions {
+            conf_threshold: 1.5,
+            max_points: 100_000,
+            confidence: None,
+            point_source: VggtColmapPointSource::Depth,
+            seed: None,
+        };
+        let stats =
+            write_feedforward_colmap(&dir, &fixture.output, &fixture.prepared, &[], &options)
+                .expect("write colmap depth source");
+        assert_eq!(stats.confidence_candidates, 13);
+        assert_eq!(stats.point3d_count, 13);
+
+        let points =
+            reader::parse_points3d(&fs::read(dir.join("points3D.bin")).expect("points3D.bin"));
+        let depth_points = fixture
+            .output
+            .world_points_from_depth()
+            .expect("depth unprojection")
+            .flatten_all()
+            .and_then(|tensor| tensor.to_vec1::<f32>())
+            .expect("depth points vec");
+        let head_points = fixture
+            .output
+            .world_points
+            .flatten_all()
+            .and_then(|tensor| tensor.to_vec1::<f32>())
+            .expect("point-head vec");
+        let mut differs_from_head = false;
+        for (rank, point) in points.iter().enumerate() {
+            let idx = fixture.candidates[rank];
+            for axis in 0..3 {
+                let expected = f64::from(depth_points[idx * 3 + axis]);
+                assert!(
+                    (point.xyz[axis] - expected).abs() < 1e-6,
+                    "depth-source xyz mismatch at rank {rank}"
+                );
+                if (expected - f64::from(head_points[idx * 3 + axis])).abs() > 1e-6 {
+                    differs_from_head = true;
+                }
+            }
+        }
+        assert!(
+            differs_from_head,
+            "fixture must distinguish depth unprojection from the point head"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Seeded limiting is reproducible for one seed and selects a different
+    /// subset for another seed; both stay subsets of the confidence mask.
+    #[test]
+    fn vggt_colmap_seeded_limit_is_reproducible_and_seed_dependent() {
+        let fixture = fixture();
+        let write = |dir: &std::path::Path, seed: u32| {
+            write_feedforward_colmap(
+                dir,
+                &fixture.output,
+                &fixture.prepared,
+                &[],
+                &VggtColmapOptions {
+                    conf_threshold: 1.5,
+                    max_points: 5,
+                    confidence: None,
+                    point_source: VggtColmapPointSource::Pointmap,
+                    seed: Some(seed),
+                },
+            )
+            .expect("write seeded colmap")
+        };
+
+        let dir_a = temp_dir("seed7a");
+        let dir_b = temp_dir("seed7b");
+        let dir_c = temp_dir("seed11");
+        write(&dir_a, 7);
+        write(&dir_b, 7);
+        write(&dir_c, 11);
+        for name in ["cameras.bin", "images.bin", "points3D.bin", "points.ply"] {
+            assert_eq!(
+                fs::read(dir_a.join(name)).expect("seed 7 first"),
+                fs::read(dir_b.join(name)).expect("seed 7 second"),
+                "{name} must be reproducible for the same seed"
+            );
+        }
+
+        let points_a =
+            reader::parse_points3d(&fs::read(dir_a.join("points3D.bin")).expect("points3D.bin"));
+        let points_c =
+            reader::parse_points3d(&fs::read(dir_c.join("points3D.bin")).expect("points3D.bin"));
+        assert_eq!(points_a.len(), 5);
+        assert_eq!(points_c.len(), 5);
+
+        let xyz_a: Vec<Vec<f64>> = points_a.iter().map(|point| point.xyz.clone()).collect();
+        let xyz_c: Vec<Vec<f64>> = points_c.iter().map(|point| point.xyz.clone()).collect();
+        assert_ne!(xyz_a, xyz_c, "different seeds must draw different subsets");
+
+        // Every seeded point comes from the confidence-filtered candidates and
+        // keeps the ascending candidate order.
+        let world_flat = fixture
+            .output
+            .world_points
+            .flatten_all()
+            .and_then(|tensor| tensor.to_vec1::<f32>())
+            .expect("world points vec");
+        let candidate_xyz: Vec<[f64; 3]> = fixture
+            .candidates
+            .iter()
+            .map(|&idx| {
+                [
+                    f64::from(world_flat[idx * 3]),
+                    f64::from(world_flat[idx * 3 + 1]),
+                    f64::from(world_flat[idx * 3 + 2]),
+                ]
+            })
+            .collect();
+        let mut previous = None;
+        for xyz in &xyz_a {
+            let position = candidate_xyz
+                .iter()
+                .position(|candidate| {
+                    (candidate[0] - xyz[0]).abs() < 1e-9
+                        && (candidate[1] - xyz[1]).abs() < 1e-9
+                        && (candidate[2] - xyz[2]).abs() < 1e-9
+                })
+                .expect("seeded point is a confidence candidate");
+            if let Some(previous) = previous {
+                assert!(position > previous, "seeded points keep candidate order");
+            }
+            previous = Some(position);
+        }
+
+        for dir in [&dir_a, &dir_b, &dir_c] {
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 }

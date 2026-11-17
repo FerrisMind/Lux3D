@@ -38,27 +38,27 @@ use std::{path::Path, sync::Arc};
 
 use super::nn_blocks::Linear;
 use crate::weights::VarBuilder;
-use candle_core::{D, DType, Device, IndexOp, Module, Result as CandleResult, Tensor};
-use candle_nn::{LayerNorm, layer_norm};
+use candle_core::{DType, Device, IndexOp, Module, Result as CandleResult, Tensor, D};
+use candle_nn::{layer_norm, LayerNorm};
 
 use super::{
     attention_math::{
-        Rope2d, RopeEmbeddings, apply_layernorm_rope, apply_rope, exact_query_chunked_sdpa,
-        position_getter,
+        apply_layernorm_rope, apply_rope, exact_query_chunked_sdpa, position_getter, Rope2d,
+        RopeEmbeddings,
     },
-    nn_blocks::{LayerScale, Mlp, linear, linear_fwd},
+    nn_blocks::{linear, linear_fwd, LayerScale, Mlp},
     vggt_dpt::{VggtDptActivation, VggtDptHead},
-    vggt_track::{TRACK_DEFAULT_ITERS, VggtTrackHead, VggtTrackQuery, VggtTrackResult},
+    vggt_track::{VggtTrackHead, VggtTrackQuery, VggtTrackResult, TRACK_DEFAULT_ITERS},
 };
 use crate::{
-    CanonicalWeightSetPaths, ModelAssetOptions, ModelFamily, Result,
     error::Lux3dError,
     export::{PointCloudFormat, VggtExportStage},
     geometry::VggtGeometryStage,
     load_canonical_weights,
     neural::VggtNeuralStage,
     preprocess::VggtPreprocessStage,
-    runtime::{DeviceLocalCache, pi3_encoder::Pi3DinoEncoder, pi3_encoder::load_pi3_encoder},
+    runtime::{pi3_encoder::load_pi3_encoder, pi3_encoder::Pi3DinoEncoder, DeviceLocalCache},
+    CanonicalWeightSetPaths, ModelAssetOptions, ModelFamily, Result,
 };
 
 pub use crate::preprocess::VggtPreparedInputs;
@@ -856,49 +856,13 @@ impl VggtPipeline {
     ///
     /// Includes `pose_enc` (the last camera-refinement iteration) and
     /// `pose_enc_list`, the per-iteration pose encodings stacked as `[K, S, 9]`
-    /// (a single-iteration output stays `[1, S, 9]`).
+    /// (a single-iteration output stays `[1, S, 9]`). The official Gradio demo
+    /// saves the `predictions.npz` keys `images`, `extrinsic`, `intrinsic` and
+    /// `world_points_from_depth` (`demo_gradio.py:216-218, 84-93`); those are
+    /// written alongside the historical keys with the same batch-squeezed
+    /// shapes the demo produces.
     pub fn export_inference_npz(&self, output: &VggtInferenceOutput, path: &Path) -> Result<()> {
-        use ndarray::{ArrayD, IxDyn};
-
-        let pose_enc_list = stack_pose_enc_list(&output.pose_enc_list)?;
-        let file = std::fs::File::create(path).map_err(|source| Lux3dError::ModelAssetIo {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let mut npz = ndarray_npy::NpzWriter::new(file);
-        let fields: [(&str, &Tensor); 8] = [
-            ("world_points", &output.world_points),
-            ("world_points_conf", &output.world_points_conf),
-            ("depth", &output.depth),
-            ("depth_conf", &output.depth_conf),
-            ("extrinsics", &output.extrinsics),
-            ("intrinsics", &output.intrinsics),
-            ("pose_enc", &output.pose_enc),
-            ("pose_enc_list", &pose_enc_list),
-        ];
-        for (name, tensor) in fields {
-            let tensor = tensor
-                .to_device(&Device::Cpu)
-                .and_then(|tensor| tensor.to_dtype(DType::F32))
-                .and_then(|tensor| tensor.contiguous())
-                .map_err(|source| Lux3dError::CanonicalWeightsValidation {
-                    message: format!("failed to stage `{name}` for npz: {source}"),
-                })?;
-            let shape = tensor.dims().to_vec();
-            let data = tensor
-                .flatten_all()
-                .and_then(|tensor| tensor.to_vec1::<f32>())
-                .map_err(|source| Lux3dError::CanonicalWeightsValidation {
-                    message: format!("failed to read `{name}` for npz: {source}"),
-                })?;
-            let array = ArrayD::from_shape_vec(IxDyn(&shape), data)
-                .map_err(|_| Lux3dError::InvalidInput("failed to build npz tensor"))?;
-            npz.add_array(name, &array)
-                .map_err(|_| Lux3dError::InvalidInput("failed to write npz tensor"))?;
-        }
-        npz.finish()
-            .map_err(|_| Lux3dError::InvalidInput("failed to finish npz"))?;
-        Ok(())
+        write_inference_npz(output, path)
     }
 
     pub fn debug_forward(
@@ -1323,6 +1287,62 @@ fn stack_pose_enc_list(list: &[Tensor]) -> Result<Tensor> {
     })
 }
 
+/// Write the `.npz` prediction dump. Free function so unit tests can cover
+/// the key set and shapes without loading VGGT weights.
+fn write_inference_npz(output: &VggtInferenceOutput, path: &Path) -> Result<()> {
+    use ndarray::{ArrayD, IxDyn};
+
+    let pose_enc_list = stack_pose_enc_list(&output.pose_enc_list)?;
+    // Official demo keys: `images` ([S,3,H,W], preprocessed [0,1]),
+    // `extrinsic`/`intrinsic` ([S,3,4]/[S,3,3], batch-squeezed) and
+    // `world_points_from_depth` ([S,H,W,3]).
+    let world_points_from_depth = output.world_points_from_depth()?;
+    let extrinsic = squeeze_batch_dim(&output.extrinsics, "VGGT extrinsics")?;
+    let intrinsic = squeeze_batch_dim(&output.intrinsics, "VGGT intrinsics")?;
+    let file = std::fs::File::create(path).map_err(|source| Lux3dError::ModelAssetIo {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut npz = ndarray_npy::NpzWriter::new(file);
+    let fields: [(&str, &Tensor); 12] = [
+        ("world_points", &output.world_points),
+        ("world_points_conf", &output.world_points_conf),
+        ("depth", &output.depth),
+        ("depth_conf", &output.depth_conf),
+        ("extrinsics", &output.extrinsics),
+        ("intrinsics", &output.intrinsics),
+        ("pose_enc", &output.pose_enc),
+        ("pose_enc_list", &pose_enc_list),
+        ("images", &output.rgb_frames),
+        ("extrinsic", &extrinsic),
+        ("intrinsic", &intrinsic),
+        ("world_points_from_depth", &world_points_from_depth),
+    ];
+    for (name, tensor) in fields {
+        let tensor = tensor
+            .to_device(&Device::Cpu)
+            .and_then(|tensor| tensor.to_dtype(DType::F32))
+            .and_then(|tensor| tensor.contiguous())
+            .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                message: format!("failed to stage `{name}` for npz: {source}"),
+            })?;
+        let shape = tensor.dims().to_vec();
+        let data = tensor
+            .flatten_all()
+            .and_then(|tensor| tensor.to_vec1::<f32>())
+            .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                message: format!("failed to read `{name}` for npz: {source}"),
+            })?;
+        let array = ArrayD::from_shape_vec(IxDyn(&shape), data)
+            .map_err(|_| Lux3dError::InvalidInput("failed to build npz tensor"))?;
+        npz.add_array(name, &array)
+            .map_err(|_| Lux3dError::InvalidInput("failed to write npz tensor"))?;
+    }
+    npz.finish()
+        .map_err(|_| Lux3dError::InvalidInput("failed to finish npz"))?;
+    Ok(())
+}
+
 fn input_dims(normalized_frames: &Tensor) -> Result<(usize, usize, usize, usize, usize)> {
     normalized_frames
         .dims5()
@@ -1588,6 +1608,75 @@ mod tests {
         assert!((values[6] - (-1.4)).abs() < 1e-6);
         assert!((values[7] - 2.0).abs() < 1e-6);
         assert!((values[8] - 1.0).abs() < 1e-6);
+    }
+
+    /// The `.npz` dump carries the official demo's prediction keys with the
+    /// batch-squeezed shapes (`demo_gradio.py:216-218, 84-93`) alongside the
+    /// historical keys.
+    #[test]
+    fn export_inference_npz_includes_official_prediction_keys() {
+        let output = synthetic_output(2, 10.0);
+        let path = std::env::temp_dir().join(format!(
+            "lux3d-vggt-npz-{}-{}.npz",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        write_inference_npz(&output, &path).expect("write npz");
+
+        let mut npz = ndarray_npy::NpzReader::new(std::fs::File::open(&path).expect("open npz"))
+            .expect("npz reader");
+        let mut names = npz.names().expect("npz names");
+        names.sort();
+        let mut expected = vec![
+            "depth",
+            "depth_conf",
+            "extrinsic",
+            "extrinsics",
+            "images",
+            "intrinsic",
+            "intrinsics",
+            "pose_enc",
+            "pose_enc_list",
+            "world_points",
+            "world_points_conf",
+            "world_points_from_depth",
+        ];
+        expected.sort();
+        assert_eq!(names, expected);
+
+        let images: ndarray::ArrayD<f32> = npz.by_name("images").expect("images");
+        assert_eq!(images.shape(), &[2, 3, 1, 1]);
+        let rgb = output
+            .rgb_frames
+            .flatten_all()
+            .and_then(|tensor| tensor.to_vec1::<f32>())
+            .expect("rgb vec");
+        assert_eq!(images.as_slice().expect("contiguous images"), rgb);
+
+        let extrinsic: ndarray::ArrayD<f32> = npz.by_name("extrinsic").expect("extrinsic");
+        assert_eq!(extrinsic.shape(), &[2, 3, 4]);
+        let intrinsic: ndarray::ArrayD<f32> = npz.by_name("intrinsic").expect("intrinsic");
+        assert_eq!(intrinsic.shape(), &[2, 3, 3]);
+
+        let world_from_depth: ndarray::ArrayD<f32> = npz
+            .by_name("world_points_from_depth")
+            .expect("world_points_from_depth");
+        assert_eq!(world_from_depth.shape(), &[2, 1, 1, 3]);
+        let expected_world = output
+            .world_points_from_depth()
+            .expect("depth unprojection")
+            .flatten_all()
+            .and_then(|tensor| tensor.to_vec1::<f32>())
+            .expect("world vec");
+        assert_eq!(
+            world_from_depth.as_slice().expect("contiguous world"),
+            expected_world
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Constant-per-frame tensor: element `idx` holds `(idx / k) + base`.
