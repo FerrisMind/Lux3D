@@ -49,7 +49,10 @@
 //!     grid ceiling `hr_resolution // 16 <= 64`... the elastic models accept
 //!     larger grids, so the 1536 cascade decodes at 1536 unless the token
 //!     budget reduces it to 1024). The 1024 cascade always breaks on its
-//!     first pass.
+//!     first pass. Multi-sample runs concatenate the per-sample quantized
+//!     rows (distinct across samples, like the reference batch column) and
+//!     run ONE loop, so the budget and the returned resolution are global
+//!     (`trellis2_image_to_3d.py:327-339`).
 //! 4d. HR shape SLAT on the quantized coords with `shape_dit_1024` +
 //!     `cond_1024` (DINOv3 at 1024, `[1, 4101, 1024]`) -> de-normalize.
 //! 5. shape VAE decode at the returned `hr_resolution` -> dual-grid head
@@ -145,7 +148,13 @@
 //! SLAT stage draws ONE joint noise tensor over the concatenated active
 //! coords of all samples (`torch.randn(coords.shape[0], in_channels)`), all
 //! samples share one conditioning pass, and decoding/export run per sample.
-//! The Lux3D RNG is not bit-identical to `torch.randn` (locked decision 4),
+//! Cascade runs quantize/upsample every sample first and run ONE token-budget
+//! loop over the concatenated batch coords, so all samples share a single
+//! `hr_resolution` and the global token cap is `max_num_tokens`, not
+//! `num_samples * max_num_tokens` (`trellis2_image_to_3d.py:327-339,
+//! 586-591`; per-sample rows stay distinct exactly like the reference's
+//! leading batch column). The Lux3D RNG is not bit-identical to
+//! `torch.randn` (locked decision 4),
 //! so the draws are distribution-equivalent, not value-identical, to the
 //! reference; only the draw structure matches. The single-run entry points
 //! error on `num_samples != 1`.
@@ -177,8 +186,8 @@ use crate::contracts::Trellis2PipelineType;
 use crate::error::Lux3dError;
 use crate::export::Trellis2ExportStage;
 use crate::geometry::{
-    area_weighted_vertex_normals, bake_pbr_texture, bake_pbr_texture_with_snap, uv_unwrap, MeshBvh,
-    Trellis2GeometryStage,
+    area_weighted_vertex_normals, bake_pbr_texture, bake_pbr_texture_with_snap,
+    fill_holes_with_centroids, uv_unwrap, MeshBvh, Trellis2GeometryStage,
 };
 use crate::preprocess::{Trellis2BackgroundRemover, Trellis2Preprocess};
 use crate::runtime::Rmbg2Model;
@@ -672,23 +681,85 @@ pub fn quantize_hr_coords_with_stop(
     let mut hr_resolution = resolution;
     let coords = loop {
         let scale = (hr_resolution / 16) as f32;
-        // ((coord + 0.5) / lr_resolution * (hr_resolution // 16)).int():
-        // torch promotes to float32, divides, multiplies, then truncates
-        // toward zero (`x as i32` saturates like torch only for in-range
-        // values, which the non-negative <= 511 coords always are).
-        let mut quant: Vec<[i32; 3]> = hr_coords
-            .iter()
-            .map(|c| {
-                [
-                    ((c[0] as f32 + 0.5) / lr * scale) as i32,
-                    ((c[1] as f32 + 0.5) / lr * scale) as i32,
-                    ((c[2] as f32 + 0.5) / lr * scale) as i32,
-                ]
-            })
-            .collect();
-        quant.sort_unstable();
-        quant.dedup();
+        let quant = quantize_hr_sample(hr_coords, lr, scale);
         if quant.len() < max_num_tokens || hr_resolution == stop_resolution {
+            break quant;
+        }
+        hr_resolution -= 128;
+    };
+    (coords, hr_resolution)
+}
+
+/// Quantize one sample's upsampled HR coords onto the `hr_resolution // 16`
+/// grid with the exact reference expression
+/// `((coord + 0.5) / lr_resolution * (hr_resolution // 16)).int()` (F32
+/// arithmetic, truncate toward zero — the upsampled coords are non-negative,
+/// so this is a floor), then deduplicate the rows.
+///
+/// `torch.unique(dim=0)` returns lexicographically sorted rows; the returned
+/// coords are sorted the same way.
+fn quantize_hr_sample(hr_coords: &[[i32; 3]], lr: f32, scale: f32) -> Vec<[i32; 3]> {
+    let mut quant: Vec<[i32; 3]> = hr_coords
+        .iter()
+        .map(|c| {
+            [
+                ((c[0] as f32 + 0.5) / lr * scale) as i32,
+                ((c[1] as f32 + 0.5) / lr * scale) as i32,
+                ((c[2] as f32 + 0.5) / lr * scale) as i32,
+            ]
+        })
+        .collect();
+    quant.sort_unstable();
+    quant.dedup();
+    quant
+}
+
+/// Multi-sample [`quantize_hr_coords`]: the reference quantizes the WHOLE
+/// batch before the unique/budget loop and combines the rows with a leading
+/// batch column (`torch.cat([hr_coords[:, :1], quantized_xyz], dim=1)` then
+/// `unique(dim=0)`, `trellis2_image_to_3d.py:327-339`), so identical xyz
+/// rows from different samples stay distinct and the token count is the SUM
+/// of the per-sample unique counts. One `hr_resolution` is chosen for the
+/// whole batch and returned; the caller must decode every sample at it.
+///
+/// The per-sample rows are deduplicated and sorted exactly like
+/// [`quantize_hr_coords`] (the batch marker is implicit in the sample
+/// index), and a single sample is bit-identical to the single-sample
+/// helper.
+pub fn quantize_hr_coords_batched(
+    samples: &[Vec<[i32; 3]>],
+    lr_resolution: u32,
+    target_resolution: u32,
+    max_num_tokens: usize,
+) -> (Vec<Vec<[i32; 3]>>, u32) {
+    quantize_hr_coords_batched_with_stop(
+        samples,
+        lr_resolution,
+        target_resolution,
+        max_num_tokens,
+        TRELLIS2_CASCADE_HR_RESOLUTION,
+    )
+}
+
+/// [`quantize_hr_coords_batched`] with the loop's stop resolution explicit
+/// (test hook mirroring [`quantize_hr_coords_with_stop`]).
+pub fn quantize_hr_coords_batched_with_stop(
+    samples: &[Vec<[i32; 3]>],
+    lr_resolution: u32,
+    resolution: u32,
+    max_num_tokens: usize,
+    stop_resolution: u32,
+) -> (Vec<Vec<[i32; 3]>>, u32) {
+    let lr = lr_resolution as f32;
+    let mut hr_resolution = resolution;
+    let coords = loop {
+        let scale = (hr_resolution / 16) as f32;
+        let quant: Vec<Vec<[i32; 3]>> = samples
+            .iter()
+            .map(|sample| quantize_hr_sample(sample, lr, scale))
+            .collect();
+        let total_rows: usize = quant.iter().map(Vec::len).sum();
+        if total_rows < max_num_tokens || hr_resolution == stop_resolution {
             break quant;
         }
         hr_resolution -= 128;
@@ -762,8 +833,10 @@ pub struct Trellis2MeshPostprocessOptions {
     /// value `1`). Only used when `remesh` is set.
     pub remesh_band: f32,
     /// Project-back lerp factor toward the original surface (upstream
-    /// `remesh_project`; `0` disables, the shipped value; the reference
+    /// `remesh_project`; applied only when `> 0` like
+    /// `remeshing.py:238`, `0` disables, the shipped value; the reference
     /// signature default `0.9` is not used by either shipped entry point).
+    /// Negative values are rejected by [`Self::validate`].
     pub remesh_project: f32,
 }
 
@@ -788,7 +861,9 @@ impl Trellis2MeshPostprocessOptions {
     /// component thresholds — and accept any decimation target (`0` = skip
     /// simplification, topology-only). The remesh branch additionally
     /// requires a finite non-negative `remesh_band` and a finite
-    /// `remesh_project` (the remesher itself validates the derived grid).
+    /// non-negative `remesh_project` (the remesher itself validates the
+    /// derived grid; `0` disables project-back like the official
+    /// `project_back > 0` guard).
     pub fn validate(&self) -> Result<()> {
         if !self.enabled {
             return Ok(());
@@ -812,10 +887,11 @@ impl Trellis2MeshPostprocessOptions {
                      value in grid cells (the shipped value is 1)",
                 ));
             }
-            if !self.remesh_project.is_finite() {
+            if !self.remesh_project.is_finite() || self.remesh_project < 0.0 {
                 return Err(Lux3dError::InvalidInput(
-                    "Trellis2 postprocess remesh_project must be finite (0 disables \
-                     project-back)",
+                    "Trellis2 postprocess remesh_project must be a finite non-negative \
+                     factor (0 disables project-back; the official guard applies it only \
+                     when > 0)",
                 ));
             }
         }
@@ -930,7 +1006,9 @@ pub struct Trellis2RunOptions {
     /// Cascade token budget (49152). The reference loop breaks when the
     /// quantized HR coord count drops below this value — but also whenever
     /// `hr_resolution == 1024`, so the 1024 cascade decodes at 1024 even
-    /// when the budget would be exceeded.
+    /// when the budget would be exceeded. Multi-sample runs budget the
+    /// concatenated batch, so this is a GLOBAL cap shared by every sample
+    /// (not per sample), exactly like `sample_shape_slat_cascade`.
     pub max_num_tokens: usize,
     /// Run image preprocessing inside `run_from_path` (true).
     pub preprocess: bool,
@@ -1330,13 +1408,14 @@ pub struct Trellis2CascadeShape {
 /// and the joint HR / texture draws in
 /// [`Trellis2Pipeline::run_batched_core`]. Unlike [`Trellis2CascadeShape`]
 /// the HR SLAT is not part of the struct: the joint HR noise draw needs every
-/// sample's quantized coords first.
+/// sample's quantized coords first. The batch-level `hr_resolution` is shared
+/// by every part and is NOT stored here (the official cascade returns one
+/// `res` for the whole batch, `trellis2_image_to_3d.py:339,586-591`).
 struct Trellis2BatchedCascadePart {
     ss_coords: Vec<[i32; 3]>,
     lr_slat: Tensor,
     hr_upsampled_coords: Vec<[i32; 3]>,
     quant_coords: Vec<[i32; 3]>,
-    hr_resolution: u32,
 }
 
 /// Raw TRELLIS.2 checkpoint layout (`models/TRELLIS.2-4B`), stage prefix ->
@@ -2247,29 +2326,18 @@ impl Trellis2Pipeline {
             })
     }
 
-    /// Cascade upsample + quantize steps (the middle of the reference
-    /// `sample_shape_slat_cascade`, `trellis2_image_to_3d.py:319-339`):
-    ///
-    /// 1. load the shape VAE and run `upsample(slat, 4)` — `from_latent` +
-    ///    stages 0..3 exactly like the full decode — to obtain the HR coords
-    ///    on the 512 grid;
-    /// 2. drop the VAE, then quantize onto the `hr_resolution // 16` grid,
-    ///    deduplicate and run the token-budget loop
-    ///    ([`quantize_hr_coords`]) starting at `target_resolution` (1024 or
-    ///    1536; the loop's stop resolution stays 1024).
-    ///
-    /// Returns `(hr_upsampled_coords, quant_coords, hr_resolution)`. The
-    /// 1024 cascade's loop always breaks at `hr_resolution == 1024`, so
-    /// `hr_resolution` is 1024 there regardless of the token count; the
-    /// 1536 cascade decodes at 1536 unless the token budget reduces it.
-    pub fn upsample_and_quantize_shape_slat(
+    /// Shape VAE `upsample(slat, 4)` only (the reference
+    /// `sample_shape_slat_cascade` upsample step, `trellis2_image_to_3d.py:319-326`):
+    /// `from_latent` + stages 0..3 exactly like the full decode, returning
+    /// the HR coords on the 512 grid. The batched cascade runs this per
+    /// sample BEFORE the shared token-budget loop so the whole batch is
+    /// quantized and budgeted together.
+    pub fn upsample_shape_slat(
         &self,
         lr_coords: &[[i32; 3]],
         lr_slat_denorm: &Tensor,
-        max_num_tokens: usize,
-        target_resolution: u32,
         device: &Device,
-    ) -> Result<(Vec<[i32; 3]>, Vec<[i32; 3]>, u32)> {
+    ) -> Result<Vec<[i32; 3]>> {
         let profile = std::env::var_os("LUX3D_STAGE_TIME").is_some();
         let load_mark = std::time::Instant::now();
         let decoder = self.acquire_shape_vae(device)?;
@@ -2285,6 +2353,35 @@ impl Trellis2Pipeline {
                 message: format!("Trellis2 shape VAE upsample failed: {source}"),
             })?;
         drop(decoder);
+        Ok(hr_coords)
+    }
+
+    /// Cascade upsample + quantize steps (the middle of the reference
+    /// `sample_shape_slat_cascade`, `trellis2_image_to_3d.py:319-339`):
+    ///
+    /// 1. load the shape VAE and run `upsample(slat, 4)` — `from_latent` +
+    ///    stages 0..3 exactly like the full decode — to obtain the HR coords
+    ///    on the 512 grid ([`Self::upsample_shape_slat`]);
+    /// 2. drop the VAE, then quantize onto the `hr_resolution // 16` grid,
+    ///    deduplicate and run the token-budget loop
+    ///    ([`quantize_hr_coords`]) starting at `target_resolution` (1024 or
+    ///    1536; the loop's stop resolution stays 1024).
+    ///
+    /// Returns `(hr_upsampled_coords, quant_coords, hr_resolution)`. The
+    /// 1024 cascade's loop always breaks at `hr_resolution == 1024`, so
+    /// `hr_resolution` is 1024 there regardless of the token count; the
+    /// 1536 cascade decodes at 1536 unless the token budget reduces it.
+    /// Multi-sample runs use [`quantize_hr_coords_batched`] on the whole
+    /// batch instead of this per-sample helper.
+    pub fn upsample_and_quantize_shape_slat(
+        &self,
+        lr_coords: &[[i32; 3]],
+        lr_slat_denorm: &Tensor,
+        max_num_tokens: usize,
+        target_resolution: u32,
+        device: &Device,
+    ) -> Result<(Vec<[i32; 3]>, Vec<[i32; 3]>, u32)> {
+        let hr_coords = self.upsample_shape_slat(lr_coords, lr_slat_denorm, device)?;
         let (quant_coords, hr_resolution) = quantize_hr_coords(
             &hr_coords,
             TRELLIS2_CASCADE_LR_RESOLUTION,
@@ -2664,14 +2761,17 @@ impl Trellis2Pipeline {
 
     /// Snapshot the pre-postprocess surface for the bake snap-back.
     ///
-    /// Upstream `to_glb` builds its BVH from the cleaned decoded mesh right
-    /// before the remesh/simplify branches (`postprocess.py:122`) and keeps
-    /// it for the texel projection (`postprocess.py:254-256`). Our
-    /// [`Self::postprocess_decoded_mesh`] owns that whole chain (starting
-    /// with the same `fill_holes(3e-2)` pre-pass), so the snapshot is taken
-    /// from the decoded mesh immediately before it; the ≤3e-2-perimeter
-    /// hole-fill fan patches it would add are the only difference from the
-    /// official BVH surface.
+    /// Upstream `to_glb` fills holes (`mesh.fill_holes(max_hole_perimeter =
+    /// 3e-2)`, `postprocess.py:108-113`) and then builds its BVH from the
+    /// cleaned decoded mesh right before the remesh/simplify branches
+    /// (`postprocess.py:122`), keeping it for the texel projection
+    /// (`postprocess.py:254-256`). Our [`Self::postprocess_decoded_mesh`]
+    /// owns that whole chain and starts with the same fill, so the snapshot
+    /// applies the SAME `fill_holes(fill_hole_perimeter)` pass here before
+    /// returning; the snap BVH is thus built from the filled surface, not the
+    /// raw decoded one. Already-filled meshes pass through byte-identically
+    /// (the fill only appends centroid fan patches for closed loops under the
+    /// threshold).
     ///
     /// Returns `None` when no textured mesh will be baked (`with_texture`
     /// off, texture export disabled / unwrap off, empty mesh) or when the
@@ -2703,7 +2803,15 @@ impl Trellis2Pipeline {
             }
             faces.push(index as u32);
         }
-        Ok(Some((mesh.vertices.clone(), faces)))
+        // Same shared pre-branch fill the geometry post-process applies
+        // (`postprocess.py:108-113`), so the snap BVH and the remesh BVH see
+        // the same filled surface.
+        let (vertices, faces) = fill_holes_with_centroids(
+            &mesh.vertices,
+            &faces,
+            options.postprocess.fill_hole_perimeter,
+        );
+        Ok(Some((vertices, faces)))
     }
 
     fn assemble_mesh(
@@ -3166,9 +3274,13 @@ impl Trellis2Pipeline {
                     )?),
                 };
                 // LR shape SLAT per sample (the candle sparse DiT is single
-                // sample) + deterministic upsample/quantize. The LR noise
-                // rows come from the ONE joint draw.
-                let mut parts: Vec<Trellis2BatchedCascadePart> = Vec::with_capacity(count);
+                // sample) + deterministic upsample. The LR noise rows come
+                // from the ONE joint draw. The token budget runs ONCE over
+                // the whole batch below (the official `unique`/budget loop
+                // sees the concatenated batch coords, so every sample shares
+                // one `hr_resolution`, `trellis2_image_to_3d.py:327-339`).
+                let mut lr_parts: Vec<(Vec<[i32; 3]>, Tensor, Vec<[i32; 3]>)> =
+                    Vec::with_capacity(count);
                 let mut row_offset = 0_usize;
                 for coords in &coords_by_sample {
                     let lr_slat = match shape_init {
@@ -3207,25 +3319,33 @@ impl Trellis2Pipeline {
                         }
                     };
                     row_offset += coords.len();
-                    let (hr_upsampled_coords, quant_coords, hr_resolution) = self
-                        .upsample_and_quantize_shape_slat(
-                            coords,
-                            &lr_slat,
-                            options.max_num_tokens,
-                            decode_resolution,
-                            device,
-                        )?;
+                    let hr_upsampled_coords = self.upsample_shape_slat(coords, &lr_slat, device)?;
+                    lr_parts.push((coords.clone(), lr_slat, hr_upsampled_coords));
+                }
+                let hr_upsampled_by_sample: Vec<Vec<[i32; 3]>> = lr_parts
+                    .iter()
+                    .map(|(_, _, hr_upsampled)| hr_upsampled.clone())
+                    .collect();
+                let (quant_by_sample, hr_resolution) = quantize_hr_coords_batched(
+                    &hr_upsampled_by_sample,
+                    TRELLIS2_CASCADE_LR_RESOLUTION,
+                    decode_resolution,
+                    options.max_num_tokens,
+                );
+                let mut parts: Vec<Trellis2BatchedCascadePart> = Vec::with_capacity(count);
+                for ((ss_coords, lr_slat, hr_upsampled_coords), quant_coords) in
+                    lr_parts.into_iter().zip(quant_by_sample)
+                {
                     if quant_coords.is_empty() {
                         return Err(Lux3dError::InvalidInput(
                             "Trellis2 cascade quantized the upsampled coords to zero HR tokens",
                         ));
                     }
                     parts.push(Trellis2BatchedCascadePart {
-                        ss_coords: coords.clone(),
+                        ss_coords,
                         lr_slat,
                         hr_upsampled_coords,
                         quant_coords,
-                        hr_resolution,
                     });
                 }
                 stage_done!("shape spatial (LR + upsample)");
@@ -3241,8 +3361,10 @@ impl Trellis2Pipeline {
                 )?;
                 let mut hr_latents = Vec::with_capacity(count);
                 let mut hr_offset = 0_usize;
+                // ONE shared latent-grid bound for every sample (the batch
+                // budget returned a single `hr_resolution`).
+                let hr_grid = (hr_resolution / 16) as usize;
                 for part in &parts {
-                    let grid = (part.hr_resolution / 16) as usize;
                     let slice = noise_rows(&hr_joint, hr_offset, part.quant_coords.len())?;
                     hr_offset += part.quant_coords.len();
                     hr_latents.push(self.sample_shape_slat_hr(
@@ -3252,7 +3374,7 @@ impl Trellis2Pipeline {
                         options.seed,
                         &shape_params,
                         device,
-                        grid,
+                        hr_grid,
                     )?);
                 }
                 stage_done!("shape spatial (HR)");
@@ -3271,6 +3393,13 @@ impl Trellis2Pipeline {
                 };
                 let mut tex_latents = Vec::with_capacity(count);
                 let mut tex_offset = 0_usize;
+                // One elastic texture config for the whole batch: the shared
+                // cascade resolution decides the latent grid bound.
+                let tex_config = if hr_grid > 64 {
+                    Trellis2SlatConfig::tex_1536()
+                } else {
+                    Trellis2SlatConfig::tex_1024()
+                };
                 for (index, part) in parts.iter().enumerate() {
                     let tex_latent = if !options.with_texture {
                         None
@@ -3300,11 +3429,7 @@ impl Trellis2Pipeline {
                                 let slice = noise_rows(joint, tex_offset, part.quant_coords.len())?;
                                 Some(self.sample_tex_slat_stage(
                                     "tex_dit_1024",
-                                    if (part.hr_resolution / 16) as usize > 64 {
-                                        Trellis2SlatConfig::tex_1536()
-                                    } else {
-                                        Trellis2SlatConfig::tex_1024()
-                                    },
+                                    tex_config.clone(),
                                     cond_shape,
                                     &hr_latents[index],
                                     &part.quant_coords,
@@ -3325,14 +3450,10 @@ impl Trellis2Pipeline {
                         &part.quant_coords,
                         &hr_latents[index],
                         device,
-                        part.hr_resolution,
+                        hr_resolution,
                     )?;
-                    let mut mesh = self.assemble_mesh(
-                        part.hr_resolution,
-                        mesh,
-                        &decoded.coords,
-                        &decoded.feats,
-                    )?;
+                    let mut mesh =
+                        self.assemble_mesh(hr_resolution, mesh, &decoded.coords, &decoded.feats)?;
                     let snap_surface = Self::capture_bake_snap_surface(&mesh, options)?;
                     mesh = self.postprocess_decoded_mesh(mesh, &options.postprocess)?;
                     let tex_attrs = match &tex_latents[index] {
@@ -3347,12 +3468,7 @@ impl Trellis2Pipeline {
                                 tex_coords, decoded.coords,
                                 "guided texture decode coords must equal the shape decode coords"
                             );
-                            self.attach_texture(
-                                &mut mesh,
-                                &decoded.coords,
-                                &attrs,
-                                part.hr_resolution,
-                            )?;
+                            self.attach_texture(&mut mesh, &decoded.coords, &attrs, hr_resolution)?;
                             Some(attrs)
                         }
                         None => None,
@@ -3374,7 +3490,7 @@ impl Trellis2Pipeline {
                         lr_shape_latent: Some(part.lr_slat.clone()),
                         hr_upsampled_coords: Some(part.hr_upsampled_coords.clone()),
                         quant_coords: Some(part.quant_coords.clone()),
-                        hr_resolution: Some(part.hr_resolution),
+                        hr_resolution: Some(hr_resolution),
                         subdiv_logits: decoded.subdiv_logits,
                         tex_latent: tex_latents[index].clone(),
                         tex_attrs,
@@ -4394,6 +4510,59 @@ mod tests {
         );
     }
 
+    /// Multi-sample cascade token budgeting is GLOBAL: the reference
+    /// concatenates the batch coords before the `unique`/budget loop
+    /// (`trellis2_image_to_3d.py:327-339`), so two samples that each fit a
+    /// per-sample cap but exceed it together must share ONE reduced
+    /// `hr_resolution`, and the global row count must stay under the cap.
+    #[test]
+    fn batched_cascade_budget_is_global_and_shares_one_resolution() {
+        // 40 distinct LR x-coords spaced 4 apart, identical per sample; the
+        // reference's leading batch column keeps equal xyz rows from
+        // different samples distinct under `unique(dim=0)`.
+        let sample: Vec<[i32; 3]> = (0..40).map(|k| [4 * k, 0, 0]).collect();
+        let samples = vec![sample.clone(), sample.clone()];
+        let cap = 45_usize;
+
+        // Per sample the 1536-grid pass yields 30 unique rows (< 45), so a
+        // per-sample budget would keep 1536 for both samples.
+        let (single, single_resolution) =
+            quantize_hr_coords(&sample, TRELLIS2_CASCADE_LR_RESOLUTION, 1536, cap);
+        assert_eq!(30, single.len());
+        assert_eq!(1536, single_resolution);
+
+        // The batch total at 1536 is 60 >= 45, so the shared loop reduces
+        // the resolution until the GLOBAL count fits (1024 here).
+        let (batched, hr_resolution) =
+            quantize_hr_coords_batched(&samples, TRELLIS2_CASCADE_LR_RESOLUTION, 1536, cap);
+        assert_eq!(
+            1024, hr_resolution,
+            "the batch must share one reduced resolution"
+        );
+        let total: usize = batched.iter().map(Vec::len).sum();
+        assert!(
+            total < cap,
+            "global token count {total} must stay below {cap}"
+        );
+        for sample in &batched {
+            assert_eq!(20, sample.len());
+            let mut sorted = sample.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(&sorted, sample, "per-sample rows stay sorted and unique");
+        }
+
+        // A batch of one is bit-identical to the single-sample helper.
+        let (one, one_resolution) = quantize_hr_coords_batched(
+            std::slice::from_ref(&samples[0]),
+            TRELLIS2_CASCADE_LR_RESOLUTION,
+            1536,
+            cap,
+        );
+        assert_eq!(single_resolution, one_resolution);
+        assert_eq!(single, one[0]);
+    }
+
     /// Regression guard for `num_samples = 1`: the joint-draw helpers consume
     /// the exact legacy single-sample stream values in the same order, so
     /// the single-output path (and `run_many_*` with N = 1, which keeps the
@@ -4625,5 +4794,41 @@ mod tests {
         assert!(error
             .to_string()
             .contains("face index outside the vertex buffer"));
+    }
+
+    /// The captured snap surface runs the SAME shared `fill_holes`
+    /// pre-pass as the geometry post-process (`postprocess.py:108-122`), so
+    /// the snap BVH sees the filled surface instead of the raw hole
+    /// boundary.
+    #[test]
+    fn bake_snap_surface_capture_applies_the_shared_fill_holes_prepass() {
+        let mut mesh = drifted_pbr_buffers();
+        // One tiny quad (side 0.005): its boundary loop perimeter (0.02) is
+        // under the default 3e-2, so the fill closes it with a centroid fan.
+        mesh.vertices = vec![
+            0.0, 0.0, 0.0, 0.005, 0.0, 0.0, 0.005, 0.005, 0.0, 0.0, 0.005, 0.0,
+        ];
+        mesh.faces = vec![0, 1, 2, 0, 2, 3];
+        let options = Trellis2RunOptions::default();
+        let (vertices, faces) = Trellis2Pipeline::capture_bake_snap_surface(&mesh, &options)
+            .expect("capture")
+            .expect("snapshot");
+        assert_eq!(15, vertices.len(), "the fill adds the loop centroid");
+        assert_eq!(18, faces.len(), "the loop is closed with a centroid fan");
+
+        // `fill_hole_perimeter = 0` keeps the raw decoded surface (the
+        // shared fill is a no-op), preserving the already-filled behavior.
+        let no_fill = Trellis2RunOptions {
+            postprocess: Trellis2MeshPostprocessOptions {
+                fill_hole_perimeter: 0.0,
+                ..Trellis2MeshPostprocessOptions::default()
+            },
+            ..Trellis2RunOptions::default()
+        };
+        let (vertices, faces) = Trellis2Pipeline::capture_bake_snap_surface(&mesh, &no_fill)
+            .expect("capture")
+            .expect("snapshot");
+        assert_eq!(mesh.vertices, vertices);
+        assert_eq!(vec![0, 1, 2, 0, 2, 3], faces);
     }
 }

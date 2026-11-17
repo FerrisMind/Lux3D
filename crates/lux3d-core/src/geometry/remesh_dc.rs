@@ -53,9 +53,11 @@
 //!    increasing SDF (outward). Each grid edge is emitted exactly once, by
 //!    the cell that owns it at its max corner.
 //! 6. **Project back.** Each output vertex moves toward its BVH closest point
-//!    by the factor `project_back`: `0` disables (the shipped demo value,
-//!    `example.py:45`, `app.py:505`), `1` places every vertex on the input
-//!    surface.
+//!    by the factor `project_back` when it is positive: `0` disables (the
+//!    shipped demo value, `example.py:45`, `app.py:505`), `1` places every
+//!    vertex on the input surface. Matching the official `if project_back >
+//!    0` guard (`remeshing.py:238`), a negative factor is rejected by the
+//!    option validation instead of extrapolating away from the surface.
 //!
 //! # Degenerate cases and assumptions
 //!
@@ -86,8 +88,9 @@
 //!   `(vertices, faces)` buffers; the buffers are validated here, but the
 //!   tree is not re-derived. `resolution` must be in
 //!   `2..=MAX_GRID_SIZE_PER_AXIS`, `center` / `band` / `project_back` must be
-//!   finite, `band >= 0`, and `scale > 0`. `project_back` is a raw lerp
-//!   factor, so values outside `[0, 1]` extrapolate.
+//!   finite, `band >= 0`, `project_back >= 0`, and `scale > 0`.
+//!   `project_back` is a raw lerp factor, so values above 1 extrapolate
+//!   toward (and past) the closest point, matching the official call.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -457,7 +460,9 @@ pub fn remesh_narrow_band_dc<'mesh>(
     }
 
     // ---- step 6: project back to the input surface ------------------------
-    if options.project_back != 0.0 {
+    // Official guard: `if project_back > 0` (`remeshing.py:238`); `0`
+    // disables and negative factors are rejected by validation.
+    if options.project_back > 0.0 {
         for vertex in output_vertices.chunks_exact_mut(3) {
             let point = [vertex[0], vertex[1], vertex[2]];
             let hit = bvh.closest_point(point);
@@ -499,9 +504,10 @@ fn validate_options(options: &RemeshDcOptions) -> Result<()> {
             "remesh narrow-band dual contouring requires a finite non-negative band",
         ));
     }
-    if !options.project_back.is_finite() {
+    if !options.project_back.is_finite() || options.project_back < 0.0 {
         return Err(Lux3dError::InvalidInput(
-            "remesh narrow-band dual contouring requires a finite project_back factor",
+            "remesh narrow-band dual contouring requires a finite non-negative project_back \
+             factor (0 disables project-back)",
         ));
     }
     Ok(())
@@ -1227,6 +1233,16 @@ mod tests {
         .is_err());
         assert!(run(&RemeshDcOptions {
             project_back: f32::NAN,
+            ..valid
+        })
+        .is_err());
+        assert!(run(&RemeshDcOptions {
+            project_back: -0.5,
+            ..valid
+        })
+        .is_err());
+        assert!(run(&RemeshDcOptions {
+            project_back: f32::NEG_INFINITY,
             ..valid
         })
         .is_err());

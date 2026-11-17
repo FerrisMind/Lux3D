@@ -332,9 +332,12 @@ impl Trellis2GeometryStage {
 ///
 /// The upstream remesh branch skips the duplicate-face / non-manifold /
 /// small-component / orientation-unification chain, so this helper does not
-/// run it. The remesher emits quads; they are split along the 0-2 diagonal
-/// (the same diagonal convention as the O-Voxel quad splitter) because the
-/// meshopt simplifier and the export writers are triangle-only.
+/// run it. The remesher emits quads; they are split into triangles with the
+/// official adaptive diagonal selection (compare the two triangulations'
+/// triangle-normal alignment and keep the better one, `align0 > align1`,
+/// ties pick split 2 — `flexible_dual_grid.py:244-256`, the same rule as the
+/// CuMesh remesh splitter `remeshing.py:212-233`) because the meshopt
+/// simplifier and the export writers are triangle-only.
 fn postprocess_mesh_remesh(
     vertices: &[f32],
     faces: &[u32],
@@ -358,13 +361,66 @@ fn postprocess_mesh_remesh(
     debug_assert_eq!(remeshed.faces.len() % 4, 0, "the remesher emits quads");
     let mut triangles = Vec::with_capacity(remeshed.faces.len() / 2);
     for quad in remeshed.faces.chunks_exact(4) {
-        triangles.extend_from_slice(&[quad[0], quad[1], quad[2], quad[0], quad[2], quad[3]]);
+        triangles.extend_from_slice(&split_quad_adaptive(
+            &remeshed.vertices,
+            [quad[0], quad[1], quad[2], quad[3]],
+        ));
     }
     Ok(if options.decimation_target > 0 {
         simplify_mesh(&remeshed.vertices, &triangles, options.decimation_target)
     } else {
         compact_mesh(&remeshed.vertices, &triangles)
     })
+}
+
+/// Split a quad with the official adaptive diagonal selection
+/// (`flexible_dual_grid.py:244-256`, also the CuMesh remesh splitter
+/// `remeshing.py:212-233`).
+///
+/// Split 1 is `[0, 1, 2] + [0, 2, 3]`, split 2 is `[0, 1, 3] + [3, 1, 2]`.
+/// For each split the two triangle normals are compared and the split with
+/// the larger `abs(dot)` alignment wins; `align0 > align1` is strict, so a
+/// tie chooses split 2 exactly like the reference `torch.where`.
+fn split_quad_adaptive(vertices: &[f32], quad: [u32; 4]) -> [u32; 6] {
+    let position = |index: u32| {
+        let base = index as usize * 3;
+        [vertices[base], vertices[base + 1], vertices[base + 2]]
+    };
+    let p0 = position(quad[0]);
+    let p1 = position(quad[1]);
+    let p2 = position(quad[2]);
+    let p3 = position(quad[3]);
+
+    // Shared second triangle of both splits (`cross(p2 - p1, p3 - p1)`).
+    let n1 = triangle_normal(p1, p2, p3);
+    let align0 = triangle_normal(p1, p0, p2)
+        .iter()
+        .zip(n1.iter())
+        .map(|(a, b)| a * b)
+        .sum::<f32>()
+        .abs();
+    let align1 = triangle_normal(p1, p0, p3)
+        .iter()
+        .zip(n1.iter())
+        .map(|(a, b)| a * b)
+        .sum::<f32>()
+        .abs();
+    if align0 > align1 {
+        [quad[0], quad[1], quad[2], quad[0], quad[2], quad[3]]
+    } else {
+        [quad[0], quad[1], quad[3], quad[3], quad[1], quad[2]]
+    }
+}
+
+/// `cross(b - a, c - a)`.
+fn triangle_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
+    let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    [
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    ]
 }
 
 #[cfg(test)]
@@ -497,6 +553,14 @@ mod tests {
             },
             Trellis2MeshPostprocessOptions {
                 remesh_project: f32::INFINITY,
+                ..Trellis2MeshPostprocessOptions::default()
+            },
+            Trellis2MeshPostprocessOptions {
+                remesh_project: -0.5,
+                ..Trellis2MeshPostprocessOptions::default()
+            },
+            Trellis2MeshPostprocessOptions {
+                remesh_project: f32::NEG_INFINITY,
                 ..Trellis2MeshPostprocessOptions::default()
             },
         ] {
@@ -840,5 +904,56 @@ mod tests {
             .postprocess_decoded_mesh(input, &Trellis2MeshPostprocessOptions::default())
             .expect_err("remesh cannot remap vertex colors");
         assert!(error.to_string().contains("remesh rebuilds the topology"));
+    }
+
+    /// Adaptive quad split matches the official `align0 > align1` rule
+    /// (`flexible_dual_grid.py:244-256`): split 1 = `[0,1,2]+[0,2,3]`,
+    /// split 2 = `[0,1,3]+[3,1,2]`, ties choose split 2 (`torch.where`).
+    #[test]
+    fn remesh_quad_split_matches_the_official_alignment_rule() {
+        let flat = |points: [[f32; 3]; 4]| -> Vec<f32> {
+            points.iter().flatten().copied().collect::<Vec<f32>>()
+        };
+        let quad = [0, 1, 2, 3];
+
+        // align0 = 1 > align1 = 0: split 1.
+        let split_1 = flat([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 1.0],
+            [0.0, 0.0, 1.0],
+        ]);
+        assert_eq!(
+            [0, 1, 2, 0, 2, 3],
+            split_quad_adaptive(&split_1, quad),
+            "the better-aligned split 1 must win"
+        );
+
+        // Swapping the last two corners gives align0 = 0 < align1 = 1:
+        // split 2.
+        let split_2 = flat([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 1.0, 1.0],
+        ]);
+        assert_eq!(
+            [0, 1, 3, 3, 1, 2],
+            split_quad_adaptive(&split_2, quad),
+            "the better-aligned split 2 must win"
+        );
+
+        // align0 == align1 == 1: strict `>` keeps split 2.
+        let tied = flat([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+        ]);
+        assert_eq!(
+            [0, 1, 3, 3, 1, 2],
+            split_quad_adaptive(&tied, quad),
+            "a tie chooses split 2 like torch.where"
+        );
     }
 }

@@ -699,9 +699,11 @@ fn texture_mesh_run_e2e() {
         "lux3d-trellis2-texture-e2e-{}.glb",
         std::process::id()
     ));
+    // No remesh on the standalone texturing path, so the upstream
+    // `doubleSided = !remeshed` rule keeps both sides (`postprocess.py:303`).
     pipeline
         .export
-        .write_textured_glb(&output.mesh, &out_path)
+        .write_textured_glb(&output.mesh, &out_path, true)
         .expect("textured glb write");
     assert!(out_path.is_file());
     if let Some(expected_uvs) = &corner_uvs {

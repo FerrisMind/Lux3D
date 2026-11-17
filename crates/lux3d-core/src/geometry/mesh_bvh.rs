@@ -47,7 +47,9 @@
 //!   more triangles than `u32` can address.
 //! * Zero-area (degenerate) triangles are accepted; their closest point is
 //!   well defined on the triangle edges.
-//! * Query points are expected to be finite.
+//! * Query points MUST be finite: [`MeshBvh::closest_point`] /
+//!   [`MeshBvh::closest_points`] assert the contract in every build profile
+//!   instead of returning the internal sentinel triangle id.
 
 use std::cmp::Ordering;
 
@@ -184,13 +186,21 @@ impl<'a> MeshBvh<'a> {
     /// position and the unsigned distance — the data the official
     /// `unsigned_distance(..., return_uvw=True)` call exposes
     /// (`postprocess.py:254-256`).
+    ///
+    /// # Contract
+    ///
+    /// `point` must be finite. The contract is enforced with an assertion in
+    /// every build profile: a non-finite query has no meaningful nearest
+    /// triangle and would otherwise return the internal sentinel triangle
+    /// id. Every in-tree caller validates its positions (remesh checks the
+    /// input vertices; the bake path interpolates validated atlas vertices).
     pub fn closest_point(&self, point: [f32; 3]) -> ClosestPoint {
         let mut stack = Vec::with_capacity(64);
         self.query(point, &mut stack)
     }
 
     /// Batched [`Self::closest_point`]: one result per input point, in input
-    /// order.
+    /// order. Every point must satisfy the same finite-input contract.
     pub fn closest_points(&self, points: &[[f32; 3]]) -> Vec<ClosestPoint> {
         let mut stack = Vec::with_capacity(64);
         points
@@ -200,6 +210,10 @@ impl<'a> MeshBvh<'a> {
     }
 
     fn query(&self, point: [f32; 3], stack: &mut Vec<u32>) -> ClosestPoint {
+        assert!(
+            point.iter().all(|value| value.is_finite()),
+            "MeshBvh::closest_point requires a finite query point, got {point:?}"
+        );
         stack.clear();
         stack.push(0);
 
@@ -885,5 +899,16 @@ mod tests {
         assert!(hit.position[1].abs() <= 1e-6);
         assert!((hit.unsigned_distance - 1.0).abs() <= 1e-6);
         assert!((hit.uvw.iter().sum::<f32>() - 1.0).abs() <= 1e-6);
+    }
+
+    /// The finite-input contract is enforced in every build profile: a
+    /// non-finite query panics instead of returning the internal sentinel
+    /// triangle id.
+    #[test]
+    #[should_panic(expected = "requires a finite query point")]
+    fn non_finite_queries_are_rejected() {
+        let vertices = [0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let bvh = MeshBvh::build(&vertices, &[0, 1, 2]).expect("build bvh");
+        let _ = bvh.closest_point([f32::NAN, 0.0, 0.0]);
     }
 }
