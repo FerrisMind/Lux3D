@@ -7,6 +7,19 @@
 //! image, and camera/point rescaling back to the original image resolution
 //! through the per-frame [`VggtOriginalCoords`].
 //!
+//! It also implements the track-based reconstruction path
+//! [`write_track_colmap`] (upstream `batch_np_matrix_to_pycolmap`,
+//! `vggt/dependency/np_to_pycolmap.py:12-145`): per-frame tracks `[S, N, 2]`
+//! plus a visibility mask (`vis > vis_thresh`, official default 0.2), the
+//! predicted world points as the initial 3D positions (official feeds
+//! `pred_points_3d`, sampled from the point map at each query pixel — there is
+//! no triangulation solver), a reprojection-error mask (`diff <
+//! max_reproj_error`, official default 8.0), the official per-frame inlier
+//! count gate (`min_inlier_per_frame`, official default 64), the
+//! `inlier_num >= 2` per-track gate, the `< 3000` point-coordinate gate, and
+//! `SIMPLE_PINHOLE` cameras. No bundle adjustment is run (explicit non-goal —
+//! the export is COLMAP-ready input for external BA).
+//!
 //! Differences from upstream, all deliberate and documented:
 //! * The 3D-point source defaults to the depth-unprojected
 //!   [`VggtInferenceOutput::world_points_from_depth`] (upstream
@@ -24,6 +37,13 @@
 //!   `point3D_id`; newer COLMAP releases omit it). Integer ids are written as
 //!   little-endian unsigned values, which is byte-identical to the task's
 //!   signed spec for the positive 1-based ids used here.
+//! * Track-mode reprojection errors are evaluated after the official
+//!   square-mode intrinsic rescale (`intrinsic[:, :2, :] *= 1024 / 518`,
+//!   `demo_colmap.py:168-169`): our tracks are predicted in model-input
+//!   pixels, so they are multiplied by the same `load_size / model_size`
+//!   factor before the threshold test. Crop/pad frames have no official
+//!   COLMAP counterpart; their reprojection errors stay in model-input
+//!   pixels.
 
 use std::{fs, path::Path};
 
@@ -33,17 +53,28 @@ use super::point_cloud::{write_ply, PointCloudView};
 use crate::{
     error::Lux3dError,
     geometry::{rescale_intrinsics_to_original, shift_point2d_to_original},
-    preprocess::{VggtOriginalCoords, VggtPreparedInputs},
-    runtime::VggtInferenceOutput,
+    preprocess::{VggtOriginalCoords, VggtPreparedInputs, VggtPreprocessMode},
+    runtime::{VggtAutoTrackResult, VggtInferenceOutput},
     Result,
 };
 
 /// COLMAP camera model id for `PINHOLE` (params: fx, fy, cx, cy).
 pub const COLMAP_CAMERA_MODEL_PINHOLE: i32 = 1;
+/// COLMAP camera model id for `SIMPLE_PINHOLE` (params: f, cx, cy) — the
+/// track/BA path model (`_build_pycolmap_intri`, `np_to_pycolmap.py:310-312`).
+pub const COLMAP_CAMERA_MODEL_SIMPLE_PINHOLE: i32 = 2;
 /// Upstream demo `conf_thres_value` default for the feedforward mode.
 pub const DEFAULT_CONF_THRESHOLD: f32 = 5.0;
 /// Upstream demo `max_points_for_colmap`.
 pub const DEFAULT_MAX_POINTS: usize = 100_000;
+/// Upstream `--vis_thresh` default (`demo_colmap.py:53`).
+pub const DEFAULT_VIS_THRESHOLD: f32 = 0.2;
+/// Upstream `--max_reproj_error` default (`demo_colmap.py:49`).
+pub const DEFAULT_MAX_REPROJ_ERROR: f32 = 8.0;
+/// Upstream builder `min_inlier_per_frame` default (`np_to_pycolmap.py:24`).
+pub const DEFAULT_MIN_INLIER_PER_FRAME: usize = 64;
+/// Upstream builder `max_points3D_val` default (`np_to_pycolmap.py:20`).
+pub const DEFAULT_MAX_POINTS3D_VAL: f64 = 3000.0;
 
 /// Source of the exported 3D points.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -308,6 +339,668 @@ pub fn write_feedforward_colmap(
         point2d_count: points3d.len(),
         confidence_candidates: candidates.len(),
     })
+}
+
+/// COLMAP export mode (upstream `demo_colmap.py` feedforward branch vs the
+/// track/BA-input branch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VggtColmapMode {
+    /// `batch_np_matrix_to_pycolmap_wo_track` (feedforward): PINHOLE cameras,
+    /// one single-observation track per exported pixel.
+    #[default]
+    Feedforward,
+    /// `batch_np_matrix_to_pycolmap` with the bundle-adjustment optimization
+    /// left out (see [`write_track_colmap`]): SIMPLE_PINHOLE cameras and
+    /// multi-frame tracks.
+    Track,
+}
+
+/// Track-mode export options. Mirrors the official builder arguments
+/// (`np_to_pycolmap.py:12-25`) plus the demo's visibility threshold.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VggtTrackColmapOptions {
+    /// Strict track visibility gate `pred_vis_scores > vis_thresh`
+    /// (`demo_colmap.py:170`, default 0.2).
+    pub vis_thresh: f32,
+    /// Reprojection-error gate `||project(points3d) - tracks|| <
+    /// max_reproj_error` (`np_to_pycolmap.py:56-60`, demo default 8.0). When
+    /// the preprocess mode is `square` both the projection and the tracks are
+    /// in the loaded 1024-pixel space, matching the official
+    /// `intrinsic[:, :2, :] *= 1024 / 518` step.
+    pub max_reproj_error: f32,
+    /// Share one camera object across all frames (`np_to_pycolmap.py:93-101`).
+    /// Unused by the feedforward path, where upstream forces it to `False`.
+    pub shared_camera: bool,
+    /// Official `min_inlier_per_frame`: every frame must keep at least this
+    /// many inlier observations or the official builder returns no
+    /// reconstruction (`np_to_pycolmap.py:71-73`). Default 64.
+    pub min_inlier_per_frame: usize,
+    /// Official `max_points3D_val`: points with any coordinate `>=` this value
+    /// stay in the reconstruction but receive no 2D observations
+    /// (`np_to_pycolmap.py:120`). Default 3000.
+    pub max_points3d_val: f64,
+}
+
+impl Default for VggtTrackColmapOptions {
+    fn default() -> Self {
+        Self {
+            vis_thresh: DEFAULT_VIS_THRESHOLD,
+            max_reproj_error: DEFAULT_MAX_REPROJ_ERROR,
+            shared_camera: false,
+            min_inlier_per_frame: DEFAULT_MIN_INLIER_PER_FRAME,
+            max_points3d_val: DEFAULT_MAX_POINTS3D_VAL,
+        }
+    }
+}
+
+/// Flat track payload for [`write_track_colmap`]: row-major
+/// `points3d [N, 3]`, `points_rgb [N, 3]`, `tracks [S, N, 2]` (pixel
+/// coordinates in the model-input space, e.g. 518x518) and
+/// `visibility [S, N]`.
+#[derive(Debug, Clone, Copy)]
+pub struct VggtTrackPack<'a> {
+    /// Predicted initial 3D point per track (official `pred_points_3d`; no
+    /// triangulation).
+    pub points3d: &'a [f32],
+    /// Per-track RGB color `[0, 255]` (official `pred_colors`).
+    pub points_rgb: &'a [u8],
+    /// Track pixel coordinates `[S, N, 2]` in model-input resolution.
+    pub tracks: &'a [f32],
+    /// Track visibility `[S, N]` in `[0, 1]`.
+    pub visibility: &'a [f32],
+}
+
+/// Per-track initialization data sampled from the prediction point map at the
+/// query pixels (official `pred_points_3d` / `pred_colors`,
+/// `track_predict.py:171-179`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct VggtTrackSeeds {
+    /// Row-major `[N, 3]` world points.
+    pub points3d: Vec<f32>,
+    /// Row-major `[N, 3]` RGB colors.
+    pub points_rgb: Vec<u8>,
+}
+
+/// Result counters for [`write_track_colmap`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VggtTrackColmapStats {
+    pub camera_count: usize,
+    pub image_count: usize,
+    /// Points with at least two inlier observations (official `valid_mask`,
+    /// `np_to_pycolmap.py:78-88`). Includes points skipped by the
+    /// `max_points3D_val` observation gate, which keep an empty track.
+    pub point3d_count: usize,
+    /// Total 2D observations written across all images.
+    pub point2d_count: usize,
+    /// Tracks fed into the builder (`N`), including tracks dropped by the
+    /// `inlier_num >= 2` gate and the `points.ply` payload.
+    pub track_count: usize,
+    /// Smallest per-frame inlier count after the visibility + reprojection
+    /// masks (the value checked against `min_inlier_per_frame`).
+    pub min_inliers_per_frame: usize,
+}
+
+/// Sample the per-track 3D initialization points and colors from the predicted
+/// point map and RGB frames at the query pixels — exactly the official
+/// `pred_points_3d` / `pred_colors` computation (`track_predict.py:171-179`):
+/// round the model-resolution query pixel, index the query frame's point map,
+/// and take the RGB frame value there.
+///
+/// `point_source` selects the official depth-unprojected map
+/// ([`VggtColmapPointSource::Depth`], what `demo_colmap.py` passes to
+/// `predict_tracks` at `:140,155-164`) or the point-head map.
+pub fn sample_track_seeds(
+    output: &VggtInferenceOutput,
+    prepared: &VggtPreparedInputs,
+    query_frames: &[usize],
+    query_points: &[[f32; 2]],
+    point_source: VggtColmapPointSource,
+) -> Result<VggtTrackSeeds> {
+    if query_frames.len() != query_points.len() {
+        return Err(Lux3dError::CanonicalWeightsValidation {
+            message: format!(
+                "VGGT track seeds need one query frame per point, got {} frames for {} points",
+                query_frames.len(),
+                query_points.len()
+            ),
+        });
+    }
+    let (s, h, w) = resolve_grid_dims(output)?;
+    let points = resolve_point_source(output, point_source, s, h, w)?;
+    let rgb = rgb_frames_at_model_resolution(prepared, s, h, w)?;
+    let mut seeds = VggtTrackSeeds {
+        points3d: Vec::with_capacity(query_points.len() * 3),
+        points_rgb: Vec::with_capacity(query_points.len() * 3),
+    };
+    for (query, points_xy) in query_frames.iter().zip(query_points) {
+        if *query >= s {
+            return Err(Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "VGGT track query frame {query} is out of range for {s} prepared frames"
+                ),
+            });
+        }
+        if !points_xy[0].is_finite() || !points_xy[1].is_finite() {
+            return Err(Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "VGGT track query point ({}, {}) is not finite",
+                    points_xy[0], points_xy[1]
+                ),
+            });
+        }
+        // Official `query_points_scaled.round().long()`; the query points here
+        // are already in the point-map resolution.
+        let x = points_xy[0].round().clamp(0.0, (w - 1) as f32) as usize;
+        let y = points_xy[1].round().clamp(0.0, (h - 1) as f32) as usize;
+        let pixel = query * h * w + y * w + x;
+        seeds
+            .points3d
+            .extend_from_slice(&points[pixel * 3..pixel * 3 + 3]);
+        for channel in 0..3 {
+            seeds
+                .points_rgb
+                .push(rgb_u8(rgb[(query * 3 + channel) * h * w + y * w + x]));
+        }
+    }
+    Ok(seeds)
+}
+
+/// Write the COLMAP sparse model + `points.ply` for the track-based path,
+/// faithful to `batch_np_matrix_to_pycolmap` (`np_to_pycolmap.py:12-145`)
+/// without the bundle-adjustment step:
+///
+/// * visibility mask `visibility > vis_thresh`, reprojection mask
+///   `||K [R|t] X / z - track|| < max_reproj_error`; both must hold. The
+///   official `projected_points_2d[z <= 0] = 1e6` line runs after the mask is
+///   computed and does not affect it (`np_to_pycolmap.py:58-60`), so the mask
+///   depends only on the projected difference.
+/// * per-frame inlier gate `min_inlier_per_frame` (the official builder
+///   returns no reconstruction when a frame has fewer inliers, `:71-73`); this
+///   function errors instead of writing a partial model.
+/// * per-track gate `inlier_num >= 2` (`:78-88`).
+/// * per-observation `max_points3d_val` gate `xyz < max_points3d_val`
+///   (`:120`), applied per axis with strict `<`.
+/// * 1-based camera/image/point ids, `image_{i+1}` naming fallback,
+///   `SIMPLE_PINHOLE` cameras (`_build_pycolmap_intri`, `:310-312`) with
+///   `f = (fx + fy) / 2`, rescaled to the original resolution like the
+///   feedforward writer.
+///
+/// In `square` preprocess mode the model-space intrinsics and tracks are
+/// multiplied by `load_size / model_size` (the official
+/// `intrinsic[:, :2, :] *= 1024 / 518`) before the reprojection check, and the
+/// reconstruction uses the loaded-square image size. Crop/pad frames keep
+/// model-input pixels (no official COLMAP counterpart).
+///
+/// `points.ply` contains every input track seed/color (official line 249 uses
+/// the unfiltered `points_3d`/`points_rgb` of the track branch).
+pub fn write_track_colmap(
+    dir: &Path,
+    output: &VggtInferenceOutput,
+    prepared: &VggtPreparedInputs,
+    image_names: &[String],
+    pack: &VggtTrackPack<'_>,
+    options: &VggtTrackColmapOptions,
+) -> Result<VggtTrackColmapStats> {
+    let (s, h, w) = resolve_grid_dims(output)?;
+    let coords = &prepared.original_coords;
+    if coords.len() != s {
+        return Err(Lux3dError::CanonicalWeightsValidation {
+            message: format!(
+                "VGGT track COLMAP export needs {s} per-frame original coords, found {}",
+                coords.len()
+            ),
+        });
+    }
+    let model_size = f64::from(prepared.target_size.width.max(prepared.target_size.height));
+    if model_size <= 0.0 {
+        return Err(Lux3dError::InvalidInput(
+            "VGGT prepared target size must be non-zero",
+        ));
+    }
+
+    // Flat track payload validation. `N` is derived from the `[S, N, 2]`
+    // tracks and every other array is checked against it.
+    let n = if s == 0 {
+        0
+    } else {
+        pack.tracks.len() / (s * 2)
+    };
+    let expected_tracks = s * n * 2;
+    let expected_visibility = s * n;
+    if pack.tracks.len() != expected_tracks
+        || pack.visibility.len() != expected_visibility
+        || pack.points3d.len() != n * 3
+        || pack.points_rgb.len() != n * 3
+    {
+        return Err(Lux3dError::CanonicalWeightsValidation {
+            message: format!(
+                "VGGT track payload shapes do not match: tracks={} (want {}), visibility={} (want {}), points3d={} (want {}), points_rgb={} (want {}) for {s} frames",
+                pack.tracks.len(),
+                expected_tracks,
+                pack.visibility.len(),
+                expected_visibility,
+                pack.points3d.len(),
+                n * 3,
+                pack.points_rgb.len(),
+                n * 3
+            ),
+        });
+    }
+
+    // Reconstruction pixel space: the official loaded 1024 square for square
+    // preprocess (`intrinsic[:, :2, :] *= 1024 / 518`), model input otherwise.
+    let space = track_recon_space(coords, model_size, w, h)?;
+
+    let intrinsics =
+        tensor_to_cpu_vec::<f64>(&squeeze_leading_batch_3d(&output.intrinsics)?, "intrinsics")?;
+    if intrinsics.len() != s * 9 {
+        return Err(Lux3dError::CanonicalWeightsValidation {
+            message: format!(
+                "VGGT intrinsics carry {} values, expected {} for {s} frames",
+                intrinsics.len(),
+                s * 9
+            ),
+        });
+    }
+    let extrinsics =
+        tensor_to_cpu_vec::<f64>(&squeeze_leading_batch_3d(&output.extrinsics)?, "extrinsics")?;
+    if extrinsics.len() != s * 12 {
+        return Err(Lux3dError::CanonicalWeightsValidation {
+            message: format!(
+                "VGGT extrinsics carry {} values, expected {} for {s} frames",
+                extrinsics.len(),
+                s * 12
+            ),
+        });
+    }
+
+    // Per-frame intrinsics in reconstruction space (rows 0/1 scaled in square
+    // mode) for the reprojection check.
+    let mut k_recon = Vec::with_capacity(s);
+    for frame in 0..s {
+        let values = &intrinsics[frame * 9..frame * 9 + 9];
+        let mut k = [
+            [values[0], values[1], values[2]],
+            [values[3], values[4], values[5]],
+            [values[6], values[7], values[8]],
+        ];
+        if space.loaded {
+            for row in k.iter_mut().take(2) {
+                for value in row.iter_mut() {
+                    *value *= space.scale;
+                }
+            }
+        }
+        k_recon.push(k);
+    }
+
+    // Official masks: `vis > vis_thresh`, then AND the reprojection mask.
+    let mut masks = vec![false; s * n];
+    let mut inliers = vec![0_usize; n];
+    let max_reproj_error = f64::from(options.max_reproj_error);
+    for frame in 0..s {
+        let k = &k_recon[frame];
+        let extrinsic = &extrinsics[frame * 12..frame * 12 + 12];
+        for point in 0..n {
+            let flat = frame * n + point;
+            let visible = pack.visibility[flat] > options.vis_thresh;
+            let xyz = [
+                f64::from(pack.points3d[point * 3]),
+                f64::from(pack.points3d[point * 3 + 1]),
+                f64::from(pack.points3d[point * 3 + 2]),
+            ];
+            let (projected_x, projected_y) = project_point(k, extrinsic, &xyz);
+            let track_x = f64::from(pack.tracks[flat * 2]) * space.scale;
+            let track_y = f64::from(pack.tracks[flat * 2 + 1]) * space.scale;
+            let diff = ((projected_x - track_x).powi(2) + (projected_y - track_y).powi(2)).sqrt();
+            if visible && diff < max_reproj_error {
+                masks[flat] = true;
+                inliers[point] += 1;
+            }
+        }
+    }
+
+    // Official per-frame inlier gate (`np_to_pycolmap.py:71-73`): the builder
+    // refuses to build a reconstruction when any frame has fewer than
+    // `min_inlier_per_frame` observations.
+    let min_inliers_per_frame = (0..s)
+        .map(|frame| {
+            masks[frame * n..(frame + 1) * n]
+                .iter()
+                .filter(|&&keep| keep)
+                .count()
+        })
+        .min()
+        .unwrap_or(0);
+    if min_inliers_per_frame < options.min_inlier_per_frame {
+        return Err(Lux3dError::CanonicalWeightsValidation {
+            message: format!(
+                "VGGT track COLMAP export has a frame with only {min_inliers_per_frame} inliers (min_inlier_per_frame = {}); the official builder returns no reconstruction",
+                options.min_inlier_per_frame
+            ),
+        });
+    }
+
+    // `valid_mask = masks.sum(0) >= 2`.
+    let valid_idx: Vec<usize> = (0..n).filter(|&point| inliers[point] >= 2).collect();
+
+    struct TrackPoint3D {
+        point3d_id: u64,
+        xyz: [f64; 3],
+        rgb: [u8; 3],
+        track: Vec<(u32, u32)>,
+    }
+    let mut points3d: Vec<TrackPoint3D> = valid_idx
+        .iter()
+        .enumerate()
+        .map(|(rank, &point)| TrackPoint3D {
+            point3d_id: rank as u64 + 1,
+            xyz: [
+                f64::from(pack.points3d[point * 3]),
+                f64::from(pack.points3d[point * 3 + 1]),
+                f64::from(pack.points3d[point * 3 + 2]),
+            ],
+            rgb: [
+                pack.points_rgb[point * 3],
+                pack.points_rgb[point * 3 + 1],
+                pack.points_rgb[point * 3 + 2],
+            ],
+            track: Vec::new(),
+        })
+        .collect();
+
+    // Image 2D associations + track elements, in official order: frames
+    // ascending, then 1-based point3D ids ascending.
+    let mut per_frame_points2d: Vec<Vec<(u64, f64, f64)>> = vec![Vec::new(); s];
+    for frame in 0..s {
+        for (rank, &point) in valid_idx.iter().enumerate() {
+            let exported = &mut points3d[rank];
+            // Official `max_points3D_val` observation gate (`:120`).
+            if !exported
+                .xyz
+                .iter()
+                .all(|value| *value < options.max_points3d_val)
+            {
+                continue;
+            }
+            if !masks[frame * n + point] {
+                continue;
+            }
+            let flat = frame * n + point;
+            let x_recon = f64::from(pack.tracks[flat * 2]) * space.scale;
+            let y_recon = f64::from(pack.tracks[flat * 2 + 1]) * space.scale;
+            let (x, y) = point2d_to_original(x_recon, y_recon, &coords[frame], model_size);
+            let point2d_idx = per_frame_points2d[frame].len() as u32;
+            per_frame_points2d[frame].push((exported.point3d_id, x, y));
+            exported.track.push(((frame + 1) as u32, point2d_idx));
+        }
+    }
+    let point2d_count: usize = per_frame_points2d.iter().map(Vec::len).sum();
+
+    // Final camera parameters: `_build_pycolmap_intri` SIMPLE_PINHOLE on the
+    // official rescaled intrinsics, then the upstream rename/rescale to the
+    // original resolution (principal point = image center, `demo_colmap.py:
+    // 254-292`).
+    let intrinsics_rescaled =
+        rescale_intrinsics_to_original(&output.intrinsics, coords, model_size)?;
+    let camera_params: Vec<[f64; 3]> = (0..s)
+        .map(|frame| {
+            let k = &intrinsics_rescaled[frame];
+            [(k[0][0] + k[1][1]) / 2.0, k[0][2], k[1][2]]
+        })
+        .collect();
+
+    // cameras.bin: u64 count; per camera: u32 camera_id, i32 model_id,
+    // u64 width, u64 height, 3 x f64 params (f, cx, cy) for SIMPLE_PINHOLE.
+    let camera_frames: Vec<usize> = if s == 0 {
+        Vec::new()
+    } else if options.shared_camera {
+        vec![0]
+    } else {
+        (0..s).collect()
+    };
+    let mut cameras_bin = Vec::new();
+    put_u64(&mut cameras_bin, camera_frames.len() as u64);
+    for (camera_index, &frame) in camera_frames.iter().enumerate() {
+        put_u32(&mut cameras_bin, (camera_index + 1) as u32);
+        put_i32(&mut cameras_bin, COLMAP_CAMERA_MODEL_SIMPLE_PINHOLE);
+        put_u64(&mut cameras_bin, u64::from(coords[frame].width));
+        put_u64(&mut cameras_bin, u64::from(coords[frame].height));
+        for value in &camera_params[frame] {
+            put_f64(&mut cameras_bin, *value);
+        }
+    }
+
+    // images.bin: same layout as the feedforward writer; `camera_id` is 1 for
+    // every image in shared-camera mode (`np_to_pycolmap.py:93-110`).
+    let mut images_bin = Vec::new();
+    put_u64(&mut images_bin, s as u64);
+    for frame in 0..s {
+        let rotation = extrinsics_rotation(&extrinsics, frame);
+        let translation = extrinsics_translation(&extrinsics, frame);
+        let qvec = rotation_to_quat_wxyz(&rotation);
+        put_u32(&mut images_bin, (frame + 1) as u32);
+        for value in &qvec {
+            put_f64(&mut images_bin, *value);
+        }
+        for value in &translation {
+            put_f64(&mut images_bin, *value);
+        }
+        put_u32(
+            &mut images_bin,
+            if options.shared_camera {
+                1
+            } else {
+                frame as u32 + 1
+            },
+        );
+        let fallback = format!("image_{}", frame + 1);
+        let name = image_names
+            .get(frame)
+            .map(String::as_str)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&fallback);
+        put_nul_terminated(&mut images_bin, name);
+        let points2d = &per_frame_points2d[frame];
+        put_u64(&mut images_bin, points2d.len() as u64);
+        for (point3d_id, px, py) in points2d {
+            put_f64(&mut images_bin, *px);
+            put_f64(&mut images_bin, *py);
+            put_u64(&mut images_bin, *point3d_id);
+        }
+    }
+
+    // points3D.bin: 1-based ids for the `valid_mask` points, with the official
+    // per-track observation lists (possibly empty under the
+    // `max_points3D_val` gate).
+    let mut points3d_bin = Vec::new();
+    put_u64(&mut points3d_bin, points3d.len() as u64);
+    for point in &points3d {
+        put_u64(&mut points3d_bin, point.point3d_id);
+        for value in &point.xyz {
+            put_f64(&mut points3d_bin, *value);
+        }
+        for channel in &point.rgb {
+            put_u8(&mut points3d_bin, *channel);
+        }
+        put_f64(&mut points3d_bin, 0.0);
+        put_u64(&mut points3d_bin, point.track.len() as u64);
+        for (image_id, point2d_idx) in &point.track {
+            put_u32(&mut points3d_bin, *image_id);
+            put_u32(&mut points3d_bin, *point2d_idx);
+        }
+    }
+
+    fs::create_dir_all(dir).map_err(|source| Lux3dError::ModelAssetIo {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    for (name, bytes) in [
+        ("cameras.bin", cameras_bin),
+        ("images.bin", images_bin),
+        ("points3D.bin", points3d_bin),
+    ] {
+        let path = dir.join(name);
+        fs::write(&path, bytes).map_err(|source| Lux3dError::ModelAssetIo { path, source })?;
+    }
+    // Official `trimesh.PointCloud(points_3d, colors=points_rgb)` next to the
+    // sparse model (`demo_colmap.py:249`); the track branch passes the
+    // unfiltered predicted track points.
+    let ply_points: Vec<f32> = pack.points3d.to_vec();
+    let ply_colors: Vec<u8> = pack.points_rgb.to_vec();
+    let ply_path = dir.join("points.ply");
+    let ply_view = PointCloudView {
+        points: &ply_points,
+        colors: &ply_colors,
+    };
+    write_ply(&ply_view, &ply_path)?;
+
+    Ok(VggtTrackColmapStats {
+        camera_count: camera_frames.len(),
+        image_count: s,
+        point3d_count: points3d.len(),
+        point2d_count,
+        track_count: n,
+        min_inliers_per_frame,
+    })
+}
+
+/// Convenience wrapper for the `--track-auto` pipeline: samples track seeds
+/// from the prediction point map ([`sample_track_seeds`]) and exports the
+/// [`VggtAutoTrackResult`] tracks.
+pub fn write_track_colmap_from_auto(
+    dir: &Path,
+    output: &VggtInferenceOutput,
+    prepared: &VggtPreparedInputs,
+    image_names: &[String],
+    auto: &VggtAutoTrackResult,
+    point_source: VggtColmapPointSource,
+    options: &VggtTrackColmapOptions,
+) -> Result<VggtTrackColmapStats> {
+    let seeds = sample_track_seeds(
+        output,
+        prepared,
+        &auto.query_frames,
+        &auto.query_points,
+        point_source,
+    )?;
+    let tracks = tensor_to_cpu_vec::<f32>(&auto.track.coords, "track coords")?;
+    let visibility = tensor_to_cpu_vec::<f32>(&auto.track.visibility, "track visibility")?;
+    let pack = VggtTrackPack {
+        points3d: &seeds.points3d,
+        points_rgb: &seeds.points_rgb,
+        tracks: &tracks,
+        visibility: &visibility,
+    };
+    write_track_colmap(dir, output, prepared, image_names, &pack, options)
+}
+
+/// Reconstruction pixel space for the track path.
+struct TrackReconSpace {
+    /// Model-input pixel -> reconstruction pixel factor (loaded-square factor
+    /// in square mode, 1 otherwise). Applied to intrinsics rows 0/1 and to the
+    /// track coordinates.
+    scale: f64,
+    /// Reconstruction images are `load_size` square (loaded 1024 space).
+    loaded: bool,
+}
+
+/// Square mode reproduces the official `intrinsic[:, :2, :] *= 1024 / 518`
+/// step (`demo_colmap.py:168-169`); crop/pad frames stay in model pixels.
+fn track_recon_space(
+    coords: &[VggtOriginalCoords],
+    model_size: f64,
+    width: usize,
+    height: usize,
+) -> Result<TrackReconSpace> {
+    let square_count = coords
+        .iter()
+        .filter(|coords| coords.mode == VggtPreprocessMode::Square)
+        .count();
+    if square_count == 0 {
+        if width == 0 || height == 0 {
+            return Err(Lux3dError::InvalidInput(
+                "VGGT track COLMAP export needs a non-empty model grid",
+            ));
+        }
+        return Ok(TrackReconSpace {
+            scale: 1.0,
+            loaded: false,
+        });
+    }
+    if square_count != coords.len() {
+        return Err(Lux3dError::CanonicalWeightsValidation {
+            message: "VGGT track COLMAP export cannot mix square and crop/pad frames".to_string(),
+        });
+    }
+    let first = coords[0]
+        .square
+        .ok_or_else(|| Lux3dError::CanonicalWeightsValidation {
+            message: "square preprocess mode requires the official square coordinate payload"
+                .to_string(),
+        })?;
+    let scale = first.model_to_loaded_scale(model_size);
+    if !(scale.is_finite() && scale > 0.0) {
+        return Err(Lux3dError::CanonicalWeightsValidation {
+            message: format!(
+                "official square intrinsic scale load_size/model_size is not positive ({scale})"
+            ),
+        });
+    }
+    for coords in coords {
+        let square = coords
+            .square
+            .ok_or_else(|| Lux3dError::CanonicalWeightsValidation {
+                message: "square preprocess mode requires the official square coordinate payload"
+                    .to_string(),
+            })?;
+        if (square.model_to_loaded_scale(model_size) - scale).abs() > f64::EPSILON {
+            return Err(Lux3dError::CanonicalWeightsValidation {
+                message: "per-frame square preprocess payloads disagree on load_size/model_size"
+                    .to_string(),
+            });
+        }
+    }
+    Ok(TrackReconSpace {
+        scale,
+        loaded: true,
+    })
+}
+
+/// Project one world point through `[R|t]` and `K` with the official
+/// `project_3D_points_np` + `img_from_cam_np` math
+/// (`vggt/dependency/projection.py:12-102`): perspective divide, then the
+/// full `K` product, with NaNs replaced by 0.0 (the official `nan_to_num`).
+fn project_point(k: &[[f64; 3]; 3], extrinsic: &[f64], xyz: &[f64; 3]) -> (f64, f64) {
+    let x = extrinsic[0] * xyz[0] + extrinsic[1] * xyz[1] + extrinsic[2] * xyz[2] + extrinsic[3];
+    let y = extrinsic[4] * xyz[0] + extrinsic[5] * xyz[1] + extrinsic[6] * xyz[2] + extrinsic[7];
+    let z = extrinsic[8] * xyz[0] + extrinsic[9] * xyz[1] + extrinsic[10] * xyz[2] + extrinsic[11];
+    let u = x / z;
+    let v = y / z;
+    let mut projected_x = k[0][0] * u + k[0][1] * v + k[0][2];
+    let mut projected_y = k[1][0] * u + k[1][1] * v + k[1][2];
+    if projected_x.is_nan() {
+        projected_x = 0.0;
+    }
+    if projected_y.is_nan() {
+        projected_y = 0.0;
+    }
+    (projected_x, projected_y)
+}
+
+/// Map a reconstruction-space track pixel to the original image.
+///
+/// Square mode stores tracks in the loaded 1024 space, so the official
+/// `(xy - top_left) * resize_ratio` shift applies directly
+/// (`demo_colmap.py:280-285`); crop/pad use the stock model-space helper.
+fn point2d_to_original(x: f64, y: f64, coords: &VggtOriginalCoords, model_size: f64) -> (f64, f64) {
+    match (coords.mode, coords.square) {
+        (VggtPreprocessMode::Square, Some(square)) => {
+            let ratio = square.resize_ratio();
+            ((x - square.x1) * ratio, (y - square.y1) * ratio)
+        }
+        _ => shift_point2d_to_original(x, y, coords, model_size),
+    }
 }
 
 /// Deterministic point cap: keep an evenly spaced subset of the ascending
@@ -745,6 +1438,33 @@ mod tests {
                     width: cursor.u64(),
                     height: cursor.u64(),
                     params: cursor.f64_array(4),
+                })
+                .collect();
+            cursor.expect_end();
+            cameras
+        }
+
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct TestTrackCamera {
+            pub camera_id: u32,
+            pub model_id: i32,
+            pub width: u64,
+            pub height: u64,
+            /// SIMPLE_PINHOLE params: f, cx, cy.
+            pub params: Vec<f64>,
+        }
+
+        /// Track-mode camera reader (`SIMPLE_PINHOLE` stores 3 params).
+        pub fn parse_track_cameras(data: &[u8]) -> Vec<TestTrackCamera> {
+            let mut cursor = Cursor::new(data);
+            let count = cursor.u64() as usize;
+            let cameras = (0..count)
+                .map(|_| TestTrackCamera {
+                    camera_id: cursor.u32(),
+                    model_id: cursor.i32(),
+                    width: cursor.u64(),
+                    height: cursor.u64(),
+                    params: cursor.f64_array(3),
                 })
                 .collect();
             cursor.expect_end();
@@ -1419,5 +2139,779 @@ mod tests {
         for dir in [&dir_a, &dir_b, &dir_c] {
             let _ = fs::remove_dir_all(dir);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Track-mode export (`batch_np_matrix_to_pycolmap` semantics, no BA)
+    // -----------------------------------------------------------------------
+
+    struct TrackFixture {
+        output: VggtInferenceOutput,
+        prepared: VggtPreparedInputs,
+    }
+
+    /// 3-frame, 4x4 synthetic reconstruction: identity extrinsics and
+    /// `fx = fy = 10, cx = cy = 2` intrinsics. Per-pixel world points are
+    /// `[3 * pixel, 3 * pixel + 1, 3 * pixel + 2]`; RGB channel `c` at local
+    /// pixel `i` is `(c * 100 + i % 100) / 255`.
+    fn track_fixture() -> TrackFixture {
+        let device = Device::Cpu;
+        let (s, h, w) = (3usize, 4usize, 4usize);
+        let pixels = s * h * w;
+        let world_points = Tensor::from_vec(
+            (0..pixels * 3).map(|i| i as f32).collect(),
+            (1, s, h, w, 3),
+            &device,
+        )
+        .expect("world points");
+        let world_points_conf =
+            Tensor::ones((1, s, h, w), DType::F32, &device).expect("world points conf");
+        let depth = Tensor::ones((1, s, h, w, 1), DType::F32, &device).expect("depth");
+        let depth_conf = Tensor::ones((1, s, h, w), DType::F32, &device).expect("depth conf");
+        let pose_enc = Tensor::zeros((1, s, 9), DType::F32, &device).expect("pose enc");
+        let mut extrinsic_values: Vec<f32> = Vec::with_capacity(s * 12);
+        for _ in 0..s {
+            extrinsic_values
+                .extend_from_slice(&[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+        }
+        let extrinsics =
+            Tensor::from_vec(extrinsic_values, (1, s, 3, 4), &device).expect("extrinsics");
+        let mut intrinsic_values: Vec<f32> = Vec::with_capacity(s * 9);
+        for _ in 0..s {
+            intrinsic_values.extend_from_slice(&[10.0, 0.0, 2.0, 0.0, 10.0, 2.0, 0.0, 0.0, 1.0]);
+        }
+        let intrinsics =
+            Tensor::from_vec(intrinsic_values, (1, s, 3, 3), &device).expect("intrinsics");
+        let rgb_frames = Tensor::from_vec(
+            (0..s * 3 * h * w)
+                .map(|i| {
+                    let channel = (i / (h * w)) % 3;
+                    let pixel = i % (h * w);
+                    (channel * 100 + pixel % 100) as f32 / 255.0
+                })
+                .collect(),
+            (s, 3, h, w),
+            &device,
+        )
+        .expect("rgb frames");
+        let normalized_frames =
+            Tensor::zeros((1, s, 3, h, w), DType::F32, &device).expect("normalized frames");
+        let export_mask = Tensor::ones((1, s, h, w), DType::U8, &device).expect("mask");
+
+        let output = VggtInferenceOutput {
+            world_points,
+            world_points_conf,
+            depth,
+            depth_conf,
+            pose_enc,
+            pose_enc_list: vec![Tensor::zeros((1, s, 9), DType::F32, &device).expect("pose")],
+            extrinsics,
+            intrinsics,
+            rgb_frames: rgb_frames.clone(),
+            export_mask,
+        };
+        let prepared = VggtPreparedInputs {
+            interval: 1,
+            original_size: crate::contracts::SpatialSize::new(4, 4),
+            target_size: crate::contracts::SpatialSize::new(4, 4),
+            preprocess_mode: VggtPreprocessMode::Crop,
+            rgb_frames,
+            normalized_frames,
+            original_coords: (0..s)
+                .map(|_| VggtOriginalCoords {
+                    width: 4,
+                    height: 4,
+                    offset_x: 0,
+                    offset_y: 0,
+                    content_width: 4,
+                    content_height: 4,
+                    mode: VggtPreprocessMode::Crop,
+                    square: None,
+                })
+                .collect(),
+        };
+        TrackFixture { output, prepared }
+    }
+
+    /// Five synthetic tracks with the fixture's (2,2)/(3,2)/(2,3)/(2,2)/(4,4)
+    /// projections:
+    /// * t0 visible in all 3 frames (exact projection);
+    /// * t1 visible in frames 0/1 with a 3-pixel offset (inside the 8.0 gate),
+    ///   hidden in frame 2;
+    /// * t2 visible only in frame 0 (one inlier -> invalid track);
+    /// * t3 visible in all frames, 20-pixel offset in frame 2 (outside the
+    ///   8.0 gate);
+    /// * t4 invisible everywhere.
+    fn track_payload() -> (Vec<f32>, Vec<u8>, Vec<f32>, Vec<f32>) {
+        let (s, n) = (3usize, 5usize);
+        let points3d = vec![
+            0.0, 0.0, 1.0, // t0 -> (2, 2)
+            0.1, 0.0, 1.0, // t1 -> (3, 2)
+            0.0, 0.1, 1.0, // t2 -> (2, 3)
+            0.0, 0.0, 2.0, // t3 -> (2, 2)
+            0.2, 0.2, 1.0, // t4 -> (4, 4)
+        ];
+        let points_rgb: Vec<u8> = (0..n * 3).map(|i| (i * 7 % 251) as u8).collect();
+        let base = [
+            (2.0f32, 2.0f32),
+            (3.0, 2.0),
+            (2.0, 3.0),
+            (2.0, 2.0),
+            (4.0, 4.0),
+        ];
+        let mut tracks = vec![0.0f32; s * n * 2];
+        let mut visibility = vec![0.0f32; s * n];
+        for frame in 0..s {
+            for point in 0..n {
+                let (mut x, y) = base[point];
+                if point == 1 {
+                    x += 3.0;
+                }
+                if point == 3 && frame == 2 {
+                    x += 20.0;
+                }
+                tracks[(frame * n + point) * 2] = x;
+                tracks[(frame * n + point) * 2 + 1] = y;
+                visibility[frame * n + point] = match point {
+                    0 => 1.0,
+                    1 => {
+                        if frame == 2 {
+                            0.0
+                        } else {
+                            1.0
+                        }
+                    }
+                    2 => {
+                        if frame == 0 {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    3 => 1.0,
+                    _ => 0.0,
+                };
+            }
+        }
+        (points3d, points_rgb, tracks, visibility)
+    }
+
+    fn write_track_fixture(
+        tag: &str,
+        options: &VggtTrackColmapOptions,
+        payload: &(Vec<f32>, Vec<u8>, Vec<f32>, Vec<f32>),
+    ) -> (std::path::PathBuf, VggtTrackColmapStats) {
+        let TrackFixture { output, prepared } = track_fixture();
+        let dir = temp_dir(tag);
+        let pack = VggtTrackPack {
+            points3d: &payload.0,
+            points_rgb: &payload.1,
+            tracks: &payload.2,
+            visibility: &payload.3,
+        };
+        let stats = write_track_colmap(&dir, &output, &prepared, &[], &pack, options)
+            .expect("write track colmap");
+        (dir, stats)
+    }
+
+    fn square_coords(
+        x1: f64,
+        y1: f64,
+        width: u32,
+        height: u32,
+        load_size: u32,
+        model_size: u32,
+    ) -> VggtOriginalCoords {
+        VggtOriginalCoords {
+            width,
+            height,
+            offset_x: 0,
+            offset_y: 0,
+            content_width: width,
+            content_height: height,
+            mode: VggtPreprocessMode::Square,
+            square: Some(crate::preprocess::VggtSquareOriginalCoords {
+                x1,
+                y1,
+                x2: x1 + f64::from(load_size),
+                y2: y1 + f64::from(load_size),
+                width,
+                height,
+                load_size,
+                model_size,
+            }),
+        }
+    }
+
+    #[test]
+    fn vggt_track_colmap_observations_and_reprojection_mask() {
+        let payload = track_payload();
+        let options = VggtTrackColmapOptions {
+            vis_thresh: 0.2,
+            max_reproj_error: 8.0,
+            shared_camera: false,
+            min_inlier_per_frame: 1,
+            max_points3d_val: 3000.0,
+        };
+        let (dir, stats) = write_track_fixture("track-obs", &options, &payload);
+
+        assert_eq!(stats.camera_count, 3);
+        assert_eq!(stats.image_count, 3);
+        assert_eq!(stats.track_count, 5);
+        // t2 has a single inlier (< 2) and t4 none: two tracks are dropped.
+        assert_eq!(stats.point3d_count, 3);
+        // frame 0: t0,t1,t3; frame 1: t0,t1,t3; frame 2: t0 only (t3's 20 px
+        // reprojection error fails the 8.0 gate, t1 is hidden).
+        assert_eq!(stats.point2d_count, 7);
+        assert_eq!(stats.min_inliers_per_frame, 1);
+
+        let cameras =
+            reader::parse_track_cameras(&fs::read(dir.join("cameras.bin")).expect("cameras.bin"));
+        assert_eq!(cameras.len(), 3);
+        for (frame, camera) in cameras.iter().enumerate() {
+            assert_eq!(camera.camera_id, frame as u32 + 1);
+            assert_eq!(
+                camera.model_id, COLMAP_CAMERA_MODEL_SIMPLE_PINHOLE,
+                "SIMPLE_PINHOLE model id"
+            );
+            assert_eq!(camera.width, 4);
+            assert_eq!(camera.height, 4);
+            assert_eq!(camera.params, vec![10.0, 2.0, 2.0]);
+        }
+
+        let images = reader::parse_images(&fs::read(dir.join("images.bin")).expect("images.bin"));
+        assert_eq!(images.len(), 3);
+        assert_eq!(images[0].points2d.len(), 3);
+        assert_eq!(images[1].points2d.len(), 3);
+        assert_eq!(images[2].points2d.len(), 1);
+        assert_eq!(
+            images[0]
+                .points2d
+                .iter()
+                .map(|point| point.point3d_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            images[1]
+                .points2d
+                .iter()
+                .map(|point| point.point3d_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(images[2].points2d[0].point3d_id, 1);
+        // Masked-out tracks never appear in images.bin.
+        assert!(images.iter().all(|image| image
+            .points2d
+            .iter()
+            .all(|point| point.point3d_id != 4 && point.point3d_id != 5)));
+        assert_eq!(images[0].name, "image_1");
+        assert_eq!(images[0].camera_id, 1);
+
+        let points =
+            reader::parse_points3d(&fs::read(dir.join("points3D.bin")).expect("points3D.bin"));
+        assert_eq!(points.len(), 3);
+        let expected_xyz = [[0.0, 0.0, 1.0], [0.1, 0.0, 1.0], [0.0, 0.0, 2.0]];
+        let expected_tracks = [vec![1u32, 2, 3], vec![1, 2], vec![1, 2]];
+        for (rank, point) in points.iter().enumerate() {
+            assert_eq!(point.point3d_id, rank as u64 + 1);
+            for axis in 0..3 {
+                // f32 seed values widen into the f64 COLMAP storage.
+                assert!((point.xyz[axis] - expected_xyz[rank][axis]).abs() < 1e-6);
+            }
+            assert_eq!(point.error, 0.0);
+            let track_images: Vec<u32> =
+                point.track.iter().map(|element| element.image_id).collect();
+            assert_eq!(track_images, expected_tracks[rank], "point {rank} track");
+            for element in &point.track {
+                let image = &images[element.image_id as usize - 1];
+                assert!(
+                    element.point2d_idx < image.points2d.len() as u32,
+                    "track points into its image's point2D list"
+                );
+                assert_eq!(
+                    image.points2d[element.point2d_idx as usize].point3d_id, point.point3d_id,
+                    "track element and image point2D agree"
+                );
+            }
+            assert_eq!(
+                point.rgb,
+                [
+                    payload.1[[0usize, 1, 3][rank] * 3],
+                    payload.1[[0usize, 1, 3][rank] * 3 + 1],
+                    payload.1[[0usize, 1, 3][rank] * 3 + 2],
+                ],
+                "colors come from the corresponding track seed"
+            );
+        }
+
+        // Track seeds are all in points.ply (official line 249 uses the
+        // unfiltered points_3d/points_rgb of the track branch).
+        let ply = fs::read_to_string(dir.join("points.ply")).expect("points.ply");
+        assert!(
+            ply.contains("element vertex 5"),
+            "all 5 seeds in points.ply"
+        );
+
+        // Raising the reprojection threshold admits t3's frame-2 observation.
+        let (dir_loose, loose) = write_track_fixture(
+            "track-loose",
+            &VggtTrackColmapOptions {
+                max_reproj_error: 25.0,
+                ..options.clone()
+            },
+            &payload,
+        );
+        assert_eq!(loose.point3d_count, 3);
+        assert_eq!(loose.point2d_count, 8);
+        assert_eq!(loose.min_inliers_per_frame, 2);
+        let loose_images =
+            reader::parse_images(&fs::read(dir_loose.join("images.bin")).expect("images.bin"));
+        assert_eq!(loose_images[2].points2d.len(), 2);
+        let loose_points =
+            reader::parse_points3d(&fs::read(dir_loose.join("points3D.bin")).expect("points"));
+        assert_eq!(loose_points[2].track.len(), 3);
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir_loose);
+    }
+
+    #[test]
+    fn vggt_track_colmap_official_gates() {
+        let payload = track_payload();
+
+        // Official `min_inlier_per_frame` gate: frame 2 has a single inlier.
+        let TrackFixture { output, prepared } = track_fixture();
+        let dir = temp_dir("track-min-gate");
+        let pack = VggtTrackPack {
+            points3d: &payload.0,
+            points_rgb: &payload.1,
+            tracks: &payload.2,
+            visibility: &payload.3,
+        };
+        let error = write_track_colmap(
+            &dir,
+            &output,
+            &prepared,
+            &[],
+            &pack,
+            &VggtTrackColmapOptions {
+                min_inlier_per_frame: 2,
+                ..VggtTrackColmapOptions::default()
+            },
+        )
+        .expect_err("official per-frame inlier gate must reject");
+        let message = format!("{error}");
+        assert!(
+            message.contains("only 1 inliers") && message.contains("min_inlier_per_frame = 2"),
+            "unexpected gate message: {message}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+
+        // Official `max_points3D_val` gate: a coordinate equal to 3000 is not
+        // `< 3000`, so the point keeps its reconstruction entry but loses every
+        // observation. Its tracks are moved to the (30002, 2) projection so
+        // the reprojection mask itself still passes.
+        let mut gated_payload = payload.clone();
+        gated_payload.0[0] = 3000.0;
+        for frame in 0..3 {
+            gated_payload.2[frame * 5 * 2] = 30002.0;
+            gated_payload.2[frame * 5 * 2 + 1] = 2.0;
+        }
+        let (dir, stats) = write_track_fixture(
+            "track-xyz-gate",
+            &VggtTrackColmapOptions {
+                min_inlier_per_frame: 1,
+                ..VggtTrackColmapOptions::default()
+            },
+            &gated_payload,
+        );
+        assert_eq!(stats.point3d_count, 3, "point stays in the reconstruction");
+        assert_eq!(stats.point2d_count, 4, "all t0 observations are gated out");
+        let points =
+            reader::parse_points3d(&fs::read(dir.join("points3D.bin")).expect("points3D.bin"));
+        assert!(points[0].track.is_empty(), "gated point has an empty track");
+        let images = reader::parse_images(&fs::read(dir.join("images.bin")).expect("images.bin"));
+        assert!(images
+            .iter()
+            .all(|image| image.points2d.iter().all(|point| point.point3d_id != 1)));
+        let _ = fs::remove_dir_all(&dir);
+
+        // Track-mode defaults match the official demo/builder arguments.
+        let defaults = VggtTrackColmapOptions::default();
+        assert_eq!(defaults.vis_thresh, 0.2);
+        assert_eq!(defaults.max_reproj_error, 8.0);
+        assert!(!defaults.shared_camera);
+        assert_eq!(defaults.min_inlier_per_frame, 64);
+        assert_eq!(defaults.max_points3d_val, 3000.0);
+        assert_eq!(VggtColmapMode::default(), VggtColmapMode::Feedforward);
+    }
+
+    #[test]
+    fn vggt_track_colmap_shared_camera() {
+        let payload = track_payload();
+        let (dir, stats) = write_track_fixture(
+            "track-shared",
+            &VggtTrackColmapOptions {
+                shared_camera: true,
+                min_inlier_per_frame: 1,
+                ..VggtTrackColmapOptions::default()
+            },
+            &payload,
+        );
+        assert_eq!(stats.camera_count, 1);
+        let cameras =
+            reader::parse_track_cameras(&fs::read(dir.join("cameras.bin")).expect("cameras.bin"));
+        assert_eq!(cameras.len(), 1);
+        assert_eq!(cameras[0].camera_id, 1);
+        assert_eq!(cameras[0].model_id, COLMAP_CAMERA_MODEL_SIMPLE_PINHOLE);
+        let images = reader::parse_images(&fs::read(dir.join("images.bin")).expect("images.bin"));
+        assert_eq!(images.len(), 3);
+        assert!(images.iter().all(|image| image.camera_id == 1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Square preprocess mode reproduces the official
+    /// `intrinsic[:, :2, :] *= 1024 / 518` rescale (here 1024 / 4 = 256 for
+    /// the 4-pixel synthetic model grid) for both the reprojection check and
+    /// the written SIMPLE_PINHOLE camera, and the loaded-space point2D shift.
+    #[test]
+    fn vggt_track_colmap_square_intrinsics_rescale() {
+        let TrackFixture {
+            output,
+            mut prepared,
+        } = track_fixture();
+        prepared.preprocess_mode = VggtPreprocessMode::Square;
+        prepared.original_coords = (0..3)
+            .map(|_| square_coords(0.0, 0.0, 1024, 1024, 1024, 4))
+            .collect();
+
+        // Two tracks with exact model-space projections: t0 -> (2,2),
+        // t1 -> (3,2). The writer scales them to the loaded 1024 space.
+        let points3d = vec![0.0f32, 0.0, 1.0, 0.1, 0.0, 1.0];
+        let points_rgb = vec![1u8, 2, 3, 4, 5, 6];
+        let mut tracks = vec![0.0f32; 3 * 2 * 2];
+        let visibility = vec![1.0f32; 3 * 2];
+        for frame in 0..3 {
+            tracks[(frame * 2) * 2] = 2.0;
+            tracks[(frame * 2) * 2 + 1] = 2.0;
+            tracks[(frame * 2 + 1) * 2] = 3.0;
+            tracks[(frame * 2 + 1) * 2 + 1] = 2.0;
+        }
+        let pack = VggtTrackPack {
+            points3d: &points3d,
+            points_rgb: &points_rgb,
+            tracks: &tracks,
+            visibility: &visibility,
+        };
+        let dir = temp_dir("track-square");
+        let stats = write_track_colmap(
+            &dir,
+            &output,
+            &prepared,
+            &[],
+            &pack,
+            &VggtTrackColmapOptions {
+                min_inlier_per_frame: 1,
+                ..VggtTrackColmapOptions::default()
+            },
+        )
+        .expect("write square track colmap");
+        assert_eq!(stats.point3d_count, 2);
+        assert_eq!(stats.point2d_count, 6);
+
+        let cameras =
+            reader::parse_track_cameras(&fs::read(dir.join("cameras.bin")).expect("cameras.bin"));
+        assert_eq!(cameras.len(), 3);
+        assert_eq!(cameras[0].width, 1024);
+        assert_eq!(cameras[0].height, 1024);
+        // 10 * (1024 / 4) = 2560; principal point = original center.
+        assert_eq!(cameras[0].params, vec![2560.0, 512.0, 512.0]);
+
+        let images = reader::parse_images(&fs::read(dir.join("images.bin")).expect("images.bin"));
+        assert_eq!(images[0].points2d[0].x, 512.0);
+        assert_eq!(images[0].points2d[0].y, 512.0);
+        assert_eq!(images[0].points2d[1].x, 768.0);
+        assert_eq!(images[0].points2d[1].y, 512.0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Official `track_predict.py:171-179`: per-track 3D points/colors are
+    /// sampled from the prediction point map and RGB frames at the rounded
+    /// query pixel.
+    #[test]
+    fn vggt_track_seeds_sample_query_pixels() {
+        let TrackFixture { output, prepared } = track_fixture();
+        let auto = VggtAutoTrackResult {
+            track: crate::runtime::VggtTrackResult {
+                coords: Tensor::zeros((3, 3, 2), DType::F32, &Device::Cpu).expect("coords"),
+                visibility: Tensor::ones((3, 3), DType::F32, &Device::Cpu).expect("visibility"),
+                confidence: None,
+            },
+            query_frames: vec![0, 1, 2],
+            query_points: vec![[1.4, 2.0], [0.0, 0.0], [3.0, 3.0]],
+            ranked_query_frames: vec![0, 1, 2],
+            queries_per_frame: vec![1, 1, 1],
+            pruned_per_frame: vec![0, 0, 0],
+            reorder_indices: vec![vec![0, 1, 2]; 3],
+        };
+        let seeds = sample_track_seeds(
+            &output,
+            &prepared,
+            &auto.query_frames,
+            &auto.query_points,
+            VggtColmapPointSource::Pointmap,
+        )
+        .expect("sample seeds");
+        // pixel = 3 * (frame * h * w + y * w + x)
+        assert_eq!(
+            seeds.points3d,
+            vec![27.0, 28.0, 29.0, 48.0, 49.0, 50.0, 141.0, 142.0, 143.0]
+        );
+        // rgb channel c at local pixel i is (c * 100 + i % 100) / 255.
+        assert_eq!(
+            seeds.points_rgb,
+            vec![9, 109, 209, 0, 100, 200, 15, 115, 215]
+        );
+
+        // Depth-source seeds follow `world_points_from_depth` (identity
+        // extrinsics, depth 1.0, fx=fy=10, cx=cy=2): the fixture's
+        // `world_points` differ from that map, so the two sources must differ.
+        let depth_seeds = sample_track_seeds(
+            &output,
+            &prepared,
+            &auto.query_frames,
+            &auto.query_points,
+            VggtColmapPointSource::Depth,
+        )
+        .expect("sample depth seeds");
+        assert_ne!(depth_seeds.points3d, seeds.points3d);
+    }
+
+    /// End-to-end core run with the local VGGT-1B canonical weights:
+    /// `run_with_auto_tracks` (stage-A queries + track head) then
+    /// `write_track_colmap_from_auto`. This is the exact pipeline the CLI
+    /// `--track-auto --colmap-mode track` wiring calls. The source defaults to
+    /// the official reference `examples/llff_fern/images` multi-view sequence
+    /// when present (the repository `test-assets/pi3-frames` fixture is three
+    /// flat-color frames with no parallax), overridable with
+    /// `LUX3D_VG5_E2E_SOURCE`. Ignored by default because it loads ~1.2 GB of
+    /// weights; run with `cargo test -p lux3d-core [--features cuda] --lib
+    /// vggt_track_colmap_e2e -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "loads VGGT-1B weights; run explicitly with --ignored"]
+    fn vggt_track_colmap_e2e_local_weights() {
+        use crate::{
+            runtime::{VggtAutoQueryOptions, VggtPipeline, VggtRunOptions},
+            weights::ModelAssetOptions,
+        };
+
+        let model_dir = std::env::var_os("LUX3D_VGGT_MODEL_PATH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from("G:/jobs/candle-based-projects/3d/canonical-weights/vggt")
+            });
+        if !model_dir.join("model.safetensors").is_file() {
+            eprintln!(
+                "skipping VG5 e2e: no VGGT canonical weights at {}",
+                model_dir.display()
+            );
+            return;
+        }
+        // `cargo test` runs with the package root as the working directory.
+        // The repository fixture has only three flat-color frames with no
+        // geometric parallax (every track is inlier only on its own query
+        // frame), so the official reference multi-view examples are preferred
+        // when they sit beside the workspace; `LUX3D_VG5_E2E_SOURCE` overrides
+        // both.
+        let source = std::env::var_os("LUX3D_VG5_E2E_SOURCE")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                [
+                    "../../../candle-3d-refs/vggt/examples/llff_fern/images",
+                    "test-assets/pi3-frames",
+                    "../../test-assets/pi3-frames",
+                ]
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .find(|path| path.is_dir())
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("test-assets/pi3-frames"));
+        if !source.is_dir() {
+            eprintln!("skipping VG5 e2e: fixture {} is missing", source.display());
+            return;
+        }
+        fn e2e_device() -> Device {
+            #[cfg(feature = "cuda")]
+            {
+                if let Ok(device) = Device::new_cuda(0) {
+                    return device;
+                }
+            }
+            Device::Cpu
+        }
+
+        let device = e2e_device();
+        eprintln!("[vg5-e2e] device={device:?} model={}", model_dir.display());
+        let pipeline = VggtPipeline::load_with_options(
+            ModelAssetOptions {
+                canonical_dir: Some(model_dir),
+                cache_dir: None,
+            },
+            VggtRunOptions::default(),
+        )
+        .expect("load VGGT pipeline");
+        let prepared = pipeline
+            .prepare_inputs_from_path_with_mode(&source, None, VggtPreprocessMode::Square, &device)
+            .expect("prepare square inputs");
+        let (inference, auto) = pipeline
+            .run_with_auto_tracks(
+                &prepared,
+                &VggtAutoQueryOptions {
+                    query_frame_num: 7,
+                    max_query_pts: 96,
+                    track_iters: 4,
+                    dino_weights: None,
+                },
+            )
+            .expect("auto tracking");
+        eprintln!(
+            "[vg5-e2e] query frames={:?} points={:?} pruned={:?}",
+            auto.ranked_query_frames, auto.queries_per_frame, auto.pruned_per_frame
+        );
+        let dir = temp_dir("track-e2e");
+        // Diagnostics: per-frame visibility / reprojection-mask counts and
+        // error quantiles, using the same math as `write_track_colmap`.
+        {
+            let seeds = sample_track_seeds(
+                &inference,
+                &prepared,
+                &auto.query_frames,
+                &auto.query_points,
+                VggtColmapPointSource::Depth,
+            )
+            .expect("sample e2e seeds");
+            let coords_flat =
+                tensor_to_cpu_vec::<f32>(&auto.track.coords, "track coords").expect("coords");
+            let vis_flat = tensor_to_cpu_vec::<f32>(&auto.track.visibility, "track visibility")
+                .expect("visibility");
+            let (frames, height, width) = resolve_grid_dims(&inference).expect("grid dims");
+            let tracks = auto.query_points.len();
+            let model_size = f64::from(prepared.target_size.width.max(prepared.target_size.height));
+            let space = track_recon_space(&prepared.original_coords, model_size, width, height)
+                .expect("recon space");
+            let intri = tensor_to_cpu_vec::<f64>(
+                &squeeze_leading_batch_3d(&inference.intrinsics).expect("squeeze intrinsics"),
+                "intrinsics",
+            )
+            .expect("intrinsics");
+            let extri = tensor_to_cpu_vec::<f64>(
+                &squeeze_leading_batch_3d(&inference.extrinsics).expect("squeeze extrinsics"),
+                "extrinsics",
+            )
+            .expect("extrinsics");
+            for frame in 0..frames {
+                let mut k = [
+                    [intri[frame * 9], intri[frame * 9 + 1], intri[frame * 9 + 2]],
+                    [
+                        intri[frame * 9 + 3],
+                        intri[frame * 9 + 4],
+                        intri[frame * 9 + 5],
+                    ],
+                    [
+                        intri[frame * 9 + 6],
+                        intri[frame * 9 + 7],
+                        intri[frame * 9 + 8],
+                    ],
+                ];
+                if space.loaded {
+                    for row in k.iter_mut().take(2) {
+                        for value in row.iter_mut() {
+                            *value *= space.scale;
+                        }
+                    }
+                }
+                let mut visible = 0;
+                let mut reprojected = 0;
+                let mut both = 0;
+                let mut errors = Vec::with_capacity(tracks);
+                for point in 0..tracks {
+                    let flat = frame * tracks + point;
+                    let xyz = [
+                        f64::from(seeds.points3d[point * 3]),
+                        f64::from(seeds.points3d[point * 3 + 1]),
+                        f64::from(seeds.points3d[point * 3 + 2]),
+                    ];
+                    let (px, py) = project_point(&k, &extri[frame * 12..frame * 12 + 12], &xyz);
+                    let tx = f64::from(coords_flat[flat * 2]) * space.scale;
+                    let ty = f64::from(coords_flat[flat * 2 + 1]) * space.scale;
+                    let error = ((px - tx).powi(2) + (py - ty).powi(2)).sqrt();
+                    let is_visible = vis_flat[flat] > 0.2;
+                    let in_reproj = error < 8.0;
+                    visible += usize::from(is_visible);
+                    reprojected += usize::from(in_reproj);
+                    both += usize::from(is_visible && in_reproj);
+                    if error.is_finite() {
+                        errors.push(error);
+                    }
+                }
+                errors.sort_by(|a, b| a.partial_cmp(b).expect("finite errors"));
+                let quantile = |q: f64| {
+                    errors
+                        .get(((errors.len().saturating_sub(1)) as f64 * q) as usize)
+                        .copied()
+                        .unwrap_or(f64::NAN)
+                };
+                eprintln!(
+                    "[vg5-e2e] frame {frame}: visible={visible} reproj<8={reprojected} both={both} err p50={:.3} p90={:.3} p99={:.3}",
+                    quantile(0.5),
+                    quantile(0.9),
+                    quantile(0.99)
+                );
+            }
+        }
+        let stats = write_track_colmap_from_auto(
+            &dir,
+            &inference,
+            &prepared,
+            &[],
+            &auto,
+            VggtColmapPointSource::Depth,
+            &VggtTrackColmapOptions {
+                // The stage-A tracker without stage B/C fine tracking is a
+                // coarse matcher, so this structural e2e lowers the official
+                // per-frame gate (default 64, enforced by
+                // `VggtTrackColmapOptions::default` and unit tested); the
+                // per-track `>= 2 inliers` gate still applies.
+                min_inlier_per_frame: 1,
+                ..VggtTrackColmapOptions::default()
+            },
+        )
+        .expect("export track colmap");
+        eprintln!(
+            "[vg5-e2e] tracks={} cameras={} images={} points3d={} point2d={} min_inliers={}",
+            stats.track_count,
+            stats.camera_count,
+            stats.image_count,
+            stats.point3d_count,
+            stats.point2d_count,
+            stats.min_inliers_per_frame
+        );
+        let cameras =
+            reader::parse_track_cameras(&fs::read(dir.join("cameras.bin")).expect("cameras.bin"));
+        let images = reader::parse_images(&fs::read(dir.join("images.bin")).expect("images.bin"));
+        let points =
+            reader::parse_points3d(&fs::read(dir.join("points3D.bin")).expect("points3D.bin"));
+        assert_eq!(cameras.len(), prepared.original_coords.len());
+        assert_eq!(images.len(), prepared.original_coords.len());
+        assert_eq!(points.len(), stats.point3d_count);
+        assert!(points.iter().any(|point| point.track.len() >= 2));
+        assert!(cameras
+            .iter()
+            .all(|camera| camera.model_id == COLMAP_CAMERA_MODEL_SIMPLE_PINHOLE));
+        eprintln!("[vg5-e2e] sparse model at {}", dir.display());
+        // Leave the artifact in place for inspection; it is under the OS temp
+        // directory, not the repository.
     }
 }

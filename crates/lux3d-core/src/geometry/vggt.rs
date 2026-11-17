@@ -390,10 +390,13 @@ fn unproject_depth_to_world_inner(
 
     // World = R^T p - R^T t. Row-vector form: world^T = p^T R - t^T R, so the
     // batched matmuls use the original camera-from-world R directly.
-    let r = extri.narrow(D::Minus1, 0, 3)?; // [S,3,3]
-    let t = extri.narrow(D::Minus1, 3, 1)?; // [S,3,1]
+    // Narrowed/transposed views are not contiguous; the CUDA matmul kernel
+    // requires contiguous operands, so materialize them here.
+    let r = extri.narrow(D::Minus1, 0, 3)?.contiguous()?; // [S,3,3]
+    let t = extri.narrow(D::Minus1, 3, 1)?.contiguous()?; // [S,3,1]
     let t_inv = t
         .transpose(1, 2)? // [S,1,3]
+        .contiguous()?
         .matmul(&r)?
         .affine(-1.0, 0.0)?; // [S,1,3] = -R^T t
     let world = cam_coords

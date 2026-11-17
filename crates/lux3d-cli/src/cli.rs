@@ -2,9 +2,11 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 use lux3d_core::export::{
-    build_vggt_glb_scene, load_mesh, write_feedforward_colmap, write_vggt_glb, VggtColmapOptions,
-    VggtGlbOptions, VggtGlbPredictions, DEFAULT_CONF_THRESHOLD, DEFAULT_GLB_CONF_PERCENTILE,
-    DEFAULT_MAX_POINTS,
+    build_vggt_glb_scene, load_mesh, write_feedforward_colmap, write_track_colmap_from_auto,
+    write_vggt_glb, VggtColmapMode, VggtColmapOptions, VggtGlbOptions, VggtGlbPredictions,
+    VggtTrackColmapOptions, DEFAULT_CONF_THRESHOLD, DEFAULT_GLB_CONF_PERCENTILE,
+    DEFAULT_MAX_POINTS, DEFAULT_MAX_REPROJ_ERROR, DEFAULT_MIN_INLIER_PER_FRAME,
+    DEFAULT_VIS_THRESHOLD,
 };
 use lux3d_core::geometry::VggtPointCloudCpu;
 use lux3d_core::preprocess::VggtPreprocessMode;
@@ -640,6 +642,26 @@ impl From<VggtColmapPointSourceKind> for lux3d_core::export::colmap::VggtColmapP
     }
 }
 
+/// VGGT COLMAP export mode (`--colmap-mode`).
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum, PartialEq, Eq)]
+pub enum VggtColmapModeKind {
+    /// Feedforward single-observation model
+    /// (`batch_np_matrix_to_pycolmap_wo_track`).
+    #[default]
+    Feedforward,
+    /// Track-based reconstruction without BA (`batch_np_matrix_to_pycolmap`).
+    Track,
+}
+
+impl From<VggtColmapModeKind> for VggtColmapMode {
+    fn from(kind: VggtColmapModeKind) -> Self {
+        match kind {
+            VggtColmapModeKind::Feedforward => Self::Feedforward,
+            VggtColmapModeKind::Track => Self::Track,
+        }
+    }
+}
+
 /// VGGT GLB point source (`--glb-point-source`): the official demo's
 /// "Pointmap Branch" vs "Depthmap and Camera Branch" selector
 /// (`visual_util.py:68-80`, `demo_gradio.py:466-472`).
@@ -720,6 +742,41 @@ pub struct VggtRunArgs {
         help = "VGGT COLMAP extra `world_points_conf >= threshold` gate on top of --colmap-conf-threshold (vggt only; unset = no extra gate). Modifies --colmap-dir."
     )]
     pub colmap_world_conf_threshold: Option<f32>,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = VggtColmapModeKind::Feedforward,
+        help = "VGGT COLMAP export mode (vggt only): `feedforward` (default) writes the depth-confidence-gated single-observation model (`batch_np_matrix_to_pycolmap_wo_track`, one PINHOLE camera per image); `track` writes the track-based reconstruction (`batch_np_matrix_to_pycolmap` semantics, SIMPLE_PINHOLE cameras, multi-frame tracks) WITHOUT bundle adjustment - a COLMAP-ready reconstruction for external BA. `track` requires --colmap-dir and --track-auto. Modifies --colmap-dir."
+    )]
+    pub colmap_mode: VggtColmapModeKind,
+
+    #[arg(
+        long,
+        default_value_t = DEFAULT_VIS_THRESHOLD,
+        help = "VGGT COLMAP track visibility gate `vis > threshold` (track mode only; upstream --vis_thresh default 0.2). Requires --colmap-mode track."
+    )]
+    pub vis_thresh: f32,
+
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_REPROJ_ERROR,
+        help = "VGGT COLMAP track reprojection-error gate `||project(seed 3D) - track|| < threshold`, in reconstruction pixels (track mode only; upstream --max_reproj_error default 8.0; square preprocess evaluates it in the official 1024 loaded-image space). Requires --colmap-mode track."
+    )]
+    pub max_reproj_error: f32,
+
+    #[arg(
+        long,
+        help = "VGGT COLMAP track export shares one SIMPLE_PINHOLE camera across all images (track mode only; upstream --shared_camera). Requires --colmap-mode track."
+    )]
+    pub shared_camera: bool,
+
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MIN_INLIER_PER_FRAME,
+        help = "VGGT COLMAP track per-frame inlier floor (track mode only; upstream min_inlier_per_frame default 64): the export fails when any frame keeps fewer visibility+reprojection inliers, exactly like the official builder. Lower only for tiny debug sequences. Requires --colmap-mode track."
+    )]
+    pub colmap_min_inlier_per_frame: usize,
 
     #[arg(
         long,
@@ -820,6 +877,11 @@ impl Default for VggtRunArgs {
             colmap_point_source: VggtColmapPointSourceKind::Depth,
             colmap_seed: None,
             colmap_world_conf_threshold: None,
+            colmap_mode: VggtColmapModeKind::Feedforward,
+            vis_thresh: DEFAULT_VIS_THRESHOLD,
+            max_reproj_error: DEFAULT_MAX_REPROJ_ERROR,
+            shared_camera: false,
+            colmap_min_inlier_per_frame: DEFAULT_MIN_INLIER_PER_FRAME,
             depth_points: None,
             depth_conf_threshold: 1.0,
             track_queries: None,
@@ -1493,7 +1555,7 @@ fn reject_unsupported_vggt_options(args: &RunArgs) -> anyhow::Result<()> {
 /// `--preprocess-mode crop` on another family is accepted as a no-op.
 fn reject_vggt_only_options(args: &RunArgs, family: Family) -> anyhow::Result<()> {
     let vggt = &args.vggt;
-    let set: [(&str, bool); 22] = [
+    let set: [(&str, bool); 27] = [
         (
             "--preprocess-mode",
             vggt.preprocess_mode != VggtPreprocessKind::Crop,
@@ -1517,6 +1579,20 @@ fn reject_vggt_only_options(args: &RunArgs, family: Family) -> anyhow::Result<()
         (
             "--colmap-world-conf-threshold",
             vggt.colmap_world_conf_threshold.is_some(),
+        ),
+        (
+            "--colmap-mode",
+            vggt.colmap_mode != VggtColmapModeKind::Feedforward,
+        ),
+        ("--vis-thresh", vggt.vis_thresh != DEFAULT_VIS_THRESHOLD),
+        (
+            "--max-reproj-error",
+            vggt.max_reproj_error != DEFAULT_MAX_REPROJ_ERROR,
+        ),
+        ("--shared-camera", vggt.shared_camera),
+        (
+            "--colmap-min-inlier-per-frame",
+            vggt.colmap_min_inlier_per_frame != DEFAULT_MIN_INLIER_PER_FRAME,
         ),
         ("--depth-points", vggt.depth_points.is_some()),
         ("--depth-conf-threshold", vggt.depth_conf_threshold != 1.0),
@@ -2318,6 +2394,17 @@ fn vggt_colmap_options_from_args(vggt: &VggtRunArgs) -> VggtColmapOptions {
     }
 }
 
+/// Map the track-mode COLMAP flags onto [`VggtTrackColmapOptions`].
+fn vggt_track_colmap_options_from_args(vggt: &VggtRunArgs) -> VggtTrackColmapOptions {
+    VggtTrackColmapOptions {
+        vis_thresh: vggt.vis_thresh,
+        max_reproj_error: vggt.max_reproj_error,
+        shared_camera: vggt.shared_camera,
+        min_inlier_per_frame: vggt.colmap_min_inlier_per_frame,
+        ..VggtTrackColmapOptions::default()
+    }
+}
+
 /// Map the GLB export flags onto [`VggtGlbOptions`], validating the
 /// `--glb-*` modifiers fail-fast before any weights are loaded.
 fn vggt_glb_options_from_args(vggt: &VggtRunArgs) -> anyhow::Result<VggtGlbOptions> {
@@ -2800,6 +2887,26 @@ fn run_vggt(
     if vggt.track_points_ply.is_some() && !tracking {
         anyhow::bail!("`--track-points-ply` requires `--track-queries` or `--track-auto`");
     }
+    if vggt.colmap_mode == VggtColmapModeKind::Track {
+        if vggt.colmap_dir.is_none() {
+            anyhow::bail!("`--colmap-mode track` requires `--colmap-dir`");
+        }
+        if !vggt.track_auto {
+            anyhow::bail!(
+                "`--colmap-mode track` requires `--track-auto` (the export consumes the stage-A tracks)"
+            );
+        }
+    }
+    let track_colmap_flags = vggt.vis_thresh != DEFAULT_VIS_THRESHOLD
+        || vggt.max_reproj_error != DEFAULT_MAX_REPROJ_ERROR
+        || vggt.shared_camera
+        || vggt.colmap_min_inlier_per_frame != DEFAULT_MIN_INLIER_PER_FRAME;
+    if track_colmap_flags && vggt.colmap_mode != VggtColmapModeKind::Track {
+        anyhow::bail!(
+            "`--vis-thresh`, `--max-reproj-error`, `--shared-camera` and \
+             `--colmap-min-inlier-per-frame` require `--colmap-mode track`"
+        );
+    }
     let track_output = match &vggt.track_output {
         Some(path) => Some(path.clone()),
         None if tracking => Some(vggt_default_track_output(source)),
@@ -2863,23 +2970,52 @@ fn run_vggt(
             // label the wrong cameras; fall back to `image_N` names.
             image_names.clear();
         }
-        let stats = write_feedforward_colmap(
-            colmap_dir,
-            &inference,
-            &prepared,
-            &image_names,
-            &vggt_colmap_options_from_args(vggt),
-        )
-        .map_err(anyhow::Error::from)?;
-        eprintln!(
-            "[colmap] cameras={} images={} points3d={} point2d={} conf_candidates={} -> {}",
-            stats.camera_count,
-            stats.image_count,
-            stats.point3d_count,
-            stats.point2d_count,
-            stats.confidence_candidates,
-            colmap_dir.display()
-        );
+        match vggt.colmap_mode {
+            VggtColmapModeKind::Feedforward => {
+                let stats = write_feedforward_colmap(
+                    colmap_dir,
+                    &inference,
+                    &prepared,
+                    &image_names,
+                    &vggt_colmap_options_from_args(vggt),
+                )
+                .map_err(anyhow::Error::from)?;
+                eprintln!(
+                    "[colmap] cameras={} images={} points3d={} point2d={} conf_candidates={} -> {}",
+                    stats.camera_count,
+                    stats.image_count,
+                    stats.point3d_count,
+                    stats.point2d_count,
+                    stats.confidence_candidates,
+                    colmap_dir.display()
+                );
+            }
+            VggtColmapModeKind::Track => {
+                let auto = auto_track.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("`--colmap-mode track` requires `--track-auto`")
+                })?;
+                let stats = write_track_colmap_from_auto(
+                    colmap_dir,
+                    &inference,
+                    &prepared,
+                    &image_names,
+                    auto,
+                    vggt.colmap_point_source.into(),
+                    &vggt_track_colmap_options_from_args(vggt),
+                )
+                .map_err(anyhow::Error::from)?;
+                eprintln!(
+                    "[colmap:track] tracks={} cameras={} images={} points3d={} point2d={} min_inliers={} -> {}",
+                    stats.track_count,
+                    stats.camera_count,
+                    stats.image_count,
+                    stats.point3d_count,
+                    stats.point2d_count,
+                    stats.min_inliers_per_frame,
+                    colmap_dir.display()
+                );
+            }
+        }
     }
     if let Some(depth_path) = vggt.depth_points.as_deref() {
         let point_cloud = vggt_depth_point_cloud(&inference, vggt.depth_conf_threshold)?;
