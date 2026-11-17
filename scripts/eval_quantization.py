@@ -43,12 +43,21 @@ Examples:
       --source test-assets/mesh-input.png --device cuda \
       --output-dir out/eval-trellis2 -- \
       --pipeline-type 512 --steps 12 --texture false --seed 42
+
+  python scripts/eval_quantization.py triposg --scribble \
+      --binary target/release/lux3d-cli.exe \
+      --reference models/TripoSG-scribble \
+      --variant q8_0=out/scribble-q8_0.gguf \
+      --source assets/example_scribble_data/cat_with_wings.png --device cuda \
+      --output-dir out/eval-scribble -- \
+      --mode scribble --prompt "a cat with wings"
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -148,12 +157,29 @@ def main() -> int:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--json", dest="json_path", type=Path)
+    parser.add_argument(
+        "--scribble",
+        action="store_true",
+        help=(
+            "TripoSG-scribble eval: `--reference` is the raw checkpoint directory and "
+            "every `--variant NAME=PATH` is a standalone quantized DiT `.gguf`. The "
+            "reference directory is exported as LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR so the "
+            "variant runs find the float text encoder/VAE/DINOv2 weights. Pass "
+            "`-- --mode scribble --prompt <text>` for the run flags."
+        ),
+    )
     # Model-specific `run` flags (steps, tokens, octree depth, RMBG path, ...)
     # are unknown to this parser; collect them via parse_known_args instead of
     # a REMAINDER positional, which would swallow the options above.
     args, extra = parser.parse_known_args()
 
     extra = [item for item in extra if item != "--"]
+    if args.scribble:
+        if args.family != "triposg":
+            parser.error("--scribble is only valid with the `triposg` family")
+        if not args.reference.is_dir():
+            parser.error("--scribble expects --reference to be the raw checkpoint directory")
+        os.environ["LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR"] = str(args.reference)
     out_dir = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     is_mesh = args.family in MESH_FAMILIES
@@ -184,6 +210,10 @@ def main() -> int:
         name, _, path = spec.partition("=")
         if not path:
             raise SystemExit(f"--variant expects NAME=PATH, got {spec!r}")
+        if args.scribble and not path.lower().endswith(".gguf"):
+            raise SystemExit(
+                f"--scribble variants must be standalone DiT .gguf files, got {path!r}"
+            )
         artifact = out_dir / f"{name}.{suffix}"
         npz_path = out_dir / f"{name}.npz" if args.family == "vggt" else None
         run_one(

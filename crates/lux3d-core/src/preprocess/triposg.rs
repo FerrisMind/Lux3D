@@ -47,12 +47,12 @@ use candle_core::{Device, Tensor};
 use image::{DynamicImage, ImageReader, Rgb, RgbImage, RgbaImage};
 
 use crate::{
-    Result,
     contracts::{
         ModelFamily, NormalizationStats, PreprocessStage, SpatialSize, TensorContract,
         TripoSgPreparedImage, TripoSgRawInput,
     },
     error::Lux3dError,
+    Result,
 };
 
 /// Reference cap before any alpha analysis (`image_process.py:44-52`).
@@ -220,6 +220,79 @@ impl TripoSgPreprocessStage {
         )
         .map_err(|source| Lux3dError::CanonicalWeightsValidation {
             message: format!("failed to materialize TripoSG pixel values: {source}"),
+        })?;
+
+        Ok(TripoSgPreparedInputs {
+            original_size,
+            target_size,
+            uint8_rgb,
+            pixel_values,
+        })
+    }
+
+    /// Decode `source` with the official TripoSG-scribble preprocessing path
+    /// (`scripts/inference_triposg_scribble.py:22` and
+    /// `triposg/pipelines/pipeline_triposg_scribble.py:186-188`): the image is
+    /// loaded as plain RGB and passed straight to the DINOv2
+    /// `BitImageProcessor`. No alpha analysis, no BriaRMBG fallback, no
+    /// foreground crop/composite and no square padding.
+    pub fn prepare_scribble_inputs_from_path(
+        &self,
+        source: &Path,
+        device: &Device,
+    ) -> Result<TripoSgPreparedInputs> {
+        let image = ImageReader::open(source)
+            .map_err(|_| Lux3dError::InvalidInput("failed to open TripoSG scribble input image"))?
+            .decode()
+            .map_err(|_| {
+                Lux3dError::InvalidInput("failed to decode TripoSG scribble input image")
+            })?;
+        self.prepare_scribble_dynamic_image(&image, device)
+    }
+
+    /// Run the scribble preprocessing path on an already-decoded image.
+    ///
+    /// Mirrors `Image.open(...).convert("RGB")` followed by the DINOv2
+    /// `BitImageProcessor` (`feature_extractor_dinov2/preprocessor_config.json`):
+    /// `convert("RGB")` discards alpha without compositing, the shortest edge
+    /// is resized to 256 with the torchvision uint8 bicubic-antialias kernel,
+    /// the result is center-cropped to 224x224, and the crop is rescaled by
+    /// `1/255` and normalized with the ImageNet statistics. The source has no
+    /// 2000-pixel cap and is never square-padded in the reference.
+    pub fn prepare_scribble_dynamic_image(
+        &self,
+        image: &DynamicImage,
+        device: &Device,
+    ) -> Result<TripoSgPreparedInputs> {
+        let original_size = SpatialSize::new(image.width(), image.height());
+        if image.width() == 0 || image.height() == 0 {
+            return Err(Lux3dError::InvalidInput(
+                "TripoSG scribble input image is empty",
+            ));
+        }
+
+        // `convert("RGB")`: alpha is dropped, grayscale is replicated.
+        let rgb = image.to_rgb8();
+
+        // BitImageProcessor: shortest-edge resize (torch-native uint8
+        // antialias bicubic) + center crop, exactly the image pipeline's
+        // conditioning stage without the alpha/RMBG/composite/pad prefix.
+        let (resized_w, resized_h) =
+            shortest_edge_output_size(rgb.width(), rgb.height(), self.resize_shortest_edge);
+        let resized = resize_rgb_bicubic_antialias_u8(&rgb, resized_w, resized_h);
+        let cropped = center_crop(&resized, self.crop_size);
+
+        let target_size = SpatialSize::new(self.crop_size, self.crop_size);
+        let uint8_rgb = chw_uint8(&cropped);
+        let pixel_values = normalized_pixel_values(
+            &uint8_rgb,
+            cropped.width(),
+            cropped.height(),
+            &self.normalization,
+            device,
+        )
+        .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+            message: format!("failed to materialize TripoSG scribble pixel values: {source}"),
         })?;
 
         Ok(TripoSgPreparedInputs {

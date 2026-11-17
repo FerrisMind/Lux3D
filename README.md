@@ -184,6 +184,18 @@ cargo run -p lux3d-cli -- weights quantize trellis2 `
   --prefix ss_flow. --prefix shape_dit_512. --prefix shape_dit_1024. `
   --prefix tex_dit_512. --prefix tex_dit_1024.
 
+# TripoSG-scribble: quantize ONLY the dual-cross-attention DiT (text encoder,
+# VAE and DINOv2 stay float). --source is the raw `VAST-AI/TripoSG-scribble`
+# checkpoint directory (the transformer shard is resolved automatically);
+# FAMILY is `triposg`. Write to `<checkpoint>/transformer/model.gguf` for
+# automatic pickup, or pass the `.gguf` file directly as `--model-path`.
+# The GGUF has no embedded resolved config (raw checkpoints have none), so it
+# is a DiT override, not a standalone package.
+cargo run -p lux3d-cli -- weights quantize triposg --scribble `
+  --source <raw-TripoSG-scribble-dir> `
+  --output <raw-TripoSG-scribble-dir>/transformer/model.gguf `
+  --dtype q8_0 --fallback-dtype f16
+
 # RMBG-1.4 is an auxiliary package: separate GGUF, F16, same standalone rules.
 cargo run -p lux3d-cli -- weights quantize --aux-family rmbg `
   --source <canonical-rmbg-dir>/model.safetensors `
@@ -206,6 +218,17 @@ cargo run -p lux3d-cli -- run triposg --device cuda `
 cargo run -p lux3d-cli -- run trellis2 --device cuda `
   --model-path <gguf-trellis2-dir> --rmbg-model-path <gguf-rmbg2-f16-dir> `
   --source <image> --output out.glb
+
+# TripoSG-scribble picks up a sibling `transformer/model.gguf` automatically;
+# a standalone DiT `.gguf` can also be passed directly as `--model-path`. The
+# float text encoder/VAE/DINOv2 weights resolve from
+# LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR (default `models/TripoSG-scribble`).
+cargo run -p lux3d-cli -- run triposg --device cuda --mode scribble `
+  --prompt "a cat with wings" --model-path models/TripoSG-scribble `
+  --source <scribble.png> --output out.glb
+cargo run -p lux3d-cli -- run triposg --device cuda --mode scribble `
+  --prompt "a cat with wings" --model-path <scribble-dit-q8_0.gguf> `
+  --source <scribble.png> --output out.glb
 
 # Optional: `--all-2d` also quantizes non-`*.weight` rank-2 tensors;
 # `--prefix transformer.` (repeatable) restricts quantization for bisection.
@@ -258,6 +281,11 @@ TripoSR 1 image at `--mc-resolution 256`):
 | TRELLIS.2-4B | q6_k | 7.41 GiB | 1070 |
 | TRELLIS.2-4B | q5_k | 6.61 GiB | 1070 |
 | TRELLIS.2-4B | q4_k | 5.86 GiB | 1070 |
+| TripoSG-scribble DiT | checkpoint F16 | 3.13 GiB | — |
+| TripoSG-scribble DiT | q8_0 | 1.67 GiB | 308 matrices |
+| TripoSG-scribble DiT | q6_k | 1.29 GiB | 307 |
+| TripoSG-scribble DiT | q5_k | 1.08 GiB | 307 |
+| TripoSG-scribble DiT | q4_k | 0.88 GiB | 307 |
 
 F16 is a straight precision conversion, not block quantization: every tensor is
 stored at 16-bit and the linear layers use the regular path without `QMatMul`.
@@ -280,6 +308,32 @@ matrices whose row length is not divisible by 256 stay in F16.
 
 RMBG-1.4 (auxiliary): F32 0.16 GiB → F16 0.08 GiB; 686 tensors written,
 112 rank-0 training buffers omitted.
+
+TripoSG-scribble follows the same DiT-only policy: the dual-cross-attention
+transformer is quantized, while the CLIP text encoder, the VAE SDF decoder and
+the DINOv2 scribble encoder keep their raw float safetensors. The reference
+run is the raw checkpoint's native F16 DiT promoted to F32 (`--dtype` default
+`f32`), with the same seed/steps/image. Scribble drift (CUDA, RTX 3060;
+`cat_with_wings.png`, prompt "a cat with wings", 16 steps, 512 tokens,
+dense/hierarchical depth 8, seed 42; reference 80,109 vertices / 159,976
+faces):
+
+| variant | CD rel | F@0.5% | F@1% | voxel IoU | normal | vertices | faces | max drift | mean drift |
+|---|---|---|---|---|---|---|---|---|---|
+| q8_0 | 0.461% | 0.626 | 0.907 | 0.268 | 0.925 | 82,145 | 164,044 | 0.0669 | 0.0131 |
+| q6_k | 0.603% | 0.515 | 0.812 | 0.204 | 0.908 | 84,865 | 169,440 | 0.1043 | 0.0171 |
+| q5_k | 0.557% | 0.523 | 0.857 | 0.203 | 0.920 | 76,732 | 153,204 | 0.0654 | 0.0158 |
+| q4_k | 0.744% | 0.444 | 0.742 | 0.167 | 0.893 | 83,340 | 166,368 | 0.1421 | 0.0211 |
+
+Max/mean drift are the existing `compare_geometry.py` nearest-neighbour
+metrics (`max`, `chamfer_l1_mean` in mesh units); voxel IoU captures the
+topology change (marching-cubes vertex/face counts move by up to 6%). The
+CFG-distilled scribble DiT is far more quantization-sensitive than the image
+TripoSG model: only Q8_0 keeps F@1% above 0.90, and every K-quant changes the
+surface topology substantially. Prefer Q8_0 for scribble; Q6_K is a compact
+fallback, Q5_K/Q4_K are preview-grade. The DiT GGUF is an override, not a
+standalone package: raw checkpoints carry no `resolved_config.json`, so the
+remaining weights always load from the checkpoint directory.
 
 ### Quantization Fidelity
 
@@ -317,6 +371,13 @@ python scripts/eval_quantization.py trellis2 --binary target/release/lux3d-cli.e
   --reference <canonical-trellis2-dir> --variant q8_0=trellis2-q8_0.gguf `
   --source <input-image> --device cuda --output-dir out/eval-trellis2 -- `
   --pipeline-type 512 --steps 12 --texture false --seed 42
+
+# TripoSG-scribble (variants are DiT .gguf files; the raw reference dir is
+# exported as LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR for the variant runs)
+python scripts/eval_quantization.py triposg --scribble `
+  --reference <raw-TripoSG-scribble-dir> --variant q8_0=<scribble-dit-q8_0.gguf> `
+  --source <scribble.png> --device cuda --output-dir out/eval-scribble -- `
+  --mode scribble --prompt "a cat with wings"
 ```
 
 TripoSG mesh drift (2 steps, 1024 tokens, depth 5; reference is the same

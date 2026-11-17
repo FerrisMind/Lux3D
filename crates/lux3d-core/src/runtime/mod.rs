@@ -176,7 +176,7 @@ pub use triposg::{
     TRIPOSG_SCRIBBLE_PROMPT_CONFIDENCE, TRIPOSG_SCRIBBLE_STEPS, TripoSgInferenceOutput,
     TripoSgMeshBuffers, TripoSgPipeline, TripoSgPreparedInputs, TripoSgRunOptions,
     TripoSgScribbleInferenceOutput, TripoSgScribblePipeline, TripoSgScribbleRunOptions,
-    resolve_triposg_scribble_model_dir,
+    resolve_triposg_scribble_model_dir, resolve_triposg_scribble_model_source,
 };
 pub use triposg_dino::TripoSgDinoEncoder;
 pub use triposg_dit::{

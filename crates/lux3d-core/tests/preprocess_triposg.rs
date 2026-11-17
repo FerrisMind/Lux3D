@@ -5,9 +5,9 @@ use std::path::PathBuf;
 
 use candle_core::{DType, Device, Tensor};
 use image::{DynamicImage, Rgb, RgbImage, Rgba, RgbaImage};
-use lux3d_core::SpatialSize;
 use lux3d_core::preprocess::TripoSgPreprocessStage;
 use lux3d_core::test_support::runtime_root;
+use lux3d_core::SpatialSize;
 
 fn repo_root() -> PathBuf {
     runtime_root().join("candle-3d")
@@ -308,4 +308,146 @@ fn triposg_large_input_downscale_and_alpha_bbox() {
         prepared.uint8_rgb[plane..2 * plane],
         prepared.uint8_rgb[2 * plane..3 * plane]
     );
+}
+
+/// TripoSG-scribble preprocessing parity (`scripts/inference_triposg_scribble.py:22`
+/// + `pipeline_triposg_scribble.py:186-188`): `convert("RGB")` followed by the
+/// DINOv2 `BitImageProcessor`. Golden generated with transformers 5.17.0 on
+/// the same synthetic 611x389 RGBA pattern: `BitImageProcessor`'s internal
+/// `pil_to_tensor` -> `tvF.resize(shortest_edge=256, BICUBIC, antialias)` ->
+/// `center_crop(224)` uint8 buffer hashes to the constant below, and the
+/// trailing samples are the processor's fused `(x - mean*255)/(std*255)`
+/// float32 outputs.
+#[test]
+fn triposg_scribble_preprocess_matches_python_bitimageprocessor_golden() {
+    use sha2::{Digest, Sha256};
+
+    const GOLDEN_U8_SHA256: &str =
+        "355b722950db22f03068b0fb41655cc4657f3d7eef5c369b49151c1671127aa3";
+    // (flat CHW index, BitImageProcessor pixel value).
+    const GOLDEN_PIXEL_VALUES: [(usize, f32); 10] = [
+        (0, -0.062_933_52),
+        (1, -2.117_903_9),
+        (2, -1.775_408_9),
+        (3, -1.587_036_6),
+        (4, -1.415_789_0),
+        (5, -1.227_416_8),
+        (224 * 224, 1.115_546_2),
+        (224 * 224 + 1, 1.238_095_2),
+        (2 * 224 * 224, -1.595_294_1),
+        (100 * 224 + 50, 1.632_417_1),
+    ];
+
+    let width = 611usize;
+    let height = 389usize;
+    let mut rgba = RgbaImage::new(width as u32, height as u32);
+    for y in 0..height {
+        for x in 0..width {
+            rgba.put_pixel(
+                x as u32,
+                y as u32,
+                Rgba([
+                    ((x * 7 + y * 3) % 256) as u8,
+                    ((x * 5 + y * 11) % 256) as u8,
+                    ((x * 13 + y * 2) % 256) as u8,
+                    ((x * 3 + y * 17) % 256) as u8,
+                ]),
+            );
+        }
+    }
+
+    let stage = TripoSgPreprocessStage::default();
+    let prepared = stage
+        .prepare_scribble_dynamic_image(&DynamicImage::ImageRgba8(rgba), &Device::Cpu)
+        .expect("scribble prepared inputs");
+    assert_eq!(prepared.original_size, SpatialSize::new(611, 389));
+    assert_eq!(prepared.target_size, SpatialSize::new(224, 224));
+    assert_eq!(prepared.uint8_rgb.len(), 3 * 224 * 224);
+
+    let mut hasher = Sha256::new();
+    hasher.update(&prepared.uint8_rgb);
+    let digest = format!("{:x}", hasher.finalize());
+    assert_eq!(
+        GOLDEN_U8_SHA256, digest,
+        "resize/crop uint8 output must match the Python BitImageProcessor golden"
+    );
+
+    assert_eq!(prepared.pixel_values.dims(), &[1, 3, 224, 224]);
+    let values = prepared
+        .pixel_values
+        .to_dtype(DType::F32)
+        .expect("f32")
+        .flatten_all()
+        .expect("flatten")
+        .to_vec1::<f32>()
+        .expect("vec");
+    for (index, expected) in GOLDEN_PIXEL_VALUES {
+        let actual = values[index];
+        let delta = (actual - expected).abs();
+        assert!(
+            delta <= 1e-5,
+            "pixel_values[{index}] {actual} vs Python golden {expected} (delta {delta})"
+        );
+    }
+}
+
+/// RGBA input with a non-opaque alpha is converted with `convert("RGB")`:
+/// alpha is simply dropped, never composited over white, and an RGB source
+/// with the same color produces the identical tensor.
+#[test]
+fn triposg_scribble_preprocess_discards_alpha_without_compositing() {
+    let color = [200u8, 100, 50];
+    let mut rgba = RgbaImage::new(4, 4);
+    let mut rgb = RgbImage::new(4, 4);
+    for y in 0..4 {
+        for x in 0..4 {
+            rgba.put_pixel(x, y, Rgba([color[0], color[1], color[2], 128]));
+            rgb.put_pixel(x, y, Rgb(color));
+        }
+    }
+
+    let stage = TripoSgPreprocessStage::default();
+    let from_rgba = stage
+        .prepare_scribble_dynamic_image(&DynamicImage::ImageRgba8(rgba), &Device::Cpu)
+        .expect("scribble rgba");
+    let from_rgb = stage
+        .prepare_scribble_dynamic_image(&DynamicImage::ImageRgb8(rgb), &Device::Cpu)
+        .expect("scribble rgb");
+
+    assert_eq!(from_rgba.uint8_rgb, from_rgb.uint8_rgb);
+    // A 4x4 uniform image resizes/crops to a uniform 224x224 crop of the same
+    // RGB value (alpha 128 is ignored, not composited to (227, 177, 152)).
+    let values = from_rgba
+        .pixel_values
+        .to_dtype(DType::F32)
+        .expect("f32")
+        .flatten_all()
+        .expect("flatten")
+        .to_vec1::<f32>()
+        .expect("vec");
+    let plane = 224 * 224;
+    for channel in 0..3 {
+        let v = f32::from(color[channel]);
+        let (mean, std) = match channel {
+            0 => (0.485f32, 0.229f32),
+            1 => (0.456, 0.224),
+            _ => (0.406, 0.225),
+        };
+        let expected_channel = (v / 255.0 - mean) / std;
+        for index in 0..plane {
+            let actual = values[channel * plane + index];
+            assert!(
+                (actual - expected_channel).abs() <= 1e-5,
+                "channel {channel} pixel {index}: {actual} vs {expected_channel}"
+            );
+        }
+        // The opaque-white composite would be ~1.78 for R, far from 1.307.
+        if channel == 0 {
+            assert!(
+                (values[0] - 1.307_047).abs() <= 1e-5,
+                "alpha must be dropped, got R {}",
+                values[0]
+            );
+        }
+    }
 }

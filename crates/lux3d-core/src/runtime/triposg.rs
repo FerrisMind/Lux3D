@@ -680,7 +680,7 @@ struct TripoSgScribbleModelBundle {
 }
 
 impl TripoSgScribbleModelBundle {
-    fn load(dir: &Path, device: &Device, dtype: DType) -> Result<Self> {
+    fn load(dir: &Path, dit_gguf: Option<&Path>, device: &Device, dtype: DType) -> Result<Self> {
         let transformer_config = read_triposg_scribble_json(dir, "transformer/config.json")?;
         let vae_config = read_triposg_scribble_json(dir, "vae/config.json")?;
         let dino_config = read_triposg_scribble_json(dir, "image_encoder_dinov2/config.json")?;
@@ -760,12 +760,7 @@ impl TripoSgScribbleModelBundle {
                 message: format!("failed to construct TripoSG-scribble image encoder: {source}"),
             })?,
             dit: TripoSgDiT::load(
-                raw_safetensors_var_builder(
-                    dir,
-                    "transformer/diffusion_pytorch_model.safetensors",
-                    dtype,
-                    device,
-                )?,
+                scribble_dit_var_builder(dir, dit_gguf, dtype, device)?,
                 &transformer_cfg,
             )
             .map_err(|source| Lux3dError::CanonicalWeightsValidation {
@@ -834,6 +829,65 @@ fn raw_safetensors_var_builder(
     })
 }
 
+/// Resolve the scribble DiT weights: explicit GGUF override, then a sibling
+/// `transformer/model.gguf` (the `weights quantize --scribble` default
+/// output), then the raw diffusers safetensors shard. This mirrors
+/// [`CanonicalWeightSetPaths::var_builder`], which prefers a sibling
+/// `model.gguf` over `model.safetensors` for the image pipeline.
+fn scribble_dit_var_builder(
+    dir: &Path,
+    dit_gguf: Option<&Path>,
+    dtype: DType,
+    device: &Device,
+) -> Result<VarBuilder<'static>> {
+    let gguf_path = match dit_gguf {
+        Some(path) => Some(path.to_path_buf()),
+        None => {
+            let sibling = dir.join("transformer").join("model.gguf");
+            sibling.is_file().then_some(sibling)
+        }
+    };
+    if let Some(path) = gguf_path {
+        return VarBuilder::from_gguf(&path, dtype, device).map_err(|source| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "failed to open TripoSG-scribble DiT GGUF `{}`: {source}",
+                    path.display()
+                ),
+            }
+        });
+    }
+    raw_safetensors_var_builder(
+        dir,
+        "transformer/diffusion_pytorch_model.safetensors",
+        dtype,
+        device,
+    )
+}
+
+/// Resolve a scribble run source: a raw checkpoint directory, or a standalone
+/// DiT `.gguf` (the remaining weights then come from
+/// [`TRIPOSG_SCRIBBLE_MODEL_DIR_ENV`]/[`TRIPOSG_SCRIBBLE_DEFAULT_DIR`]).
+pub fn resolve_triposg_scribble_model_source(
+    explicit: Option<&Path>,
+) -> Result<(PathBuf, Option<PathBuf>)> {
+    if let Some(path) = explicit {
+        if path.is_file() {
+            if !crate::weights::is_gguf_path(path) {
+                return Err(Lux3dError::InvalidInput(
+                    "TripoSG scribble `--model-path` file must be a `.gguf` DiT package; \
+                     pass the raw checkpoint directory or a quantized DiT `.gguf`",
+                ));
+            }
+            return Ok((
+                resolve_triposg_scribble_model_dir(None)?,
+                Some(path.to_path_buf()),
+            ));
+        }
+    }
+    Ok((resolve_triposg_scribble_model_dir(explicit)?, None))
+}
+
 /// TripoSG-scribble pipeline: preprocess -> CLIP text embeds + DINOv2
 /// scribble embeds -> seeded rectified-flow denoise with dual cross-attention
 /// scales -> VAE SDF decode (dense/hierarchical marching cubes) -> GLB export.
@@ -841,107 +895,74 @@ fn raw_safetensors_var_builder(
 pub struct TripoSgScribblePipeline {
     /// Raw diffusers-style checkpoint directory (`VAST-AI/TripoSG-scribble`).
     pub model_dir: PathBuf,
-    /// Optional separate RMBG-1.4 canonical package for inputs without a
-    /// valid alpha channel (same fallback as the image pipeline).
-    pub rmbg_weights: Option<AuxiliaryWeightSetPaths>,
+    /// Optional explicit DiT GGUF. When absent a sibling
+    /// `transformer/model.gguf` is preferred over the safetensors shard
+    /// (same precedence as the canonical image pipeline).
+    pub dit_gguf: Option<PathBuf>,
     pub preprocess: TripoSgPreprocessStage,
     pub geometry: TripoSgGeometryStage,
     pub export: TripoSgExportStage,
     dtype: DType,
     bundle_cache: Arc<DeviceLocalCache<TripoSgScribbleModelBundle>>,
-    rmbg_cache: Arc<DeviceLocalCache<RmbgModel>>,
 }
 
 impl TripoSgScribblePipeline {
     pub fn load(model_dir: impl Into<PathBuf>) -> Result<Self> {
-        Self::load_with_rmbg_and_dtype(model_dir, None, DType::F32)
+        Self::load_with_dit_gguf_and_dtype(model_dir, None, DType::F32)
     }
 
     pub fn load_with_dtype(model_dir: impl Into<PathBuf>, dtype: DType) -> Result<Self> {
-        Self::load_with_rmbg_and_dtype(model_dir, None, dtype)
+        Self::load_with_dit_gguf_and_dtype(model_dir, None, dtype)
     }
 
-    pub fn load_with_rmbg_and_dtype(
+    /// Load with an optional quantized DiT package. `dit_gguf` is an explicit
+    /// override; `None` keeps the reference order: sibling
+    /// `transformer/model.gguf`, then the raw safetensors shard.
+    pub fn load_with_dit_gguf_and_dtype(
         model_dir: impl Into<PathBuf>,
-        rmbg_model_dir: Option<PathBuf>,
+        dit_gguf: Option<PathBuf>,
         dtype: DType,
     ) -> Result<Self> {
         let model_dir = model_dir.into();
         let resolved = resolve_triposg_scribble_model_dir(Some(&model_dir))?;
-        let rmbg_weights = match rmbg_model_dir {
-            Some(dir) => Some(load_auxiliary_canonical_weights(dir, "rmbg")?),
-            None => None,
-        };
+        if let Some(path) = dit_gguf.as_ref() {
+            if !path.is_file() {
+                return Err(Lux3dError::MissingCanonicalArtifact { path: path.clone() });
+            }
+        }
         Ok(Self {
             model_dir: resolved,
-            rmbg_weights,
+            dit_gguf,
             preprocess: TripoSgPreprocessStage::default(),
             geometry: TripoSgGeometryStage,
             export: TripoSgExportStage,
             dtype,
             bundle_cache: Arc::default(),
-            rmbg_cache: Arc::default(),
         })
     }
 
     fn bundle_for(&self, device: &Device) -> Result<Arc<TripoSgScribbleModelBundle>> {
         self.bundle_cache.get_or_try_init(device, || {
-            TripoSgScribbleModelBundle::load(&self.model_dir, device, self.dtype)
+            TripoSgScribbleModelBundle::load(
+                &self.model_dir,
+                self.dit_gguf.as_deref(),
+                device,
+                self.dtype,
+            )
         })
     }
 
-    fn rmbg_for(&self, device: &Device) -> Result<Option<Arc<RmbgModel>>> {
-        let Some(weights) = &self.rmbg_weights else {
-            return Ok(None);
-        };
-        self.rmbg_cache
-            .get_or_try_init(device, || {
-                let config =
-                    RmbgConfig::from_resolved_config(&weights.read_resolved_config_json()?)
-                        .map_err(|source| Lux3dError::CanonicalWeightsValidation {
-                            message: format!("failed to parse RMBG config: {source}"),
-                        })?;
-                // SAFETY: canonical safetensors mmap, same lifetime contract
-                // as the scribble bundle.
-                let vb = unsafe { weights.var_builder(DType::F32, device) }.map_err(|source| {
-                    Lux3dError::CanonicalWeightsValidation {
-                        message: format!("failed to open RMBG canonical weights: {source}"),
-                    }
-                })?;
-                RmbgModel::load(vb, &config).map_err(|source| {
-                    Lux3dError::CanonicalWeightsValidation {
-                        message: format!("failed to construct RMBG model: {source}"),
-                    }
-                })
-            })
-            .map(Some)
-    }
-
-    /// Same preprocessing contract as the image pipeline (see
-    /// `TripoSgPipeline::prepare_inputs_from_path`); the scribble reference
-    /// script feeds the raw RGB scribble through the DINOv2 image processor,
-    /// so this path shares Lux3D's TripoSG preprocess (documented deviation:
-    /// the reference skips the alpha/RMBG foreground step for scribbles).
+    /// Official scribble preprocessing: `convert("RGB")` + the DINOv2
+    /// `BitImageProcessor` only (`scripts/inference_triposg_scribble.py:22`,
+    /// `pipeline_triposg_scribble.py:186-188`). Alpha/RMBG foreground
+    /// handling belongs to the image-to-3D path and is not used here.
     pub fn prepare_inputs_from_path(
         &self,
         source: &Path,
         device: &Device,
     ) -> Result<TripoSgPreparedInputs> {
-        match self
-            .preprocess
-            .prepare_inputs_from_path_with_rmbg(source, device, None)
-        {
-            Ok(prepared) => Ok(prepared),
-            Err(Lux3dError::InvalidInput(message))
-                if message.starts_with("TripoSG input has no valid alpha channel")
-                    && self.rmbg_weights.is_some() =>
-            {
-                let rmbg = self.rmbg_for(device)?;
-                self.preprocess
-                    .prepare_inputs_from_path_with_rmbg(source, device, rmbg.as_deref())
-            }
-            Err(error) => Err(error),
-        }
+        self.preprocess
+            .prepare_scribble_inputs_from_path(source, device)
     }
 
     /// `CLIPTextModelWithProjection(prompt).last_hidden_state`
@@ -1815,5 +1836,96 @@ mod surface_selection_tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert!(sorted.len() <= 3);
+    }
+}
+
+#[cfg(test)]
+mod scribble_dit_loader_tests {
+    use super::*;
+    use candle_core::quantized::GgmlDType;
+    use std::collections::HashMap;
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "lux3d-scribble-dit-{tag}-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn tiny_transformer_checkpoint(dir: &Path) -> (PathBuf, PathBuf) {
+        let transformer = dir.join("transformer");
+        fs::create_dir_all(&transformer).unwrap();
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "proj_in.weight".to_string(),
+            candle_core::Tensor::rand(-0.05f32, 0.05f32, (8, 32), &Device::Cpu).unwrap(),
+        );
+        let source = transformer.join("diffusion_pytorch_model.safetensors");
+        candle_core::safetensors::save(&tensors, &source).unwrap();
+        let gguf = transformer.join("model.gguf");
+        crate::weights::quantize_checkpoint(
+            &source,
+            &gguf,
+            ModelFamily::TripoSg,
+            crate::weights::QuantizeOptions {
+                dtype: GgmlDType::Q8_0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        (source, gguf)
+    }
+
+    #[test]
+    fn dit_var_builder_prefers_sibling_gguf_then_safetensors() {
+        let dir = scratch_dir("sibling");
+        let (source, gguf) = tiny_transformer_checkpoint(&dir);
+
+        let vb = scribble_dit_var_builder(&dir, None, DType::F32, &Device::Cpu).unwrap();
+        let qt = vb
+            .get_quantized("proj_in.weight")
+            .unwrap()
+            .expect("sibling model.gguf must supply the packed tensor");
+        assert_eq!(qt.dtype(), GgmlDType::Q8_0);
+
+        // Remove the GGUF: the raw safetensors shard is the fallback.
+        fs::remove_file(&gguf).unwrap();
+        let vb = scribble_dit_var_builder(&dir, None, DType::F32, &Device::Cpu).unwrap();
+        assert!(
+            vb.get_quantized("proj_in.weight").unwrap().is_none(),
+            "safetensors fallback must be dense"
+        );
+        let weight = vb.get((8, 32), "proj_in.weight").unwrap();
+        assert_eq!(weight.dims(), &[8, 32]);
+        let _ = source;
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dit_var_builder_explicit_gguf_overrides_sibling() {
+        let dir = scratch_dir("explicit");
+        let (_source, gguf) = tiny_transformer_checkpoint(&dir);
+        let explicit = dir.join("explicit-q8_0.gguf");
+        fs::copy(&gguf, &explicit).unwrap();
+
+        let vb = scribble_dit_var_builder(&dir, Some(&explicit), DType::F32, &Device::Cpu).unwrap();
+        assert!(
+            vb.get_quantized("proj_in.weight").unwrap().is_some(),
+            "explicit DiT GGUF must be selected"
+        );
+
+        let missing = dir.join("missing.gguf");
+        let err = match scribble_dit_var_builder(&dir, Some(&missing), DType::F32, &Device::Cpu) {
+            Ok(_) => panic!("missing explicit GGUF must fail"),
+            Err(error) => error,
+        };
+        assert!(err.to_string().contains("missing.gguf"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

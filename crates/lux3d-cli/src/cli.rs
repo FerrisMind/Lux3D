@@ -9,7 +9,7 @@ use lux3d_core::export::{
 use lux3d_core::geometry::VggtPointCloudCpu;
 use lux3d_core::preprocess::VggtPreprocessMode;
 use lux3d_core::runtime::{
-    resolve_triposg_scribble_model_dir, Pi3Pipeline, Pi3xInjectConditions, Pi3xPipeline,
+    resolve_triposg_scribble_model_source, Pi3Pipeline, Pi3xInjectConditions, Pi3xPipeline,
     Pi3xVoPipeline, Trellis2MeshPostprocessOptions, Trellis2Pipeline, Trellis2RunOptions,
     Trellis2SamplerOverrides, Trellis2TextureExportOptions, Trellis2TexturingOptions,
     TripoSgPipeline, TripoSgRunOptions, TripoSgScribblePipeline, TripoSgScribbleRunOptions,
@@ -18,7 +18,8 @@ use lux3d_core::runtime::{
 };
 use lux3d_core::{
     dtype_from_name, ensure_canonical_weights, quantize_auxiliary_checkpoint, quantize_checkpoint,
-    ModelAssetOptions, ModelFamily, QuantizeOptions, Trellis2PipelineType, WeightLocator,
+    resolve_scribble_dit_source, ModelAssetOptions, ModelFamily, QuantizeOptions,
+    Trellis2PipelineType, WeightLocator,
 };
 
 #[derive(Debug, Parser, PartialEq)]
@@ -109,6 +110,12 @@ pub struct QuantizeArgs {
         help = "Only quantize tensors whose name starts with this prefix (repeatable)."
     )]
     pub prefix: Vec<String>,
+
+    #[arg(
+        long,
+        help = "Quantize the TripoSG-scribble DiT only. `--source` may be the raw `VAST-AI/TripoSG-scribble` checkpoint directory (the transformer/diffusion_pytorch_model.safetensors shard is resolved) or the shard itself; FAMILY must be `triposg`. Write the output to `<checkpoint>/transformer/model.gguf` for automatic pickup, or pass the `.gguf` file as `--model-path`."
+    )]
+    pub scribble: bool,
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -484,7 +491,7 @@ pub struct RunArgs {
 
     #[arg(
         long,
-        help = "Path to a canonical package directory, a directory containing `model.gguf`, or a standalone `.gguf` file. For `triposg --mode scribble` this is the raw `VAST-AI/TripoSG-scribble` checkpoint directory."
+        help = "Path to a canonical package directory, a directory containing `model.gguf`, or a standalone `.gguf` file. For `triposg --mode scribble` this is the raw `VAST-AI/TripoSG-scribble` checkpoint directory, or a standalone quantized DiT `.gguf` (remaining weights resolve from LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR / models/TripoSG-scribble)."
     )]
     pub model_path: Option<PathBuf>,
 
@@ -1033,33 +1040,33 @@ pub fn quantize_weights(args: QuantizeArgs) -> anyhow::Result<String> {
             args.fallback_dtype
         )
     })?;
-    let report = if let Some(aux_family) = args.aux_family.as_deref() {
-        quantize_auxiliary_checkpoint(
-            &args.source,
-            &args.output,
-            aux_family,
-            QuantizeOptions {
-                dtype,
-                fallback,
-                all_2d: args.all_2d,
-                prefixes: args.prefix.clone(),
-            },
-        )?
+    let options = QuantizeOptions {
+        dtype,
+        fallback,
+        all_2d: args.all_2d,
+        prefixes: args.prefix.clone(),
+    };
+    let report = if args.scribble {
+        if args.aux_family.is_some() {
+            anyhow::bail!("`--scribble` cannot be combined with `--aux-family`");
+        }
+        let family = args
+            .family
+            .ok_or_else(|| anyhow::anyhow!("FAMILY is required with `--scribble`"))?;
+        if family != Family::Triposg {
+            anyhow::bail!(
+                "`--scribble` quantizes the TripoSG-scribble DiT; pass `triposg` as FAMILY"
+            );
+        }
+        let source = resolve_scribble_dit_source(&args.source)?;
+        quantize_checkpoint(&source, &args.output, ModelFamily::TripoSg, options)?
+    } else if let Some(aux_family) = args.aux_family.as_deref() {
+        quantize_auxiliary_checkpoint(&args.source, &args.output, aux_family, options)?
     } else {
         let family = args
             .family
             .ok_or_else(|| anyhow::anyhow!("FAMILY is required unless `--aux-family` is used"))?;
-        quantize_checkpoint(
-            &args.source,
-            &args.output,
-            family.model_family(),
-            QuantizeOptions {
-                dtype,
-                fallback,
-                all_2d: args.all_2d,
-                prefixes: args.prefix.clone(),
-            },
-        )?
+        quantize_checkpoint(&args.source, &args.output, family.model_family(), options)?
     };
     Ok(report.render())
 }
@@ -1190,8 +1197,8 @@ pub fn run_model(args: RunArgs) -> anyhow::Result<PathBuf> {
                             anyhow::anyhow!("`--prompt` is required for `triposg --mode scribble`")
                         })?;
                     let options = triposg_scribble_run_options_from_args(&args)?;
-                    let model_dir = resolve_triposg_scribble_model_dir(args.model_path.as_deref())?;
-                    let rmbg_model_path = resolve_rmbg_model_path(&args);
+                    let (model_dir, dit_gguf) =
+                        resolve_triposg_scribble_model_source(args.model_path.as_deref())?;
                     let dtype = args
                         .dtype
                         .map(candle_core::DType::from)
@@ -1201,7 +1208,7 @@ pub fn run_model(args: RunArgs) -> anyhow::Result<PathBuf> {
                     })?;
                     run_triposg_scribble(
                         model_dir,
-                        rmbg_model_path,
+                        dit_gguf,
                         source,
                         &prompt,
                         options,
@@ -1569,11 +1576,19 @@ fn reject_unsupported_triposg_options(args: &RunArgs) -> anyhow::Result<()> {
 /// dense/hierarchical depth 8 and a raw diffusers-style checkpoint directory.
 /// Reject the flags that would silently contradict those semantics. Shared
 /// flags (`--steps`, `--seed`, `--num-tokens`, the octree depths, `--faces`,
-/// `--bounds`, `--timesteps`, `--chunk-size`, `--surface-input` excluded,
-/// `--dtype`, `--rmbg-model-path`) stay allowed.
+/// `--bounds`, `--timesteps`, `--chunk-size`, `--dtype`) stay allowed.
+/// `--rmbg-model-path` is rejected: the official scribble path consumes the
+/// raw RGB image through the DINOv2 `BitImageProcessor` and never runs RMBG.
 fn reject_scribble_mode_conflicts(args: &RunArgs) -> anyhow::Result<()> {
     if args.surface_input.is_some() {
         anyhow::bail!("`--surface-input` is not supported for `triposg --mode scribble`");
+    }
+    if args.rmbg_model_path.is_some() {
+        anyhow::bail!(
+            "`--rmbg-model-path` is not supported for `triposg --mode scribble`: the \
+             reference feeds the raw RGB scribble through the DINOv2 BitImageProcessor \
+             without any alpha/RMBG foreground step"
+        );
     }
     if args.guidance_scale.is_some() {
         anyhow::bail!(
@@ -3092,7 +3107,7 @@ fn run_triposg(
 /// denoise (no CFG) -> dense/hierarchical SDF decode -> GLB export.
 fn run_triposg_scribble(
     model_dir: PathBuf,
-    rmbg_model_path: Option<PathBuf>,
+    dit_gguf: Option<PathBuf>,
     source: &Path,
     prompt: &str,
     options: TripoSgScribbleRunOptions,
@@ -3104,7 +3119,7 @@ fn run_triposg_scribble(
     let stage_time = std::env::var_os("LUX3D_STAGE_TIME").is_some();
     let t0 = std::time::Instant::now();
     let pipeline =
-        TripoSgScribblePipeline::load_with_rmbg_and_dtype(model_dir, rmbg_model_path, dtype)?;
+        TripoSgScribblePipeline::load_with_dit_gguf_and_dtype(model_dir, dit_gguf, dtype)?;
     if stage_time {
         eprintln!("[stage] load: {:.2}s", t0.elapsed().as_secs_f64());
     }
@@ -4486,6 +4501,7 @@ mod tests {
             ("--flash-decoder", &["--flash-decoder", "true"][..]),
             ("--flash-octree-depth", &["--flash-octree-depth", "8"][..]),
             ("--cache-dir", &["--cache-dir", "hf-cache"][..]),
+            ("--rmbg-model-path", &["--rmbg-model-path", "rmbg"][..]),
         ] {
             let mut argv = vec![
                 "lux3d",

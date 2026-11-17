@@ -14,15 +14,15 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use candle_core::quantized::{GgmlDType, QTensor, gguf_file};
+use candle_core::quantized::{gguf_file, GgmlDType, QTensor};
 use candle_core::safetensors::MmapedSafetensors;
 use candle_core::{Device, Tensor};
 
 use crate::{
-    Result,
     contracts::ModelFamily,
     error::Lux3dError,
     weights::{GGUF_FAMILY_KEY, GGUF_RESOLVED_CONFIG_KEY, RESOLVED_CONFIG_FILENAME},
+    Result,
 };
 
 /// Quantization policy for [`quantize_checkpoint`].
@@ -106,6 +106,29 @@ pub fn quantize_checkpoint(
     options: QuantizeOptions,
 ) -> Result<QuantizeReport> {
     quantize_checkpoint_with_family(source, output, family.as_str(), options)
+}
+
+/// Resolve the TripoSG-scribble DiT safetensors from a raw
+/// `VAST-AI/TripoSG-scribble` checkpoint directory or a direct shard path.
+///
+/// Only the DiT is quantized (the reference quantization policy); the text
+/// encoder and VAE keep their raw float safetensors.
+pub fn resolve_scribble_dit_source(source: &Path) -> Result<PathBuf> {
+    if source.is_file() {
+        return Ok(source.to_path_buf());
+    }
+    if source.is_dir() {
+        let candidate = source
+            .join("transformer")
+            .join("diffusion_pytorch_model.safetensors");
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+        return Err(Lux3dError::MissingCanonicalArtifact { path: candidate });
+    }
+    Err(Lux3dError::MissingCanonicalArtifact {
+        path: source.to_path_buf(),
+    })
 }
 
 /// Quantize an auxiliary package (for example `rmbg`) whose family is not a
@@ -397,11 +420,11 @@ pub fn dtype_from_name(name: &str) -> Option<GgmlDType> {
 #[cfg(test)]
 mod tests {
     use super::{
-        QuantizeOptions, dtype_from_name, dtype_name, quantize_auxiliary_checkpoint,
-        quantize_checkpoint, resolve_architecture, should_quantize,
+        dtype_from_name, dtype_name, quantize_auxiliary_checkpoint, quantize_checkpoint,
+        resolve_architecture, resolve_scribble_dit_source, should_quantize, QuantizeOptions,
     };
     use crate::contracts::ModelFamily;
-    use candle_core::quantized::{GgmlDType, gguf_file};
+    use candle_core::quantized::{gguf_file, GgmlDType};
     use candle_core::{Device, Tensor};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -524,11 +547,9 @@ mod tests {
         let content = read_gguf(&output);
         assert_eq!(gguf_architecture(&content), "vggt");
         assert_eq!(content.tensor_infos.len(), 4);
-        assert!(
-            !content
-                .tensor_infos
-                .contains_key("transformer.blocks.0.num_batches_tracked")
-        );
+        assert!(!content
+            .tensor_infos
+            .contains_key("transformer.blocks.0.num_batches_tracked"));
         assert_eq!(
             content.tensor_infos["transformer.blocks.0.attn.to_q.weight"].ggml_dtype,
             GgmlDType::Q8_0
@@ -589,6 +610,34 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("activation-side"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scribble_source_resolves_the_transformer_shard() {
+        let dir = scratch_dir("scribble-source");
+        let transformer = dir.join("transformer");
+        std::fs::create_dir_all(&transformer).unwrap();
+        let shard = transformer.join("diffusion_pytorch_model.safetensors");
+        std::fs::write(&shard, b"placeholder").unwrap();
+
+        assert_eq!(resolve_scribble_dit_source(&dir).unwrap(), shard);
+        assert_eq!(resolve_scribble_dit_source(&shard).unwrap(), shard);
+
+        let missing = dir.join("missing");
+        let err = resolve_scribble_dit_source(&missing).unwrap_err();
+        assert!(err.to_string().contains("missing"));
+        let empty = scratch_dir("scribble-source-empty");
+        let err = resolve_scribble_dit_source(&empty).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("transformer/diffusion_pytorch_model.safetensors")
+                || err
+                    .to_string()
+                    .contains("diffusion_pytorch_model.safetensors"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty);
     }
 
     #[test]

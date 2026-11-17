@@ -33,7 +33,7 @@ pub use weights::{
     FutureWeightLoader, ModelAssetOptions, QuantizeOptions, QuantizeReport, RawWeightFormat,
     WeightLocator, dtype_from_name, dtype_name, ensure_canonical_weights,
     load_auxiliary_canonical_weights, load_canonical_weights, quantize_auxiliary_checkpoint,
-    quantize_checkpoint,
+    quantize_checkpoint, resolve_scribble_dit_source,
 };
 
 /// Families whose GPU timings and output parity were validated with candle's
