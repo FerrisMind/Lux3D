@@ -1,6 +1,7 @@
 use clap::Parser;
 use lux3d_cli::{
-    Cli, Command, WeightsCommand, inspect_model, normalize_weights, quantize_weights, run_model,
+    inspect_model, normalize_weights, quantize_weights, run_model, run_ovox, Cli, Command,
+    WeightsCommand,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -23,6 +24,7 @@ fn main() -> anyhow::Result<()> {
             WeightsCommand::Quantize(args) => println!("{}", quantize_weights(args)?),
         },
         Command::Run(args) => println!("{}", run_model(args)?.display()),
+        Command::Ovox(args) => println!("{}", run_ovox(args)?),
     }
 
     Ok(())

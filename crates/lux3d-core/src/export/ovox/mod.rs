@@ -17,9 +17,12 @@
 //! asserts `dtype == torch.uint8` (`vxz.py:249-252`); NPZ/PLY readers accept
 //! narrower integer dtypes and reject lossy conversions.
 
+pub mod commands;
 pub mod npz;
 pub mod ply;
 pub mod serialize;
+pub mod textured_mesh;
+pub mod voxelize;
 pub mod vxz;
 
 mod lzma2;

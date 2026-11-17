@@ -175,6 +175,128 @@ pub fn flexible_dual_grid_to_mesh(
     DualGridMesh { vertices, faces }
 }
 
+/// [`flexible_dual_grid_to_mesh`] with the reference `split_weight = None`
+/// behaviour (the o_voxel `ovox2mesh` / `ovox2glb` examples pass `None`).
+///
+/// The reference then splits every quad along the diagonal whose two
+/// triangles are better aligned: it evaluates both candidate splits
+/// (`quad_split_1 = [0,1,2,0,2,3]`, `quad_split_2 = [0,1,3,3,1,2]`) on the
+/// reconstructed positions and keeps the one with the larger absolute dot
+/// product of the two triangle normals
+/// (`flexible_dual_grid.py:244-256`):
+///
+/// ```text
+/// align0 = |cross(v1-v0, v2-v0) . cross(v2-v1, v3-v1)|
+/// align1 = |cross(v1-v0, v3-v0) . cross(v3-v1, v2-v1)|
+/// split  = if align0 > align1 { quad_split_1 } else { quad_split_2 }
+/// ```
+///
+/// Tie-breaking matches `torch.where` (the false branch wins). The TRELLIS.2
+/// decoder always supplies split weights, so this entry point is only for
+/// o_voxel assets (`.vxz` without a `split_weight` attribute).
+pub fn flexible_dual_grid_to_mesh_auto_split(
+    coords: &[[i32; 3]],
+    dual_vertices: &[[f32; 3]],
+    intersected: &[[bool; 3]],
+    grid_size: [usize; 3],
+    aabb: [[f32; 3]; 2],
+) -> DualGridMesh {
+    let n = coords.len();
+    assert_eq!(dual_vertices.len(), n, "dual vertex count mismatch");
+    assert_eq!(intersected.len(), n, "intersected flag count mismatch");
+    let voxel_size = [
+        (aabb[1][0] - aabb[0][0]) / grid_size[0] as f32,
+        (aabb[1][1] - aabb[0][1]) / grid_size[1] as f32,
+        (aabb[1][2] - aabb[0][2]) / grid_size[2] as f32,
+    ];
+
+    let mut vertices = Vec::with_capacity(n * 3);
+    for (index, coord) in coords.iter().enumerate() {
+        for axis in 0..3 {
+            vertices.push(
+                (coord[axis] as f32 + dual_vertices[index][axis]) * voxel_size[axis]
+                    + aabb[0][axis],
+            );
+        }
+    }
+
+    let map: HashMap<[i32; 3], u32> = coords
+        .iter()
+        .enumerate()
+        .map(|(index, coord)| (*coord, index as u32))
+        .collect();
+
+    let position = |row: usize| -> [f32; 3] {
+        [
+            vertices[row * 3],
+            vertices[row * 3 + 1],
+            vertices[row * 3 + 2],
+        ]
+    };
+    let cross = |a: [f32; 3], b: [f32; 3]| -> [f32; 3] {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let sub = |a: [f32; 3], b: [f32; 3]| -> [f32; 3] {
+        [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+    };
+    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+
+    let mut faces: Vec<i64> = Vec::new();
+    for (index, coord) in coords.iter().enumerate() {
+        for axis in 0..3 {
+            if !intersected[index][axis] {
+                continue;
+            }
+            let mut quad = [0u32; 4];
+            let mut valid = true;
+            for (corner, offset) in EDGE_NEIGHBOR_VOXEL_OFFSET[axis].iter().enumerate() {
+                match map.get(&[
+                    coord[0] + offset[0],
+                    coord[1] + offset[1],
+                    coord[2] + offset[2],
+                ]) {
+                    Some(&row) => quad[corner] = row,
+                    None => {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if !valid {
+                continue;
+            }
+            let p = [
+                position(quad[0] as usize),
+                position(quad[1] as usize),
+                position(quad[2] as usize),
+                position(quad[3] as usize),
+            ];
+            // Split 1: triangles (0,1,2) and (0,2,3).
+            let n0 = cross(sub(p[1], p[0]), sub(p[2], p[0]));
+            let n1 = cross(sub(p[2], p[1]), sub(p[3], p[1]));
+            let align0 = dot(n0, n1).abs();
+            // Split 2: triangles (0,1,3) and (3,1,2).
+            let n2 = cross(sub(p[1], p[0]), sub(p[3], p[0]));
+            let n3 = cross(sub(p[3], p[1]), sub(p[2], p[1]));
+            let align1 = dot(n2, n3).abs();
+            let split = if align0 > align1 {
+                &QUAD_SPLIT_1
+            } else {
+                &QUAD_SPLIT_2
+            };
+            for corner in split {
+                faces.push(quad[*corner] as i64);
+            }
+        }
+    }
+
+    DualGridMesh { vertices, faces }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

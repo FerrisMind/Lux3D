@@ -56,7 +56,7 @@
 //! 2048 atlas that is ~40 MiB steady state, no per-pixel allocations.
 
 use crate::error::Lux3dError;
-use crate::runtime::{query_vertex_attrs, Trellis2PbrLayout};
+use crate::runtime::{query_vertex_attrs_in_aabb, Trellis2PbrLayout};
 use crate::Result;
 
 use super::mesh_bvh::MeshBvh;
@@ -110,6 +110,31 @@ pub struct BakeStats {
     pub triangle_count: usize,
 }
 
+/// Placement of a sparse attribute grid in world space: the reference
+/// `grid_sample_3d` call `grid = (position - aabb[0]) / voxel_size` with
+/// `voxel_size = (aabb[1] - aabb[0]) / grid_size`
+/// (`o-voxel/o_voxel/postprocess.py:259-266`).
+///
+/// [`PbrSampleGrid::unit`] is the TRELLIS.2 `[-0.5, 0.5]^3` frame; o_voxel
+/// assets may carry any box (`.vxz` does not store one).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PbrSampleGrid {
+    /// `[[min_x, min_y, min_z], [max_x, max_y, max_z]]`.
+    pub aabb: [[f32; 3]; 2],
+    /// Per-axis voxel grid resolution.
+    pub grid_size: [u32; 3],
+}
+
+impl PbrSampleGrid {
+    /// The TRELLIS.2 reference frame `[-0.5, 0.5]^3` at a cubic resolution.
+    pub const fn unit(resolution: u32) -> Self {
+        Self {
+            aabb: [[-0.5; 3], [0.5; 3]],
+            grid_size: [resolution; 3],
+        }
+    }
+}
+
 /// Bake the 6-channel PBR voxel attributes into two RGBA textures at
 /// `texture_size` (upstream 2048).
 ///
@@ -137,13 +162,37 @@ pub fn bake_pbr_texture(
     resolution: u32,
     texture_size: usize,
 ) -> Result<BakedPbrTexture> {
+    bake_pbr_texture_in_grid(
+        vertices,
+        uvs,
+        indices,
+        voxel_coords,
+        voxel_attrs,
+        PbrSampleGrid::unit(resolution),
+        texture_size,
+    )
+}
+
+/// [`bake_pbr_texture`] with an explicit attribute-volume placement
+/// ([`PbrSampleGrid`]) — the o_voxel `ovox2glb` path where the volume was
+/// voxelized into a caller-supplied `aabb` / `grid_size`.
+#[allow(clippy::too_many_arguments)]
+pub fn bake_pbr_texture_in_grid(
+    vertices: &[[f32; 3]],
+    uvs: &[[f32; 2]],
+    indices: &[u32],
+    voxel_coords: &[[i32; 3]],
+    voxel_attrs: &[f32],
+    grid: PbrSampleGrid,
+    texture_size: usize,
+) -> Result<BakedPbrTexture> {
     bake_pbr_texture_impl(
         vertices,
         uvs,
         indices,
         voxel_coords,
         voxel_attrs,
-        resolution,
+        grid,
         texture_size,
         None,
     )
@@ -184,7 +233,32 @@ pub fn bake_pbr_texture_with_snap(
         indices,
         voxel_coords,
         voxel_attrs,
-        resolution,
+        PbrSampleGrid::unit(resolution),
+        texture_size,
+        Some(original_surface),
+    )
+}
+
+/// [`bake_pbr_texture_with_snap`] with an explicit attribute-volume
+/// placement ([`PbrSampleGrid`]) — the o_voxel `ovox2glb` path.
+#[allow(clippy::too_many_arguments)]
+pub fn bake_pbr_texture_with_snap_in_grid(
+    vertices: &[[f32; 3]],
+    uvs: &[[f32; 2]],
+    indices: &[u32],
+    original_surface: &MeshBvh<'_>,
+    voxel_coords: &[[i32; 3]],
+    voxel_attrs: &[f32],
+    grid: PbrSampleGrid,
+    texture_size: usize,
+) -> Result<BakedPbrTexture> {
+    bake_pbr_texture_impl(
+        vertices,
+        uvs,
+        indices,
+        voxel_coords,
+        voxel_attrs,
+        grid,
         texture_size,
         Some(original_surface),
     )
@@ -197,7 +271,7 @@ fn bake_pbr_texture_impl(
     indices: &[u32],
     voxel_coords: &[[i32; 3]],
     voxel_attrs: &[f32],
-    resolution: u32,
+    grid: PbrSampleGrid,
     texture_size: usize,
     original_surface: Option<&MeshBvh<'_>>,
 ) -> Result<BakedPbrTexture> {
@@ -245,10 +319,20 @@ fn bake_pbr_texture_impl(
             "PBR bake voxel attribute buffer must hold 6 channels per voxel coordinate",
         ));
     }
-    if resolution == 0 {
+    if grid.grid_size.iter().any(|&size| size == 0) {
         return Err(Lux3dError::InvalidInput(
-            "PBR bake voxel grid resolution must be positive",
+            "PBR bake voxel grid resolution must be positive on every axis",
         ));
+    }
+    for axis in 0..3 {
+        if !(grid.aabb[0][axis] < grid.aabb[1][axis])
+            || !grid.aabb[0][axis].is_finite()
+            || !grid.aabb[1][axis].is_finite()
+        {
+            return Err(Lux3dError::InvalidInput(
+                "PBR bake attribute-volume aabb must be finite with min < max on every axis",
+            ));
+        }
     }
 
     let texel_count = texture_size * texture_size;
@@ -313,7 +397,7 @@ fn bake_pbr_texture_impl(
                 &chunk_texels,
                 voxel_coords,
                 voxel_attrs,
-                resolution,
+                grid,
                 &mut baked,
             )?;
             chunk_positions.clear();
@@ -326,7 +410,7 @@ fn bake_pbr_texture_impl(
             &chunk_texels,
             voxel_coords,
             voxel_attrs,
-            resolution,
+            grid,
             &mut baked,
         )?;
     }
@@ -487,14 +571,21 @@ fn sample_chunk_into_textures(
     texels: &[usize],
     voxel_coords: &[[i32; 3]],
     voxel_attrs: &[f32],
-    resolution: u32,
+    grid: PbrSampleGrid,
     baked: &mut BakedPbrTexture,
 ) -> Result<()> {
     let channels = Trellis2PbrLayout::CHANNELS;
-    let sampled = query_vertex_attrs(positions, voxel_coords, voxel_attrs, channels, resolution)
-        .map_err(|error| Lux3dError::CanonicalWeightsValidation {
-            message: format!("Trellis2 PBR texel sampling failed: {error}"),
-        })?;
+    let sampled = query_vertex_attrs_in_aabb(
+        positions,
+        voxel_coords,
+        voxel_attrs,
+        channels,
+        grid.aabb,
+        grid.grid_size,
+    )
+    .map_err(|error| Lux3dError::CanonicalWeightsValidation {
+        message: format!("Trellis2 PBR texel sampling failed: {error}"),
+    })?;
     for (row, &texel) in texels.iter().enumerate() {
         let base = row * channels;
         let dst = texel * 4;

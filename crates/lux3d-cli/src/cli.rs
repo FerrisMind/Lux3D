@@ -39,6 +39,214 @@ pub enum Command {
     Inspect(InspectArgs),
     Weights(WeightsArgs),
     Run(RunArgs),
+    Ovox(OvoxArgs),
+}
+
+#[derive(Debug, Clone, Args, PartialEq)]
+pub struct OvoxArgs {
+    #[command(subcommand)]
+    pub command: OvoxCommand,
+}
+
+#[derive(Debug, Clone, Subcommand, PartialEq)]
+pub enum OvoxCommand {
+    #[command(
+        name = "mesh2ovox",
+        about = "Voxelize a textured mesh into a sparse PBR .vxz volume."
+    )]
+    Mesh2Ovox(Mesh2OvoxArgs),
+    #[command(
+        name = "ovox2mesh",
+        about = "Reconstruct a .ply mesh (with base-color vertex colors) from an o_voxel volume."
+    )]
+    Ovox2Mesh(Ovox2MeshArgs),
+    #[command(
+        name = "ovox2glb",
+        about = "Reconstruct, clean, UV-unwrap and bake a textured .glb from an o_voxel volume."
+    )]
+    Ovox2Glb(Ovox2GlbArgs),
+}
+
+#[derive(Debug, Clone, Args, PartialEq)]
+pub struct Mesh2OvoxArgs {
+    #[arg(
+        value_name = "INPUT",
+        help = "Input textured mesh: .glb (full PBR) or .obj/.ply/.stl (single default material)."
+    )]
+    pub input: PathBuf,
+
+    #[arg(
+        value_name = "OUTPUT",
+        help = "Output sparse volume. .vxz is the official format; .npz/.ply are also accepted."
+    )]
+    pub output: PathBuf,
+
+    #[arg(
+        long = "grid-size",
+        value_delimiter = ',',
+        value_name = "N[,N,N]",
+        default_value = "512",
+        help = "Voxel resolution per axis; one value repeats, three values set X,Y,Z. Default 512 (official RES). Required unless --voxel-size is given."
+    )]
+    pub grid_size: Vec<u32>,
+
+    #[arg(
+        long = "voxel-size",
+        value_delimiter = ',',
+        value_name = "S[,S,S]",
+        help = "Explicit voxel size per axis; one value repeats, three values set X,Y,Z. When set, the kernel uses it verbatim and --grid-size (or the auto grid) gives the index range."
+    )]
+    pub voxel_size: Vec<f32>,
+
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_name = "MINX,MINY,MINZ,MAXX,MAXY,MAXZ",
+        help = "Voxel box in the (normalized) mesh frame. Default after normalization is [-0.5,0.5]^3; with --no-normalize the wrapper auto-pads the mesh bounds."
+    )]
+    pub aabb: Option<Vec<f32>>,
+
+    #[arg(
+        long = "no-normalize",
+        help = "Skip the official mesh2ovox unit-cube normalization (center + 0.99999/max_extent)."
+    )]
+    pub no_normalize: bool,
+
+    #[arg(
+        long = "mip-level-offset",
+        default_value_t = 0.0,
+        help = "Texture mip-level offset (official textured_mesh_to_volumetric_attr default 0.0)."
+    )]
+    pub mip_level_offset: f32,
+
+    #[arg(
+        long = "face-weight",
+        default_value_t = 1.0,
+        help = "QEF face-term weight (official example 1.0)."
+    )]
+    pub face_weight: f32,
+
+    #[arg(
+        long = "boundary-weight",
+        default_value_t = 0.2,
+        help = "QEF boundary-term weight (official example 0.2)."
+    )]
+    pub boundary_weight: f32,
+
+    #[arg(
+        long = "regularization-weight",
+        default_value_t = 1e-2,
+        help = "QEF regularization weight (official example 1e-2)."
+    )]
+    pub regularization_weight: f32,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = OvoxCompressionArg::Deflate,
+        help = "Compression for .vxz output: none or deflate (LZMA writing is not supported; LZMA files can be read)."
+    )]
+    pub compression: OvoxCompressionArg,
+}
+
+#[derive(Debug, Clone, Args, PartialEq)]
+pub struct Ovox2MeshArgs {
+    #[arg(value_name = "INPUT", help = "Input o_voxel volume (.vxz/.npz/.ply).")]
+    pub input: PathBuf,
+
+    #[arg(
+        value_name = "OUTPUT",
+        help = "Output .ply (ASCII, base-color vertex colors when present)."
+    )]
+    pub output: PathBuf,
+
+    #[arg(
+        long = "grid-size",
+        value_delimiter = ',',
+        value_name = "N[,N,N]",
+        default_value = "512",
+        help = "Grid resolution the asset was voxelized with (not stored in .vxz; official example uses 512)."
+    )]
+    pub grid_size: Vec<u32>,
+
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_name = "MINX,MINY,MINZ,MAXX,MAXY,MAXZ",
+        default_value = "-0.5,-0.5,-0.5,0.5,0.5,0.5",
+        help = "Voxel box the asset was voxelized with (not stored in .vxz)."
+    )]
+    pub aabb: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Args, PartialEq)]
+pub struct Ovox2GlbArgs {
+    #[arg(value_name = "INPUT", help = "Input o_voxel volume (.vxz/.npz/.ply).")]
+    pub input: PathBuf,
+
+    #[arg(value_name = "OUTPUT", help = "Output textured .glb.")]
+    pub output: PathBuf,
+
+    #[arg(
+        long = "grid-size",
+        value_delimiter = ',',
+        value_name = "N[,N,N]",
+        default_value = "512",
+        help = "Grid resolution the asset was voxelized with."
+    )]
+    pub grid_size: Vec<u32>,
+
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_name = "MINX,MINY,MINZ,MAXX,MAXY,MAXZ",
+        default_value = "-0.5,-0.5,-0.5,0.5,0.5,0.5",
+        help = "Voxel box the asset was voxelized with."
+    )]
+    pub aabb: Vec<f32>,
+
+    #[arg(
+        long = "decimation-target",
+        default_value_t = 100_000,
+        help = "Post-process simplification target (official ovox2glb example: 100000)."
+    )]
+    pub decimation_target: usize,
+
+    #[arg(
+        long = "texture-size",
+        default_value_t = 2048,
+        help = "Bake texture edge length (official ovox2glb example: 2048)."
+    )]
+    pub texture_size: usize,
+
+    #[arg(
+        long = "fill-hole-perimeter",
+        default_value_t = 3e-2,
+        help = "Initial/final hole-fill perimeter threshold (upstream to_glb: 3e-2)."
+    )]
+    pub fill_hole_perimeter: f32,
+
+    #[arg(
+        long = "min-component-area",
+        default_value_t = 1e-5,
+        help = "Small-connected-component removal area threshold (upstream to_glb: 1e-5)."
+    )]
+    pub min_component_area: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum OvoxCompressionArg {
+    None,
+    Deflate,
+}
+
+impl From<OvoxCompressionArg> for lux3d_core::export::ovox::vxz::VxzCompression {
+    fn from(value: OvoxCompressionArg) -> Self {
+        match value {
+            OvoxCompressionArg::None => Self::None,
+            OvoxCompressionArg::Deflate => Self::Deflate,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -1068,6 +1276,7 @@ impl Command {
                 Family::Vggt => "vggt",
                 Family::Trellis2 => "trellis2",
             },
+            Self::Ovox(_) => "ovox",
         }
     }
 
@@ -1079,6 +1288,7 @@ impl Command {
                 WeightsCommand::Quantize(ref args) => args.family.map(Family::model_family),
             },
             Self::Run(args) => Some(args.family.model_family()),
+            Self::Ovox(_) => None,
         }
     }
 
@@ -1090,6 +1300,7 @@ impl Command {
                 WeightsCommand::Quantize(_) => None,
             },
             Self::Run(_) => None,
+            Self::Ovox(_) => None,
         }
     }
 }
@@ -1178,6 +1389,78 @@ pub fn normalize_weights(
     let plan = locator.locate(family)?;
     let canonical = ensure_canonical_weights(&plan)?;
     Ok(serde_json::to_string_pretty(&canonical.manifest)?)
+}
+
+fn expand3<T: Copy>(values: &[T], default: T) -> anyhow::Result<[T; 3]> {
+    match values {
+        [] => Ok([default; 3]),
+        [v] => Ok([*v; 3]),
+        [x, y, z] => Ok([*x, *y, *z]),
+        _ => anyhow::bail!("--grid-size/--voxel-size accept 1 or 3 comma-separated values"),
+    }
+}
+
+fn parse_aabb(values: &[f32]) -> anyhow::Result<[[f32; 3]; 2]> {
+    match values {
+        [x0, y0, z0, x1, y1, z1] => Ok([[*x0, *y0, *z0], [*x1, *y1, *z1]]),
+        _ => anyhow::bail!(
+            "--aabb needs exactly 6 comma-separated values: MINX,MINY,MINZ,MAXX,MAXY,MAXZ"
+        ),
+    }
+}
+
+fn resolve_voxel_size(values: &[f32]) -> anyhow::Result<Option<[f32; 3]>> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+    expand3(values, values[0]).map(Some)
+}
+
+/// Run one `ovox` subcommand and return its JSON stats report.
+pub fn run_ovox(args: OvoxArgs) -> anyhow::Result<String> {
+    use lux3d_core::export::{
+        mesh2ovox, ovox2glb, ovox2mesh, MeshToOvoxOptions, OvoxDecodeOptions, OvoxToGlbOptions,
+    };
+
+    match args.command {
+        OvoxCommand::Mesh2Ovox(a) => {
+            let options = MeshToOvoxOptions {
+                grid_size: Some(expand3(&a.grid_size, 512)?),
+                voxel_size: resolve_voxel_size(&a.voxel_size)?,
+                aabb: a.aabb.as_deref().map(parse_aabb).transpose()?,
+                normalize_to_unit_cube: !a.no_normalize,
+                mip_level_offset: a.mip_level_offset,
+                face_weight: a.face_weight,
+                boundary_weight: a.boundary_weight,
+                regularization_weight: a.regularization_weight,
+                compression: a.compression.into(),
+            };
+            let stats = mesh2ovox(&a.input, &a.output, &options)?;
+            Ok(serde_json::to_string_pretty(&stats)?)
+        }
+        OvoxCommand::Ovox2Mesh(a) => {
+            let options = OvoxDecodeOptions {
+                grid_size: expand3(&a.grid_size, 512)?,
+                aabb: parse_aabb(&a.aabb)?,
+            };
+            let stats = ovox2mesh(&a.input, &a.output, &options)?;
+            Ok(serde_json::to_string_pretty(&stats)?)
+        }
+        OvoxCommand::Ovox2Glb(a) => {
+            let options = OvoxToGlbOptions {
+                decode: OvoxDecodeOptions {
+                    grid_size: expand3(&a.grid_size, 512)?,
+                    aabb: parse_aabb(&a.aabb)?,
+                },
+                decimation_target: a.decimation_target,
+                texture_size: a.texture_size,
+                fill_hole_perimeter: a.fill_hole_perimeter,
+                min_component_area: a.min_component_area,
+            };
+            let stats = ovox2glb(&a.input, &a.output, &options)?;
+            Ok(serde_json::to_string_pretty(&stats)?)
+        }
+    }
 }
 
 pub fn run_model(args: RunArgs) -> anyhow::Result<PathBuf> {

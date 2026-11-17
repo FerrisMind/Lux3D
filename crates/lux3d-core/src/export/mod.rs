@@ -21,6 +21,18 @@ pub use colmap::{
 pub use glb_textured::{write_textured_glb, TexturedAlphaMode, TexturedGlbMesh};
 pub use import::{load_mesh, read_glb, read_obj, read_ply, read_stl, ImportedMesh};
 pub use mesh::{write_mesh, write_obj, MeshFormat, MeshView, ObjStyle};
+pub use ovox::commands::{
+    decode_ovox, mesh2ovox, ovox2glb, ovox2mesh, DecodedOvox, MeshToOvoxOptions, MeshToOvoxStats,
+    OvoxDecodeOptions, OvoxToGlbOptions, OvoxToGlbStats, OvoxToMeshStats, OVOX_DEFAULT_AABB,
+    OVOX_DEFAULT_DECIMATION_TARGET, OVOX_DEFAULT_FILL_HOLE_PERIMETER,
+    OVOX_DEFAULT_MIN_COMPONENT_AREA, OVOX_DEFAULT_MIP_LEVEL_OFFSET, OVOX_DEFAULT_RESOLUTION,
+    OVOX_DEFAULT_TEXTURE_SIZE,
+};
+pub use ovox::textured_mesh::{load_textured_mesh, OvoxTexturedMesh};
+pub use ovox::voxelize::{
+    resolve_voxelization_settings, textured_mesh_to_volumetric_attr, MaterialVoxelization,
+    OvoxAlphaMode, OvoxMaterial, OvoxTexture, VoxelizationSettings,
+};
 pub use pi3::Pi3ExportStage;
 pub use point_cloud::{write_point_cloud, PointCloudFormat, PointCloudView};
 pub use trellis2::{pbrvox, to_glb_axes, Trellis2ExportStage};

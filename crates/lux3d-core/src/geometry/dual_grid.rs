@@ -121,6 +121,15 @@ pub struct MeshToDualGridOptions {
     /// Voxel grid resolution per axis (must be `>= 2` per axis; capped at
     /// [`MAX_GRID_SIZE_PER_AXIS`]).
     pub grid_size: [u32; 3],
+    /// Optional explicit voxel size per axis. The upstream wrappers accept
+    /// either `voxel_size` or `grid_size`; when `voxel_size` is given the
+    /// grid range is `grid_size` but the kernel uses the SUPPLIED per-axis
+    /// cell size (`flexible_dual_grid.py:118-137`,
+    /// `volumetic_attr.py:139-145`). `None` keeps the usual
+    /// `voxel_size = aabb_extent / grid_size` derivation. Callers passing
+    /// an explicit voxel size should also pass an explicit `aabb`, because
+    /// the auto-aabb padding formula depends on the mode.
+    pub voxel_size: Option<[f32; 3]>,
     /// Explicit axis-aligned bounding box `[[min_x, min_y, min_z],
     /// [max_x, max_y, max_z]]`. When `None`, the box is computed from the
     /// vertex extremes and expanded by half a cell per axis (upstream
@@ -144,6 +153,7 @@ impl MeshToDualGridOptions {
     pub fn new(grid_size: [u32; 3]) -> Self {
         Self {
             grid_size,
+            voxel_size: None,
             aabb: None,
             face_weight: 1.0,
             boundary_weight: 1.0,
@@ -162,6 +172,7 @@ impl MeshToDualGridOptions {
     pub fn for_shape_slat_encoder(resolution: u32) -> Self {
         Self {
             grid_size: [resolution, resolution, resolution],
+            voxel_size: None,
             aabb: Some([[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]]),
             face_weight: 1.0,
             boundary_weight: 0.2,
@@ -271,11 +282,24 @@ pub fn mesh_to_flexible_dual_grid(
     // ---- aabb and voxel size (wrapper semantics) ---------------------------
     let aabb = resolve_aabb(vertices, options.grid_size, options.aabb)?;
     let grid_size = options.grid_size;
-    let voxel_size = [
-        (aabb[1][0] - aabb[0][0]) / grid_size[0] as f32,
-        (aabb[1][1] - aabb[0][1]) / grid_size[1] as f32,
-        (aabb[1][2] - aabb[0][2]) / grid_size[2] as f32,
-    ];
+    let voxel_size = match options.voxel_size {
+        Some(voxel_size) => {
+            for size in &voxel_size {
+                if !size.is_finite() || *size <= 0.0 {
+                    return Err(Lux3dError::InvalidInput(
+                        "dual grid voxelization explicit voxel_size must be finite and positive \
+                         on every axis",
+                    ));
+                }
+            }
+            voxel_size
+        }
+        None => [
+            (aabb[1][0] - aabb[0][0]) / grid_size[0] as f32,
+            (aabb[1][1] - aabb[0][1]) / grid_size[1] as f32,
+            (aabb[1][2] - aabb[0][2]) / grid_size[2] as f32,
+        ],
+    };
     if voxel_size.iter().any(|s| !s.is_finite() || *s <= 0.0) {
         return Err(Lux3dError::InvalidInput(
             "dual grid voxelization produced a degenerate voxel size",

@@ -20,7 +20,9 @@ pub use mesh_ops::{
     simplify_mesh, unify_face_orientations, MeshEditResult,
 };
 pub use pbr_bake::{
-    bake_pbr_texture, bake_pbr_texture_with_snap, BakeStats, BakedPbrTexture, COVERAGE_PAD_TEXELS,
+    bake_pbr_texture, bake_pbr_texture_in_grid, bake_pbr_texture_with_snap,
+    bake_pbr_texture_with_snap_in_grid, BakeStats, BakedPbrTexture, PbrSampleGrid,
+    COVERAGE_PAD_TEXELS,
 };
 pub use pi3::{Pi3GeometryStage, Pi3PointCloudCpu};
 pub use remesh_dc::{narrow_band_grid_scale, remesh_narrow_band_dc, RemeshDcMesh, RemeshDcOptions};
