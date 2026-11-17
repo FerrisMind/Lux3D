@@ -50,6 +50,7 @@ use super::{
         RopeEmbeddings,
     },
     nn_blocks::{linear, linear_fwd, LayerScale, Mlp},
+    vggt_auto_query::{VggtAutoQueryOptions, VggtAutoTrackResult},
     vggt_dpt::{VggtDptActivation, VggtDptHead},
     vggt_track::{VggtTrackHead, VggtTrackQuery, VggtTrackResult, TRACK_DEFAULT_ITERS},
 };
@@ -131,6 +132,27 @@ impl VggtInferenceOutput {
         let intrinsics = squeeze_batch_dim(&self.intrinsics, "VGGT intrinsics")?;
         crate::geometry::unproject_depth_to_world(&depth, &extrinsics, &intrinsics)
     }
+}
+
+/// What the track head should run after the shared aggregator pass.
+enum VggtTrackPlan<'a> {
+    Off,
+    /// Explicit query points (query frame 0, as upstream `VGGT.forward`).
+    Explicit {
+        queries: &'a [VggtTrackQuery],
+        iters: usize,
+    },
+    /// Stage-A automatic query selection (DINO frame ranking + FPS points +
+    /// confidence gate), tracking once per ranked query frame.
+    Auto {
+        options: &'a VggtAutoQueryOptions,
+    },
+}
+
+/// Track output plus the auto-query metadata when stage A selected queries.
+enum VggtTrackRun {
+    Explicit(VggtTrackResult),
+    Auto(VggtAutoTrackResult),
 }
 
 /// Drop a leading singleton batch dim (`[1, S, ...]` -> `[S, ...]`).
@@ -1027,12 +1049,55 @@ impl VggtPipeline {
         let (output, _, track) = self.run_forward_inner(
             prepared,
             false,
-            Some((queries, iters.unwrap_or(TRACK_DEFAULT_ITERS))),
+            VggtTrackPlan::Explicit {
+                queries,
+                iters: iters.unwrap_or(TRACK_DEFAULT_ITERS),
+            },
         )?;
-        let track = track.ok_or_else(|| Lux3dError::CanonicalWeightsValidation {
-            message: "VGGT track run produced no tracks".to_string(),
-        })?;
-        Ok((output, track))
+        match track {
+            Some(VggtTrackRun::Explicit(track)) => Ok((output, track)),
+            _ => Err(Lux3dError::CanonicalWeightsValidation {
+                message: "VGGT track run produced no tracks".to_string(),
+            }),
+        }
+    }
+
+    /// One-call inference plus stage-A automatic tracking (`--track-auto`).
+    ///
+    /// The aggregator runs once. Query frames are ranked by
+    /// [`super::vggt_auto_query`] (DINOv2-reg CLS similarity + FPS), query
+    /// points are FPS-spread and confidence-gated, and the existing track
+    /// head runs once per query frame with that frame rotated to index 0
+    /// (`track_predict.py:205-224`); the frame axis is rotated back before
+    /// the per-query-frame track sets are concatenated.
+    pub fn run_with_auto_tracks(
+        &self,
+        prepared: &VggtPreparedInputs,
+        options: &VggtAutoQueryOptions,
+    ) -> Result<(VggtInferenceOutput, VggtAutoTrackResult)> {
+        if options.query_frame_num == 0 {
+            return Err(Lux3dError::InvalidInput(
+                "`--query-frame-num` must be at least 1",
+            ));
+        }
+        if options.max_query_pts == 0 {
+            return Err(Lux3dError::InvalidInput(
+                "`--max-query-pts` must be at least 1",
+            ));
+        }
+        if options.track_iters == 0 {
+            return Err(Lux3dError::InvalidInput(
+                "`--track-iters` must be at least 1",
+            ));
+        }
+        let (output, _, track) =
+            self.run_forward_inner(prepared, false, VggtTrackPlan::Auto { options })?;
+        match track {
+            Some(VggtTrackRun::Auto(track)) => Ok((output, track)),
+            _ => Err(Lux3dError::CanonicalWeightsValidation {
+                message: "VGGT auto-track run produced no tracks".to_string(),
+            }),
+        }
     }
 
     fn run_forward(
@@ -1040,21 +1105,22 @@ impl VggtPipeline {
         prepared: &VggtPreparedInputs,
         capture_taps: bool,
     ) -> Result<(VggtInferenceOutput, Option<VggtDebugTaps>)> {
-        let (output, taps, _tracks) = self.run_forward_inner(prepared, capture_taps, None)?;
+        let (output, taps, _tracks) =
+            self.run_forward_inner(prepared, capture_taps, VggtTrackPlan::Off)?;
         Ok((output, taps))
     }
 
-    /// Full forward. `track = Some((queries, iters))` additionally runs the
-    /// track head on the same aggregator output (no second aggregator pass).
+    /// Full forward. `track` selects the optional track-head pass over the
+    /// same aggregator output (no second aggregator pass).
     fn run_forward_inner(
         &self,
         prepared: &VggtPreparedInputs,
         capture_taps: bool,
-        track: Option<(&[VggtTrackQuery], usize)>,
+        track: VggtTrackPlan<'_>,
     ) -> Result<(
         VggtInferenceOutput,
         Option<VggtDebugTaps>,
-        Option<VggtTrackResult>,
+        Option<VggtTrackRun>,
     )> {
         let normalized_frames =
             prepared
@@ -1193,19 +1259,38 @@ impl VggtPipeline {
 
         let t = std::time::Instant::now();
         let track_result = match track {
-            Some((queries, iters)) => {
+            VggtTrackPlan::Off => None,
+            VggtTrackPlan::Explicit { queries, iters } => {
                 let track_head = self.track_head_for(&device)?;
                 let refs: Vec<&Tensor> = cached_layers.iter().collect();
-                Some(track_head.track(
+                Some(VggtTrackRun::Explicit(track_head.track(
                     &refs,
                     &normalized_frames,
                     VGGT_PATCH_START_IDX,
                     queries,
                     iters,
                     chunk_size,
-                )?)
+                )?))
             }
-            None => None,
+            VggtTrackPlan::Auto { options } => {
+                let track_head = self.track_head_for(&device)?;
+                // `depth_conf` is `[1, S, H, W]`; the confidence gate samples
+                // the query frame's `[H, W]` plane.
+                let depth_conf = squeeze_batch_dim(&depth_conf, "VGGT depth_conf")?;
+                Some(VggtTrackRun::Auto(
+                    super::vggt_auto_query::run_auto_tracking(
+                        &track_head,
+                        &cached_layers,
+                        &normalized_frames,
+                        &prepared.rgb_frames,
+                        &depth_conf,
+                        VGGT_PATCH_START_IDX,
+                        options,
+                        chunk_size,
+                        &device,
+                    )?,
+                ))
+            }
         };
         stage("track_head", &t);
 

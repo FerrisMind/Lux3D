@@ -106,6 +106,7 @@ mod triposg_vae;
 mod triposr;
 mod triposr_field;
 mod vggt;
+mod vggt_auto_query;
 mod vggt_dpt;
 mod vggt_track;
 mod vision_preproc;
@@ -190,6 +191,9 @@ pub use triposr::{TripoInferenceOutput, TripoMeshBuffers, TripoPreparedInputs, T
 pub use vggt::{
     VggtAggregatorOutput, VggtDebugTaps, VggtInferenceOutput, VggtPipeline, VggtPreparedInputs,
     VggtRunOptions, merge_vggt_inference_outputs,
+};
+pub use vggt_auto_query::{
+    VggtAutoQueryOptions, VggtAutoTrackResult, DEFAULT_MAX_QUERY_PTS, DEFAULT_QUERY_FRAME_NUM,
 };
 pub use vggt_track::{
     VggtTrackHead, VggtTrackQuery, VggtTrackResult, bilinear_sample_features,

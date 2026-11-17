@@ -12,8 +12,8 @@ use lux3d_core::runtime::{
     Pi3Pipeline, Pi3xInjectConditions, Pi3xPipeline, Pi3xVoPipeline,
     Trellis2MeshPostprocessOptions, Trellis2Pipeline, Trellis2RunOptions, Trellis2SamplerOverrides,
     Trellis2TextureExportOptions, Trellis2TexturingOptions, TripoSgPipeline, TripoSgRunOptions,
-    TripoSrPipeline, VggtInferenceOutput, VggtPipeline, VggtRunOptions, VggtTrackQuery,
-    VggtTrackResult,
+    TripoSrPipeline, VggtAutoQueryOptions, VggtInferenceOutput, VggtPipeline, VggtRunOptions,
+    VggtTrackQuery, VggtTrackResult, DEFAULT_MAX_QUERY_PTS, DEFAULT_QUERY_FRAME_NUM,
 };
 use lux3d_core::{
     dtype_from_name, ensure_canonical_weights, quantize_auxiliary_checkpoint, quantize_checkpoint,
@@ -682,26 +682,46 @@ pub struct VggtRunArgs {
     #[arg(
         long,
         allow_hyphen_values = true,
-        help = "VGGT explicit track queries as a JSON array (vggt only) of {\"frame\": N, \"x\": F, \"y\": F} objects or [N, F, F] arrays: pixel coordinates in the model input resolution, `x` in [0, 518) and `y` in [0, 518) (prepared frames are at most 518x518) and the query frame must be 0 (rotate the clip so the desired query frame comes first). Automatic query selection (ALIKED/SP keypoints, DINO query-frame ranking) is NOT available - explicit queries are required."
+        help = "VGGT explicit track queries as a JSON array (vggt only) of {\"frame\": N, \"x\": F, \"y\": F} objects or [N, F, F] arrays: pixel coordinates in the model input resolution, `x` in [0, 518) and `y` in [0, 518) (prepared frames are at most 518x518) and the query frame must be 0 (rotate the clip so the desired query frame comes first). Mutually exclusive with --track-auto."
     )]
     pub track_queries: Option<String>,
 
     #[arg(
         long,
-        help = "VGGT track output JSON path (vggt only; default `<source-stem>_tracks.json` when --track-queries is given): writes {\"coords\": [[[x, y], ...], ...], \"visibility\": [[...], ...], \"confidence\": [[...], ...] | null} per frame per query."
+        help = "VGGT automatic query selection (vggt only, tracking stage A): ranks frames with DINOv2 ViT-B/14-with-registers CLS similarity + FPS (official --query-frame-num), picks up to --max-query-pts FPS-spread points per query frame (the official ALIKED/SuperPoint keypoint extractors are not part of stage A), confidence-gates them like track_predict.py (conf > 1.2 when more than 512 survive), rotates each query frame to position 0 for the track head, then rotates the tracks back. Requires the DINOv2-reg safetensors at models/dinov2_reg4/model.safetensors or LUX3D_DINOV2_REG_MODEL_PATH. Mutually exclusive with --track-queries. Rejected for other families."
+    )]
+    pub track_auto: bool,
+
+    #[arg(
+        long,
+        default_value_t = DEFAULT_QUERY_FRAME_NUM,
+        help = "VGGT automatic query frame count (vggt only, requires --track-auto; official demo default 8): DINO similarity + FPS ranks this many frames, then frame 0 is prepended when it is missing (track_predict.py), so the track head may run one extra query frame."
+    )]
+    pub query_frame_num: usize,
+
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_QUERY_PTS,
+        help = "VGGT automatic per-frame query-point cap (vggt only, requires --track-auto; official demo default 4096): points are selected by farthest-point sampling over the model-resolution pixel grid, then confidence-gated."
+    )]
+    pub max_query_pts: usize,
+
+    #[arg(
+        long,
+        help = "VGGT track output JSON path (vggt only; default `<source-stem>_tracks.json` when --track-queries or --track-auto is given): writes {\"coords\": [[[x, y], ...], ...], \"visibility\": [[...], ...], \"confidence\": [[...], ...] | null} per frame per query, plus \"query_frames\" for --track-auto."
     )]
     pub track_output: Option<PathBuf>,
 
     #[arg(
         long,
         default_value_t = 4,
-        help = "VGGT track refinement iterations (upstream TrackHead.iters default 4). Modifies --track-queries."
+        help = "VGGT track refinement iterations (upstream TrackHead.iters default 4). Modifies --track-queries and --track-auto."
     )]
     pub track_iters: usize,
 
     #[arg(
         long,
-        help = "VGGT query-point PLY path (vggt only, requires --track-queries): writes one colored vertex per query - the frame-0 world point sampled at the query pixel (nearest) with its RGB color."
+        help = "VGGT query-point PLY path (vggt only, requires --track-queries or --track-auto): writes one colored vertex per query - the query frame's world point sampled at the query pixel (nearest) with its RGB color."
     )]
     pub track_points_ply: Option<PathBuf>,
 
@@ -748,6 +768,9 @@ impl Default for VggtRunArgs {
             depth_points: None,
             depth_conf_threshold: 1.0,
             track_queries: None,
+            track_auto: false,
+            query_frame_num: DEFAULT_QUERY_FRAME_NUM,
+            max_query_pts: DEFAULT_MAX_QUERY_PTS,
             track_output: None,
             track_iters: 4,
             track_points_ply: None,
@@ -1361,7 +1384,7 @@ fn reject_unsupported_vggt_options(args: &RunArgs) -> anyhow::Result<()> {
 /// `--preprocess-mode crop` on another family is accepted as a no-op.
 fn reject_vggt_only_options(args: &RunArgs, family: Family) -> anyhow::Result<()> {
     let vggt = &args.vggt;
-    let set: [(&str, bool); 19] = [
+    let set: [(&str, bool); 22] = [
         (
             "--preprocess-mode",
             vggt.preprocess_mode != VggtPreprocessKind::Crop,
@@ -1389,6 +1412,15 @@ fn reject_vggt_only_options(args: &RunArgs, family: Family) -> anyhow::Result<()
         ("--depth-points", vggt.depth_points.is_some()),
         ("--depth-conf-threshold", vggt.depth_conf_threshold != 1.0),
         ("--track-queries", vggt.track_queries.is_some()),
+        ("--track-auto", vggt.track_auto),
+        (
+            "--query-frame-num",
+            vggt.query_frame_num != DEFAULT_QUERY_FRAME_NUM,
+        ),
+        (
+            "--max-query-pts",
+            vggt.max_query_pts != DEFAULT_MAX_QUERY_PTS,
+        ),
         ("--track-output", vggt.track_output.is_some()),
         ("--track-iters", vggt.track_iters != 4),
         ("--track-points-ply", vggt.track_points_ply.is_some()),
@@ -2279,8 +2311,14 @@ fn vggt_colmap_image_names(source: &Path, interval: usize) -> Vec<String> {
 
 /// Serialize a track result as `{"coords": [S][Q][2], "visibility": [S][Q],
 /// "confidence": [S][Q] | null}` (F32 JSON arrays; `coords` are
-/// model-resolution pixel coordinates with `coords[0] == queries`).
-fn vggt_track_result_to_json(track: &VggtTrackResult) -> anyhow::Result<serde_json::Value> {
+/// model-resolution pixel coordinates with `coords[0] == queries`). Automatic
+/// tracking adds `"query_frames": [Q]` (the source frame of each query point)
+/// and `"query_points": [Q][2]`.
+fn vggt_track_result_to_json(
+    track: &VggtTrackResult,
+    query_frames: Option<&[usize]>,
+    query_points: Option<&[[f32; 2]]>,
+) -> anyhow::Result<serde_json::Value> {
     let device = candle_core::Device::Cpu;
     let coords = track
         .coords
@@ -2309,11 +2347,18 @@ fn vggt_track_result_to_json(track: &VggtTrackResult) -> anyhow::Result<serde_js
         ),
         None => serde_json::Value::Null,
     };
-    Ok(serde_json::json!({
+    let mut value = serde_json::json!({
         "coords": coords,
         "visibility": visibility,
         "confidence": confidence,
-    }))
+    });
+    if let Some(query_frames) = query_frames {
+        value["query_frames"] = serde_json::json!(query_frames);
+    }
+    if let Some(query_points) = query_points {
+        value["query_points"] = serde_json::json!(query_points);
+    }
+    Ok(value)
 }
 
 /// Flatten a tensor to a CPU f32 vector.
@@ -2473,23 +2518,44 @@ fn run_vggt(
         Some(json) => Some(parse_vggt_track_queries(json)?),
         None => None,
     };
-    if track_queries.is_some() && vggt.track_iters == 0 {
-        anyhow::bail!("`--track-iters` must be at least 1");
-    }
-    if track_queries.is_some() && vggt.batch_size > 1 {
+    if track_queries.is_some() && vggt.track_auto {
         anyhow::bail!(
-            "`--track-queries` runs a single pass over all frames (the track head requires the query frame first); `--batch-size` chunking greater than 1 cannot be combined with tracking"
+            "`--track-queries` and `--track-auto` are mutually exclusive: pass explicit queries or let stage A select them"
         );
     }
-    if vggt.track_output.is_some() && track_queries.is_none() {
-        anyhow::bail!("`--track-output` requires `--track-queries`");
+    if vggt.track_auto {
+        if vggt.query_frame_num == 0 {
+            anyhow::bail!("`--query-frame-num` must be at least 1");
+        }
+        if vggt.max_query_pts == 0 {
+            anyhow::bail!("`--max-query-pts` must be at least 1");
+        }
+    } else {
+        if vggt.query_frame_num != DEFAULT_QUERY_FRAME_NUM {
+            anyhow::bail!("`--query-frame-num` requires `--track-auto`");
+        }
+        if vggt.max_query_pts != DEFAULT_MAX_QUERY_PTS {
+            anyhow::bail!("`--max-query-pts` requires `--track-auto`");
+        }
     }
-    if vggt.track_points_ply.is_some() && track_queries.is_none() {
-        anyhow::bail!("`--track-points-ply` requires `--track-queries`");
+    let tracking = track_queries.is_some() || vggt.track_auto;
+    if tracking && vggt.track_iters == 0 {
+        anyhow::bail!("`--track-iters` must be at least 1");
+    }
+    if tracking && vggt.batch_size > 1 {
+        anyhow::bail!(
+            "tracking runs a single pass over all frames (the track head requires the query frame first); `--batch-size` chunking greater than 1 cannot be combined with tracking"
+        );
+    }
+    if vggt.track_output.is_some() && !tracking {
+        anyhow::bail!("`--track-output` requires `--track-queries` or `--track-auto`");
+    }
+    if vggt.track_points_ply.is_some() && !tracking {
+        anyhow::bail!("`--track-points-ply` requires `--track-queries` or `--track-auto`");
     }
     let track_output = match &vggt.track_output {
         Some(path) => Some(path.clone()),
-        None if track_queries.is_some() => Some(vggt_default_track_output(source)),
+        None if tracking => Some(vggt_default_track_output(source)),
         None => None,
     };
 
@@ -2506,14 +2572,30 @@ fn run_vggt(
         options.preprocess_mode,
         device,
     )?;
-    let (inference, track) = match &track_queries {
+    let (inference, track, auto_track) = match &track_queries {
         Some(queries) => {
             let (inference, track) =
                 pipeline.run_with_tracks(&prepared, queries, Some(vggt.track_iters))?;
-            (inference, Some(track))
+            (inference, Some(track), None)
+        }
+        None if vggt.track_auto => {
+            let auto_options = VggtAutoQueryOptions {
+                query_frame_num: vggt.query_frame_num,
+                max_query_pts: vggt.max_query_pts,
+                track_iters: vggt.track_iters,
+                dino_weights: None,
+            };
+            let (inference, auto) = pipeline.run_with_auto_tracks(&prepared, &auto_options)?;
+            eprintln!(
+                "[track-auto] query frames={:?} points={:?} pruned={:?}",
+                auto.ranked_query_frames, auto.queries_per_frame, auto.pruned_per_frame
+            );
+            let track = auto.track.clone();
+            (inference, Some(track), Some(auto))
         }
         None => (
             pipeline.infer_prepared_with_options(&prepared, &options)?,
+            None,
             None,
         ),
     };
@@ -2566,7 +2648,11 @@ fn run_vggt(
     }
     if let Some(track_path) = track_output.as_deref() {
         let track = track.as_ref().expect("tracks exist when queries are set");
-        let json = vggt_track_result_to_json(track)?;
+        let json = vggt_track_result_to_json(
+            track,
+            auto_track.as_ref().map(|auto| auto.query_frames.as_slice()),
+            auto_track.as_ref().map(|auto| auto.query_points.as_slice()),
+        )?;
         std::fs::write(track_path, serde_json::to_string_pretty(&json)?).map_err(|source| {
             anyhow::anyhow!(
                 "failed to write VGGT tracks to {}: {source}",
@@ -2575,15 +2661,27 @@ fn run_vggt(
         })?;
         eprintln!(
             "[tracks] {} queries x {} frames, iters={} -> {}",
-            track_queries.as_ref().expect("queries are set").len(),
+            track.coords.dim(1).unwrap_or(0),
             track.coords.dims().first().copied().unwrap_or(0),
             vggt.track_iters,
             track_path.display()
         );
     }
     if let Some(query_ply) = vggt.track_points_ply.as_deref() {
-        let queries = track_queries.as_ref().expect("queries are set");
-        let point_cloud = vggt_query_point_cloud(&inference, queries)?;
+        let queries = match (&track_queries, &auto_track) {
+            (Some(queries), _) => queries.clone(),
+            (None, Some(auto)) => auto
+                .query_frames
+                .iter()
+                .zip(&auto.query_points)
+                .map(|(frame, xy)| VggtTrackQuery {
+                    frame: *frame,
+                    xy: *xy,
+                })
+                .collect(),
+            (None, None) => unreachable!("--track-points-ply requires tracking"),
+        };
+        let point_cloud = vggt_query_point_cloud(&inference, &queries)?;
         pipeline
             .export
             .write_point_cloud(&point_cloud, query_ply)
@@ -3337,6 +3435,97 @@ mod tests {
         assert!(error.to_string().contains("--preprocess-mode"));
     }
 
+    /// `--track-auto` parses with the official demo defaults, and combining it
+    /// with explicit `--track-queries` is rejected before any model load.
+    #[test]
+    fn vggt_auto_track_flags_parse_and_conflict() {
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "vggt",
+            "--source",
+            "frames",
+            "--output",
+            "out.ply",
+            "--track-auto",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(args.vggt.track_auto);
+        assert_eq!(8, args.vggt.query_frame_num);
+        assert_eq!(4096, args.vggt.max_query_pts);
+
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "vggt",
+            "--source",
+            "frames",
+            "--output",
+            "out.ply",
+            "--track-auto",
+            "--query-frame-num",
+            "3",
+            "--max-query-pts",
+            "128",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(3, args.vggt.query_frame_num);
+        assert_eq!(128, args.vggt.max_query_pts);
+
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "vggt",
+            "--source",
+            "frames",
+            "--output",
+            "out.ply",
+            "--track-auto",
+            "--track-queries",
+            r#"[{"frame":0,"x":1.0,"y":2.0}]"#,
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        let error = super::run_vggt(
+            super::ModelAssetOptions::default(),
+            &args,
+            &candle_core::Device::Cpu,
+        )
+        .expect_err("--track-auto and --track-queries must conflict");
+        assert!(
+            error.to_string().contains("mutually exclusive"),
+            "unexpected error: {error}"
+        );
+
+        // A non-default point cap without --track-auto is rejected too.
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "vggt",
+            "--source",
+            "frames",
+            "--output",
+            "out.ply",
+            "--max-query-pts",
+            "64",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        let error = super::run_vggt(
+            super::ModelAssetOptions::default(),
+            &args,
+            &candle_core::Device::Cpu,
+        )
+        .expect_err("--max-query-pts requires --track-auto");
+        assert!(error.to_string().contains("requires `--track-auto`"));
+    }
+
     /// Defaults keep the historical behavior: f32, crop mode, a single forward
     /// pass (batch-size 1) and no optional exports; the COLMAP options match
     /// the upstream demo defaults.
@@ -3658,11 +3847,15 @@ mod tests {
             candle_core::Tensor::from_vec(vec![0.9f32, 0.8, 0.7, 0.6, 0.5, 0.4], (2, 3), &device)
                 .expect("confidence");
 
-        let with_conf = super::vggt_track_result_to_json(&super::VggtTrackResult {
-            coords: coords.clone(),
-            visibility: visibility.clone(),
-            confidence: Some(confidence),
-        })
+        let with_conf = super::vggt_track_result_to_json(
+            &super::VggtTrackResult {
+                coords: coords.clone(),
+                visibility: visibility.clone(),
+                confidence: Some(confidence),
+            },
+            None,
+            None,
+        )
         .expect("json");
         // serde_json converts the f32 tensor values to f64 exactly as the
         // literal conversion below, so the expected value uses f32 literals.
@@ -3683,21 +3876,32 @@ mod tests {
             with_conf
         );
 
-        let without_conf = super::vggt_track_result_to_json(&super::VggtTrackResult {
-            coords,
-            visibility,
-            confidence: None,
-        })
+        let without_conf = super::vggt_track_result_to_json(
+            &super::VggtTrackResult {
+                coords,
+                visibility,
+                confidence: None,
+            },
+            Some(&[0, 2]),
+            Some(&[[1.0f32, 2.0], [3.0, 4.0]]),
+        )
         .expect("json");
         assert_eq!(serde_json::Value::Null, without_conf["confidence"]);
         assert_eq!(2, without_conf["coords"].as_array().expect("frames").len());
+        // Automatic tracking records the source frame and pixel of every
+        // query point.
+        assert_eq!(serde_json::json!([0, 2]), without_conf["query_frames"]);
+        assert_eq!(
+            serde_json::json!([[1.0f32, 2.0], [3.0, 4.0]]),
+            without_conf["query_points"]
+        );
     }
 
     /// Every VGGT-only flag (when it differs from its default) is rejected for
     /// the other families instead of being silently ignored.
     #[test]
     fn vggt_only_flags_rejected_for_other_families() {
-        let flag_options: [(&str, &[&str]); 19] = [
+        let flag_options: [(&str, &[&str]); 22] = [
             ("--preprocess-mode", &["--preprocess-mode", "pad"]),
             ("--vggt-dtype", &["--vggt-dtype", "f16"]),
             ("--batch-size", &["--batch-size", "4"]),
@@ -3725,6 +3929,9 @@ mod tests {
                 "--track-queries",
                 &["--track-queries", r#"[{"frame":0,"x":1.0,"y":2.0}]"#],
             ),
+            ("--track-auto", &["--track-auto"]),
+            ("--query-frame-num", &["--query-frame-num", "3"]),
+            ("--max-query-pts", &["--max-query-pts", "64"]),
             ("--track-output", &["--track-output", "tracks.json"]),
             ("--track-iters", &["--track-iters", "6"]),
             ("--track-points-ply", &["--track-points-ply", "queries.ply"]),
