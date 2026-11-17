@@ -127,13 +127,19 @@
 //! all three stages; a stage override's `steps` wins over the legacy field
 //! when both are set (`resolve_stage_params`).
 //!
-//! `num_samples` (upstream `run(num_samples)` batches every flow): this
-//! port keeps single-output sampling — `num_samples = 1` is bit-identical to
-//! the pre-`num_samples` behavior, and `run_many_from_path` /
-//! `run_many_with_latents` emulate `num_samples > 1` by running the
-//! deterministic stages sequentially with per-sample seed offset
-//! `seed + sample_index` over the SAME conditioning. That is NOT batched DiT
-//! inference; the single-run entry points error on `num_samples != 1`.
+//! `num_samples` (upstream `run(num_samples)` batching): `num_samples = 1`
+//! keeps the single-output path and is bit-identical to the
+//! pre-`num_samples` behavior. `num_samples > 1` follows the upstream draw
+//! structure (`trellis2_image_to_3d.py:208, 253`): the sparse structure
+//! draws ONE joint noise tensor `[num_samples, 8, R, R, R]` per stage
+//! (`torch.randn(num_samples, in_channels, reso, reso, reso)`) and every
+//! SLAT stage draws ONE joint noise tensor over the concatenated active
+//! coords of all samples (`torch.randn(coords.shape[0], in_channels)`), all
+//! samples share one conditioning pass, and decoding/export run per sample.
+//! The Lux3D RNG is not bit-identical to `torch.randn` (locked decision 4),
+//! so the draws are distribution-equivalent, not value-identical, to the
+//! reference; only the draw structure matches. The single-run entry points
+//! error on `num_samples != 1`.
 //!
 //! `Trellis2Stages::write_latent_npz` is the upstream `return_latent=True`
 //! surface (`(out_mesh, (shape_slat, tex_slat, res))`): an `.npz` with
@@ -204,6 +210,18 @@ pub const TRELLIS2_CASCADE_UPSAMPLE_TIMES: usize = 4;
 /// RNG salt for the texture SLAT noise stream (`Trellis2Rng::new(seed ^
 /// SALT)`); the shape stages use their own salts so the streams differ.
 pub const TRELLIS2_TEX_NOISE_SALT: u64 = 0x534C_4154_5F54_4558;
+
+/// RNG salt for the sparse-structure noise stream. The upstream draws it
+/// from the globally seeded torch RNG (`torch.manual_seed(seed)` +
+/// `torch.randn(...)`, `trellis2_image_to_3d.py:208`); the Lux3D port keeps
+/// a distinct per-stage stream (documented RNG deviation).
+const TRELLIS2_SS_NOISE_SALT: u64 = 0x5353_5F4E_4F49_5345;
+
+/// RNG salt for the base (LR in the cascades) shape SLAT noise stream.
+const TRELLIS2_SHAPE_NOISE_SALT: u64 = 0x534C_4154_5F4E_4F49;
+
+/// RNG salt for the cascade HR shape SLAT noise stream.
+const TRELLIS2_HR_SHAPE_NOISE_SALT: u64 = 0x534C_4154_5F48_5231;
 
 /// `shape_slat_normalization.mean` (`pipeline.json`, 32 channels).
 pub const TRELLIS2_SHAPE_SLAT_MEAN: [f32; 32] = [
@@ -286,6 +304,90 @@ impl Trellis2Rng {
     pub fn randn(&mut self, len: usize) -> Vec<f32> {
         (0..len).map(|_| self.normal_f32()).collect()
     }
+}
+
+/// Draw the sparse-structure noise for `samples` joint samples as ONE tensor
+/// `[samples, 8, 16, 16, 16]` from a single RNG stream (upstream
+/// `torch.randn(num_samples, in_channels, reso, reso, reso)`,
+/// `trellis2_image_to_3d.py:208`). For `samples = 1` this consumes the exact
+/// same stream values in the same order as the legacy single-sample draw.
+fn draw_ss_noise(samples: usize, seed: u64, device: &Device) -> Result<Tensor> {
+    let ss_config = Trellis2SsConfig::trellis_2_4b();
+    // The SS flow latent lives on the DiT's dense grid
+    // (`ss_flow_img_dit_1_3B_64` -> resolution 16); the occupancy decode
+    // then upsamples to `ss_resolution`.
+    let latent_res = ss_config.resolution;
+    let mut rng = Trellis2Rng::new(seed ^ TRELLIS2_SS_NOISE_SALT);
+    let values = rng.randn(samples * ss_config.token_count() * ss_config.in_channels);
+    Tensor::from_vec(
+        values,
+        (
+            samples,
+            ss_config.in_channels,
+            latent_res,
+            latent_res,
+            latent_res,
+        ),
+        device,
+    )
+    .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+        message: format!("Trellis2 SS noise allocation failed: {source}"),
+    })
+}
+
+/// Draw one joint SLAT noise tensor `[rows, 32]` from a single RNG stream
+/// (upstream `torch.randn(coords.shape[0], in_channels)`,
+/// `trellis2_image_to_3d.py:253`; for batched runs `rows` is the total over
+/// all samples' active coords). For `rows = coords.len()` this consumes the
+/// exact same stream values in the same order as the legacy single-sample
+/// draw.
+fn draw_slat_noise(rows: usize, seed: u64, salt: u64, device: &Device) -> Result<Tensor> {
+    let mut rng = Trellis2Rng::new(seed ^ salt);
+    let values = rng.randn(rows * 32);
+    Tensor::from_vec(values, (rows, 32), device).map_err(|source| {
+        Lux3dError::CanonicalWeightsValidation {
+            message: format!("Trellis2 SLAT noise allocation failed: {source}"),
+        }
+    })
+}
+
+/// A `[rows, 32]` contiguous slice of a joint SLAT noise draw.
+fn noise_rows(noise: &Tensor, offset: usize, rows: usize) -> Result<Tensor> {
+    noise
+        .narrow(0, offset, rows)
+        .and_then(|slice| slice.contiguous())
+        .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+            message: format!("Trellis2 joint noise slice [{offset}, {rows}] failed: {source}"),
+        })
+}
+
+/// Tile a `[1, L, C]` conditioning tensor to `[samples, L, C]` (the upstream
+/// cross-attention broadcasts `cond` over the batch; the candle DiTs require
+/// matching batch sizes). `[samples, L, C]` passes through unchanged.
+fn repeat_cond_to_batch(cond: &Tensor, samples: usize) -> Result<Tensor> {
+    let (batch, tokens, channels) =
+        cond.dims3()
+            .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                message: format!("Trellis2 conditioning must be [B, L, C]: {source}"),
+            })?;
+    if batch == samples {
+        return Ok(cond.clone());
+    }
+    if batch == 1 {
+        return cond.repeat((samples, 1, 1)).map_err(|source| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "Trellis2 conditioning batch repeat to {samples} (L {tokens}, C {channels}) \
+                     failed: {source}"
+                ),
+            }
+        });
+    }
+    Err(Lux3dError::ModelAssetResolution {
+        message: format!(
+            "Trellis2 conditioning batch {batch} cannot be shared by {samples} samples"
+        ),
+    })
 }
 
 /// Stage-resolved pipeline parameters. Defaults mirror `pipeline.json`
@@ -772,7 +874,12 @@ impl Trellis2TextureExportOptions {
 /// base step count for all three stages otherwise.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Trellis2RunOptions {
-    /// RNG seed (42). `run_many_*` runs sample `i` with `seed + i`.
+    /// RNG seed (42). Multi-sample runs (`run_many_*`, `num_samples > 1`)
+    /// draw ONE joint noise tensor per stage from this seed, matching the
+    /// upstream `torch.manual_seed(seed)` + `torch.randn(num_samples, ...)` /
+    /// `torch.randn(coords.shape[0], ...)` structure
+    /// (`trellis2_image_to_3d.py:208, 253`); Lux3D RNG streams are not
+    /// bit-identical to torch (documented deviation).
     pub seed: u64,
     /// Pipeline variant (Cascade1024 by contract).
     pub pipeline_type: Trellis2PipelineType,
@@ -805,12 +912,14 @@ pub struct Trellis2RunOptions {
     pub max_num_tokens: usize,
     /// Run image preprocessing inside `run_from_path` (true).
     pub preprocess: bool,
-    /// Sample count (1). Upstream `run(num_samples)` batches the flows;
-    /// this port keeps single-output sampling — `num_samples = 1` is
-    /// bit-identical to the unbatched behavior and the single-run entry
-    /// points error on `num_samples != 1`; use `run_many_from_path` /
-    /// `run_many_with_latents` (sequential seed-offset emulation, NOT
-    /// batched inference).
+    /// Sample count (1). `num_samples = 1` keeps the single-output path
+    /// (bit-identical to the pre-`num_samples` behavior) and the single-run
+    /// entry points error on `num_samples != 1`. `run_many_from_path` /
+    /// `run_many_with_latents` implement `num_samples > 1` with the upstream
+    /// `run(num_samples)` draw structure: ONE joint sparse-structure noise
+    /// tensor `[N, 8, R, R, R]` and ONE joint SLAT noise tensor per stage
+    /// over all samples' coords (`trellis2_image_to_3d.py:208, 253`), one
+    /// shared conditioning pass, per-sample SLAT sampling / decode / export.
     pub num_samples: usize,
     /// Geometry post-process of the assembled mesh, applied BEFORE the
     /// texture stage attaches per-vertex colors (upstream `to_glb` mesh
@@ -1194,6 +1303,19 @@ pub struct Trellis2CascadeShape {
     pub hr_slat: Tensor,
 }
 
+/// Per-sample cascade products held between the batched LR/upsample phase
+/// and the joint HR / texture draws in
+/// [`Trellis2Pipeline::run_batched_core`]. Unlike [`Trellis2CascadeShape`]
+/// the HR SLAT is not part of the struct: the joint HR noise draw needs every
+/// sample's quantized coords first.
+struct Trellis2BatchedCascadePart {
+    ss_coords: Vec<[i32; 3]>,
+    lr_slat: Tensor,
+    hr_upsampled_coords: Vec<[i32; 3]>,
+    quant_coords: Vec<[i32; 3]>,
+    hr_resolution: u32,
+}
+
 /// Raw TRELLIS.2 checkpoint layout (`models/TRELLIS.2-4B`), stage prefix ->
 /// file relative path. The 1024 shape/texture DiTs serve the cascade; the
 /// texture decoder produces the per-voxel PBR attributes.
@@ -1516,26 +1638,91 @@ impl Trellis2Pipeline {
         device: &Device,
         ss_resolution: u32,
     ) -> Result<(Tensor, Vec<[i32; 3]>)> {
+        let (z_s, mut batch) = self.sample_sparse_structure_many(
+            cond,
+            neg_cond,
+            noise,
+            1,
+            seed,
+            params,
+            device,
+            ss_resolution,
+        )?;
+        Ok((
+            z_s,
+            batch
+                .pop()
+                .expect("sample_sparse_structure_many(1) yields one coord set"),
+        ))
+    }
+
+    /// Batched sparse-structure stage (`num_samples > 1`): ONE joint noise
+    /// draw `[samples, 8, R, R, R]` (upstream `torch.randn(num_samples, ...)`,
+    /// `trellis2_image_to_3d.py:208`), one batched flow pass (the `[1, L, C]`
+    /// conditioning is tiled over the batch) and one batched occupancy
+    /// decode; the active coords are returned per sample. `samples = 1`
+    /// consumes exactly the legacy single-sample stream values in the same
+    /// order.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn sample_sparse_structure_many(
+        &self,
+        cond: &Tensor,
+        neg_cond: &Tensor,
+        noise: Option<&Tensor>,
+        samples: usize,
+        seed: u64,
+        params: &Trellis2SamplerParams,
+        device: &Device,
+        ss_resolution: u32,
+    ) -> Result<(Tensor, Vec<Vec<[i32; 3]>>)> {
+        if samples == 0 {
+            return Err(Lux3dError::InvalidInput(
+                "Trellis2 sparse structure needs at least one sample",
+            ));
+        }
+        let ss_config = Trellis2SsConfig::trellis_2_4b();
         let noise = match noise {
-            Some(noise) => noise.clone(),
-            None => {
-                let mut rng = Trellis2Rng::new(seed ^ 0x5353_5F4E_4F49_5345);
-                let ss_config = Trellis2SsConfig::trellis_2_4b();
-                // The SS flow latent lives on the DiT's dense grid
-                // (`ss_flow_img_dit_1_3B_64` -> resolution 16); the
-                // occupancy decode then upsamples to `ss_resolution`.
-                let latent_res = ss_config.resolution;
-                let values = rng.randn(ss_config.token_count() * ss_config.in_channels);
-                Tensor::from_vec(
-                    values,
-                    (1, ss_config.in_channels, latent_res, latent_res, latent_res),
-                    device,
-                )
-                .map_err(|source| Lux3dError::CanonicalWeightsValidation {
-                    message: format!("Trellis2 SS noise allocation failed: {source}"),
-                })?
+            Some(noise) => {
+                let dims = noise.dims();
+                if dims.len() != 5
+                    || dims[1] != ss_config.in_channels
+                    || (dims[2], dims[3], dims[4])
+                        != (
+                            ss_config.resolution,
+                            ss_config.resolution,
+                            ss_config.resolution,
+                        )
+                {
+                    return Err(Lux3dError::ModelAssetResolution {
+                        message: format!(
+                            "Trellis2 SS init noise must be [N, {}, {}, {}, {}], got {dims:?}",
+                            ss_config.in_channels,
+                            ss_config.resolution,
+                            ss_config.resolution,
+                            ss_config.resolution
+                        ),
+                    });
+                }
+                match dims[0] {
+                    batch if batch == samples => noise.clone(),
+                    1 => noise.repeat((samples, 1, 1, 1, 1)).map_err(|source| {
+                        Lux3dError::CanonicalWeightsValidation {
+                            message: format!("Trellis2 SS noise batch repeat failed: {source}"),
+                        }
+                    })?,
+                    batch => {
+                        return Err(Lux3dError::ModelAssetResolution {
+                            message: format!(
+                                "Trellis2 SS init noise batch {batch} cannot seed {samples} samples"
+                            ),
+                        })
+                    }
+                }
             }
+            None => draw_ss_noise(samples, seed, device)?,
         };
+        let cond_batch = repeat_cond_to_batch(cond, samples)?;
+        let neg_cond_batch = repeat_cond_to_batch(neg_cond, samples)?;
         let stage_time = std::env::var_os("LUX3D_STAGE_TIME").is_some();
         let mut stage_start = std::time::Instant::now();
         let vb = self.stage_var_builder("ss_flow", device)?;
@@ -1555,8 +1742,8 @@ impl Trellis2Pipeline {
         let (z_s, _trace) = sample_dense(
             &|x: &Tensor, t_model: f32, c: &Tensor| ss_dit.forward(x, t_model, c),
             &noise,
-            cond,
-            neg_cond,
+            &cond_batch,
+            &neg_cond_batch,
             params,
         )
         .map_err(|source| Lux3dError::CanonicalWeightsValidation {
@@ -1608,12 +1795,19 @@ impl Trellis2Pipeline {
                 stage_start.elapsed().as_secs_f64()
             );
         }
-        let coords: Vec<[i32; 3]> = coords4
-            .iter()
-            .filter(|c| c[0] == 0)
-            .map(|c| [c[1], c[2], c[3]])
-            .collect();
-        Ok((z_s, coords))
+        let mut coords_by_sample = vec![Vec::new(); samples];
+        for coord in coords4 {
+            let batch = coord[0];
+            if batch < 0 || batch as usize >= samples {
+                return Err(Lux3dError::ModelAssetResolution {
+                    message: format!(
+                        "Trellis2 occupancy coord {coord:?} is outside the {samples}-sample batch"
+                    ),
+                });
+            }
+            coords_by_sample[batch as usize].push([coord[1], coord[2], coord[3]]);
+        }
+        Ok((z_s, coords_by_sample))
     }
 
     /// Shape SLAT stage (512): sample the (normalized) latent on `coords`
@@ -1632,7 +1826,7 @@ impl Trellis2Pipeline {
         self.sample_shape_slat_stage(
             "shape_dit_512",
             Trellis2SlatConfig::shape_512(),
-            0x534C_4154_5F4E_4F49,
+            TRELLIS2_SHAPE_NOISE_SALT,
             cond,
             neg_cond,
             coords,
@@ -1646,11 +1840,14 @@ impl Trellis2Pipeline {
     /// Cascade HR shape SLAT stage (`shape_dit_1024`): same sampler params,
     /// a distinct RNG salt so the HR noise stream differs from the LR one,
     /// and the elastic validation bound for the HR grid. Negative cond is
-    /// `zeros_like(cond)` exactly like the reference.
+    /// `zeros_like(cond)` exactly like the reference. `noise` allows an
+    /// injected `[N, 32]` start (batched joint draw; `None` = seeded RNG).
+    #[allow(clippy::too_many_arguments)]
     fn sample_shape_slat_hr(
         &self,
         cond: &Tensor,
         coords: &[[i32; 3]],
+        noise: Option<&Tensor>,
         seed: u64,
         params: &Trellis2SamplerParams,
         device: &Device,
@@ -1670,11 +1867,11 @@ impl Trellis2Pipeline {
         self.sample_shape_slat_stage(
             "shape_dit_1024",
             config,
-            0x534C_4154_5F48_5231,
+            TRELLIS2_HR_SHAPE_NOISE_SALT,
             cond,
             &neg_cond,
             coords,
-            None,
+            noise,
             seed,
             params,
             device,
@@ -1701,15 +1898,7 @@ impl Trellis2Pipeline {
     ) -> Result<Tensor> {
         let noise = match noise {
             Some(noise) => noise.clone(),
-            None => {
-                let mut rng = Trellis2Rng::new(seed ^ noise_salt);
-                let values = rng.randn(coords.len() * 32);
-                Tensor::from_vec(values, (coords.len(), 32), device).map_err(|source| {
-                    Lux3dError::CanonicalWeightsValidation {
-                        message: format!("Trellis2 SLAT noise allocation failed: {source}"),
-                    }
-                })?
-            }
+            None => draw_slat_noise(coords.len(), seed, noise_salt, device)?,
         };
         let vb = self.stage_var_builder(stage, device)?;
         let dit = Trellis2SlatDit::load(vb, &config).map_err(|source| {
@@ -1849,6 +2038,7 @@ impl Trellis2Pipeline {
         let hr_slat = self.sample_shape_slat_hr(
             cond_hr,
             &quant_coords,
+            None,
             seed,
             params,
             device,
@@ -2059,15 +2249,7 @@ impl Trellis2Pipeline {
         }
         let noise = match noise {
             Some(noise) => noise.clone(),
-            None => {
-                let mut rng = Trellis2Rng::new(seed ^ TRELLIS2_TEX_NOISE_SALT);
-                let values = rng.randn(coords.len() * 32);
-                Tensor::from_vec(values, (coords.len(), 32), device).map_err(|source| {
-                    Lux3dError::CanonicalWeightsValidation {
-                        message: format!("Trellis2 texture SLAT noise allocation failed: {source}"),
-                    }
-                })?
-            }
+            None => draw_slat_noise(coords.len(), seed, TRELLIS2_TEX_NOISE_SALT, device)?,
         };
         let shape_slat_norm = self.normalize_shape_slat(shape_slat_denorm)?;
         let vb = self.stage_var_builder(stage, device)?;
@@ -2407,6 +2589,518 @@ impl Trellis2Pipeline {
         }
     }
 
+    /// Batched multi-sample core (`num_samples > 1`, the upstream
+    /// `run(num_samples)` draw structure): ONE joint sparse-structure noise
+    /// draw `[N, 8, R, R, R]` (`trellis2_image_to_3d.py:208`), ONE joint
+    /// SLAT noise draw per SLAT stage over the concatenated per-sample coords
+    /// (`torch.randn(coords.shape[0], in_channels)`, `:253`), one shared
+    /// conditioning pass, the flow passes batched where the candle model
+    /// supports it (the dense SS DiT), and per-sample SLAT sampling /
+    /// VAE decode / post-process / export. `num_samples = 1` never reaches
+    /// this function: the `run_many_*` entry points keep the unbatched
+    /// single-pass path so its noise consumption and output stay
+    /// bit-identical.
+    #[allow(clippy::too_many_arguments, unused_assignments)]
+    fn run_batched_core(
+        &self,
+        cond: &Tensor,
+        neg_cond: &Tensor,
+        cond_hr: Option<&Tensor>,
+        ss_noise: Option<&Tensor>,
+        shape_init: Option<&Tensor>,
+        tex_init: Option<&Tensor>,
+        device: &Device,
+        options: &Trellis2RunOptions,
+    ) -> Result<Vec<Trellis2Stages>> {
+        let count = options.num_samples;
+        debug_assert!(count > 1, "run_batched_core requires num_samples > 1");
+        let (ss_resolution, decode_resolution) = self.resolutions(options)?;
+        let ss_params = resolve_stage_params(
+            &self.config.ss_sampler,
+            options.ss_sampler.as_ref(),
+            options.ss_steps,
+        );
+        let shape_params = resolve_stage_params(
+            &self.config.shape_sampler,
+            options.shape_sampler.as_ref(),
+            options.shape_steps,
+        );
+        let tex_params = resolve_stage_params(
+            &self.config.tex_sampler,
+            options.tex_sampler.as_ref(),
+            options.tex_steps,
+        );
+        options.postprocess.validate()?;
+        options.texture_export.validate()?;
+        let cond_shape = cond_hr.unwrap_or(cond);
+        let neg_cond_shape = Tensor::zeros_like(cond_shape).map_err(|source| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!("Trellis2 negative cond allocation failed: {source}"),
+            }
+        })?;
+        let stage_time = std::env::var_os("LUX3D_STAGE_TIME").is_some();
+        let mut stage_start = std::time::Instant::now();
+        macro_rules! stage_done {
+            ($name:expr) => {
+                if stage_time {
+                    eprintln!(
+                        "[stage] trellis2 {}: {:.2}s",
+                        $name,
+                        stage_start.elapsed().as_secs_f64()
+                    );
+                    stage_start = std::time::Instant::now();
+                }
+            };
+        }
+        if stage_time {
+            eprintln!(
+                "[stage] trellis2 batched num_samples: {count} (one conditioning pass, one joint \
+                 noise draw per stage)"
+            );
+        }
+        let (z_s, coords_by_sample) = self.sample_sparse_structure_many(
+            cond,
+            neg_cond,
+            ss_noise,
+            count,
+            options.seed,
+            &ss_params,
+            device,
+            ss_resolution,
+        )?;
+        for coords in &coords_by_sample {
+            if coords.is_empty() {
+                return Err(Lux3dError::InvalidInput(
+                    "Trellis2 sparse structure decoded to zero active voxels for a sample",
+                ));
+            }
+        }
+        stage_done!("ss");
+        let mut stages = Vec::with_capacity(count);
+        match options.pipeline_type {
+            Trellis2PipelineType::R512 | Trellis2PipelineType::R1024 => {
+                let single = matches!(options.pipeline_type, Trellis2PipelineType::R512);
+                let (shape_stage, shape_config, tex_stage, tex_config) = if single {
+                    (
+                        "shape_dit_512",
+                        Trellis2SlatConfig::shape_512(),
+                        "tex_dit_512",
+                        Trellis2SlatConfig::tex_512(),
+                    )
+                } else {
+                    (
+                        "shape_dit_1024",
+                        Trellis2SlatConfig::shape_1024(),
+                        "tex_dit_1024",
+                        Trellis2SlatConfig::tex_1024(),
+                    )
+                };
+                let total_rows: usize = coords_by_sample.iter().map(Vec::len).sum();
+                // ONE joint shape SLAT noise draw over every sample's active
+                // coords (the upstream draw shape has the concatenated
+                // coords in dim 0; `trellis2_image_to_3d.py:253`).
+                let shape_joint = match shape_init {
+                    Some(_) => None,
+                    None => Some(draw_slat_noise(
+                        total_rows,
+                        options.seed,
+                        TRELLIS2_SHAPE_NOISE_SALT,
+                        device,
+                    )?),
+                };
+                // ONE joint texture SLAT noise draw (same rows: the texture
+                // stage runs on the shape coords).
+                let tex_joint = if options.with_texture && tex_init.is_none() {
+                    Some(draw_slat_noise(
+                        total_rows,
+                        options.seed,
+                        TRELLIS2_TEX_NOISE_SALT,
+                        device,
+                    )?)
+                } else {
+                    None
+                };
+                let mut shape_latents = Vec::with_capacity(count);
+                let mut row_offset = 0_usize;
+                for coords in &coords_by_sample {
+                    let shape_latent = match shape_init {
+                        Some(latent) => {
+                            let rows = latent.dim(0).map_err(|source| {
+                                Lux3dError::CanonicalWeightsValidation {
+                                    message: format!("Trellis2 shape latent has no rows: {source}"),
+                                }
+                            })?;
+                            if rows != coords.len() {
+                                return Err(Lux3dError::ModelAssetResolution {
+                                    message: format!(
+                                        "shape latent row count {rows} does not match the active \
+                                         voxel count {}",
+                                        coords.len()
+                                    ),
+                                });
+                            }
+                            latent.clone()
+                        }
+                        None => {
+                            let joint = shape_joint.as_ref().expect("joint draw present");
+                            let slice = noise_rows(joint, row_offset, coords.len())?;
+                            self.sample_shape_slat_stage(
+                                shape_stage,
+                                shape_config.clone(),
+                                TRELLIS2_SHAPE_NOISE_SALT,
+                                cond_shape,
+                                &neg_cond_shape,
+                                coords,
+                                Some(&slice),
+                                options.seed,
+                                &shape_params,
+                                device,
+                            )?
+                        }
+                    };
+                    row_offset += coords.len();
+                    shape_latents.push(shape_latent);
+                }
+                stage_done!("shape spatial");
+                let mut tex_latents = Vec::with_capacity(count);
+                let mut tex_offset = 0_usize;
+                for (index, coords) in coords_by_sample.iter().enumerate() {
+                    let tex_latent = if !options.with_texture {
+                        None
+                    } else {
+                        match tex_init {
+                            Some(latent) => {
+                                let rows = latent.dim(0).map_err(|source| {
+                                    Lux3dError::CanonicalWeightsValidation {
+                                        message: format!(
+                                            "Trellis2 texture latent has no rows: {source}"
+                                        ),
+                                    }
+                                })?;
+                                if rows != coords.len() {
+                                    return Err(Lux3dError::ModelAssetResolution {
+                                        message: format!(
+                                            "texture latent row count {rows} does not match the \
+                                             shape latent coord count {}",
+                                            coords.len()
+                                        ),
+                                    });
+                                }
+                                Some(latent.clone())
+                            }
+                            None => {
+                                let joint = tex_joint.as_ref().expect("joint draw present");
+                                let slice = noise_rows(joint, tex_offset, coords.len())?;
+                                Some(self.sample_tex_slat_stage(
+                                    tex_stage,
+                                    tex_config.clone(),
+                                    cond_shape,
+                                    &shape_latents[index],
+                                    coords,
+                                    Some(&slice),
+                                    options.seed,
+                                    &tex_params,
+                                    device,
+                                )?)
+                            }
+                        }
+                    };
+                    tex_offset += coords.len();
+                    tex_latents.push(tex_latent);
+                }
+                stage_done!("texture spatial");
+                for (index, coords) in coords_by_sample.iter().enumerate() {
+                    let shape_latent = &shape_latents[index];
+                    let (decoded, mesh) =
+                        self.decode_shape_vae(coords, shape_latent, device, decode_resolution)?;
+                    let mut mesh = self.assemble_mesh(
+                        decode_resolution,
+                        mesh,
+                        &decoded.coords,
+                        &decoded.feats,
+                    )?;
+                    let snap_surface = Self::capture_bake_snap_surface(&mesh, options)?;
+                    mesh = self.postprocess_decoded_mesh(mesh, &options.postprocess)?;
+                    let tex_attrs = match &tex_latents[index] {
+                        Some(tex_latent) => {
+                            let (tex_coords, attrs) = self.decode_tex_attrs(
+                                coords,
+                                tex_latent,
+                                &decoded.subdiv_logits,
+                                device,
+                            )?;
+                            assert_eq!(
+                                tex_coords, decoded.coords,
+                                "guided texture decode coords must equal the shape decode coords"
+                            );
+                            self.attach_texture(
+                                &mut mesh,
+                                &decoded.coords,
+                                &attrs,
+                                decode_resolution,
+                            )?;
+                            Some(attrs)
+                        }
+                        None => None,
+                    };
+                    let textured = self.build_textured_mesh(
+                        &mesh,
+                        &options.texture_export,
+                        snap_surface.as_ref(),
+                    )?;
+                    stages.push(Trellis2Stages {
+                        cond: cond.clone(),
+                        neg_cond: neg_cond.clone(),
+                        z_s: Some(noise_rows(&z_s, index, 1)?),
+                        ss_coords: coords.clone(),
+                        shape_coords: coords.clone(),
+                        shape_latent: shape_latent.clone(),
+                        decoded_feats: decoded.feats,
+                        mesh: Some(mesh),
+                        lr_shape_latent: None,
+                        hr_upsampled_coords: None,
+                        quant_coords: None,
+                        hr_resolution: None,
+                        subdiv_logits: decoded.subdiv_logits,
+                        tex_latent: tex_latents[index].clone(),
+                        tex_attrs,
+                        textured,
+                    });
+                }
+                stage_done!("decode+postprocess+export");
+            }
+            Trellis2PipelineType::Cascade1024 | Trellis2PipelineType::Cascade1536 => {
+                let lr_noise = match shape_init {
+                    Some(_) => None,
+                    None => Some(draw_slat_noise(
+                        coords_by_sample.iter().map(Vec::len).sum(),
+                        options.seed,
+                        TRELLIS2_SHAPE_NOISE_SALT,
+                        device,
+                    )?),
+                };
+                // LR shape SLAT per sample (the candle sparse DiT is single
+                // sample) + deterministic upsample/quantize. The LR noise
+                // rows come from the ONE joint draw.
+                let mut parts: Vec<Trellis2BatchedCascadePart> = Vec::with_capacity(count);
+                let mut row_offset = 0_usize;
+                for coords in &coords_by_sample {
+                    let lr_slat = match shape_init {
+                        Some(latent) => {
+                            let rows = latent.dim(0).map_err(|source| {
+                                Lux3dError::CanonicalWeightsValidation {
+                                    message: format!("Trellis2 shape latent has no rows: {source}"),
+                                }
+                            })?;
+                            if rows != coords.len() {
+                                return Err(Lux3dError::ModelAssetResolution {
+                                    message: format!(
+                                        "LR shape latent row count {rows} does not match the \
+                                         active voxel count {}",
+                                        coords.len()
+                                    ),
+                                });
+                            }
+                            latent.clone()
+                        }
+                        None => {
+                            let joint = lr_noise.as_ref().expect("joint draw present");
+                            let slice = noise_rows(joint, row_offset, coords.len())?;
+                            self.sample_shape_slat_stage(
+                                "shape_dit_512",
+                                Trellis2SlatConfig::shape_512(),
+                                TRELLIS2_SHAPE_NOISE_SALT,
+                                cond,
+                                neg_cond,
+                                coords,
+                                Some(&slice),
+                                options.seed,
+                                &shape_params,
+                                device,
+                            )?
+                        }
+                    };
+                    row_offset += coords.len();
+                    let (hr_upsampled_coords, quant_coords, hr_resolution) = self
+                        .upsample_and_quantize_shape_slat(
+                            coords,
+                            &lr_slat,
+                            options.max_num_tokens,
+                            decode_resolution,
+                            device,
+                        )?;
+                    if quant_coords.is_empty() {
+                        return Err(Lux3dError::InvalidInput(
+                            "Trellis2 cascade quantized the upsampled coords to zero HR tokens",
+                        ));
+                    }
+                    parts.push(Trellis2BatchedCascadePart {
+                        ss_coords: coords.clone(),
+                        lr_slat,
+                        hr_upsampled_coords,
+                        quant_coords,
+                        hr_resolution,
+                    });
+                }
+                stage_done!("shape spatial (LR + upsample)");
+                // ONE joint HR noise draw over every sample's quantized
+                // coords (`torch.randn(coords.shape[0], in_channels)` after
+                // the unique/budget loop, `trellis2_image_to_3d.py:343`).
+                let total_hr_rows: usize = parts.iter().map(|part| part.quant_coords.len()).sum();
+                let hr_joint = draw_slat_noise(
+                    total_hr_rows,
+                    options.seed,
+                    TRELLIS2_HR_SHAPE_NOISE_SALT,
+                    device,
+                )?;
+                let mut hr_latents = Vec::with_capacity(count);
+                let mut hr_offset = 0_usize;
+                for part in &parts {
+                    let grid = (part.hr_resolution / 16) as usize;
+                    let slice = noise_rows(&hr_joint, hr_offset, part.quant_coords.len())?;
+                    hr_offset += part.quant_coords.len();
+                    hr_latents.push(self.sample_shape_slat_hr(
+                        cond_shape,
+                        &part.quant_coords,
+                        Some(&slice),
+                        options.seed,
+                        &shape_params,
+                        device,
+                        grid,
+                    )?);
+                }
+                stage_done!("shape spatial (HR)");
+                // ONE joint texture noise draw over the HR shape coords,
+                // drawn after the shape SLAT stages like the reference
+                // (`sample_tex_slat`, `trellis2_image_to_3d.py:412`).
+                let tex_joint = if options.with_texture && tex_init.is_none() {
+                    Some(draw_slat_noise(
+                        total_hr_rows,
+                        options.seed,
+                        TRELLIS2_TEX_NOISE_SALT,
+                        device,
+                    )?)
+                } else {
+                    None
+                };
+                let mut tex_latents = Vec::with_capacity(count);
+                let mut tex_offset = 0_usize;
+                for (index, part) in parts.iter().enumerate() {
+                    let tex_latent = if !options.with_texture {
+                        None
+                    } else {
+                        match tex_init {
+                            Some(latent) => {
+                                let rows = latent.dim(0).map_err(|source| {
+                                    Lux3dError::CanonicalWeightsValidation {
+                                        message: format!(
+                                            "Trellis2 texture latent has no rows: {source}"
+                                        ),
+                                    }
+                                })?;
+                                if rows != part.quant_coords.len() {
+                                    return Err(Lux3dError::ModelAssetResolution {
+                                        message: format!(
+                                            "texture latent row count {rows} does not match the \
+                                             HR coord count {}",
+                                            part.quant_coords.len()
+                                        ),
+                                    });
+                                }
+                                Some(latent.clone())
+                            }
+                            None => {
+                                let joint = tex_joint.as_ref().expect("joint draw present");
+                                let slice = noise_rows(joint, tex_offset, part.quant_coords.len())?;
+                                Some(self.sample_tex_slat_stage(
+                                    "tex_dit_1024",
+                                    if (part.hr_resolution / 16) as usize > 64 {
+                                        Trellis2SlatConfig::tex_1536()
+                                    } else {
+                                        Trellis2SlatConfig::tex_1024()
+                                    },
+                                    cond_shape,
+                                    &hr_latents[index],
+                                    &part.quant_coords,
+                                    Some(&slice),
+                                    options.seed,
+                                    &tex_params,
+                                    device,
+                                )?)
+                            }
+                        }
+                    };
+                    tex_offset += part.quant_coords.len();
+                    tex_latents.push(tex_latent);
+                }
+                stage_done!("texture spatial");
+                for (index, part) in parts.iter().enumerate() {
+                    let (decoded, mesh) = self.decode_shape_vae(
+                        &part.quant_coords,
+                        &hr_latents[index],
+                        device,
+                        part.hr_resolution,
+                    )?;
+                    let mut mesh = self.assemble_mesh(
+                        part.hr_resolution,
+                        mesh,
+                        &decoded.coords,
+                        &decoded.feats,
+                    )?;
+                    let snap_surface = Self::capture_bake_snap_surface(&mesh, options)?;
+                    mesh = self.postprocess_decoded_mesh(mesh, &options.postprocess)?;
+                    let tex_attrs = match &tex_latents[index] {
+                        Some(tex_latent) => {
+                            let (tex_coords, attrs) = self.decode_tex_attrs(
+                                &part.quant_coords,
+                                tex_latent,
+                                &decoded.subdiv_logits,
+                                device,
+                            )?;
+                            assert_eq!(
+                                tex_coords, decoded.coords,
+                                "guided texture decode coords must equal the shape decode coords"
+                            );
+                            self.attach_texture(
+                                &mut mesh,
+                                &decoded.coords,
+                                &attrs,
+                                part.hr_resolution,
+                            )?;
+                            Some(attrs)
+                        }
+                        None => None,
+                    };
+                    let textured = self.build_textured_mesh(
+                        &mesh,
+                        &options.texture_export,
+                        snap_surface.as_ref(),
+                    )?;
+                    stages.push(Trellis2Stages {
+                        cond: cond.clone(),
+                        neg_cond: neg_cond.clone(),
+                        z_s: Some(noise_rows(&z_s, index, 1)?),
+                        ss_coords: part.ss_coords.clone(),
+                        shape_coords: part.quant_coords.clone(),
+                        shape_latent: hr_latents[index].clone(),
+                        decoded_feats: decoded.feats,
+                        mesh: Some(mesh),
+                        lr_shape_latent: Some(part.lr_slat.clone()),
+                        hr_upsampled_coords: Some(part.hr_upsampled_coords.clone()),
+                        quant_coords: Some(part.quant_coords.clone()),
+                        hr_resolution: Some(part.hr_resolution),
+                        subdiv_logits: decoded.subdiv_logits,
+                        tex_latent: tex_latents[index].clone(),
+                        tex_attrs,
+                        textured,
+                    });
+                }
+                stage_done!("decode+postprocess+export");
+            }
+        }
+        Ok(stages)
+    }
+
     /// Single-resolution core for `512` and `1024` (shared; the reference
     /// duplicates the two branches in `run(...)`): SS stage (unless
     /// `coords_override`) on `cond_ss`, shape SLAT stage (unless
@@ -2498,7 +3192,7 @@ impl Trellis2Pipeline {
             None => self.sample_shape_slat_stage(
                 shape_stage,
                 shape_config,
-                0x534C_4154_5F4E_4F49,
+                TRELLIS2_SHAPE_NOISE_SALT,
                 cond_shape,
                 &neg_cond_shape,
                 &ss_coords,
@@ -2727,6 +3421,7 @@ impl Trellis2Pipeline {
         let hr_slat = self.sample_shape_slat_hr(
             cond_hr,
             &quant_coords,
+            None,
             options.seed,
             shape_params,
             device,
@@ -2849,16 +3544,16 @@ impl Trellis2Pipeline {
     }
 
     /// Guard the single-output entry points against the multi-sample mode:
-    /// the upstream `run(num_samples)` batch is emulated by
-    /// [`Self::run_many_from_path`] / [`Self::run_many_with_latents`]
-    /// (sequential per-sample seed offsets), so `num_samples != 1` must not
-    /// silently run once.
+    /// the upstream `run(num_samples)` batch is implemented by
+    /// [`Self::run_many_from_path`] / [`Self::run_many_with_latents`] (joint
+    /// per-stage noise draws + per-sample decode), so `num_samples != 1`
+    /// must not silently run once.
     fn check_single_sample(options: &Trellis2RunOptions) -> Result<()> {
         if options.num_samples != 1 {
             return Err(Lux3dError::ContractValidation {
                 message: format!(
                     "Trellis2 num_samples = {} requires the run_many_* entry points \
-                     (sequential seed-offset emulation); the single-output runs accept \
+                     (joint per-stage noise draws); the single-output runs accept \
                      num_samples = 1 only",
                     options.num_samples
                 ),
@@ -3036,10 +3731,13 @@ impl Trellis2Pipeline {
     }
 
     /// Multi-sample surface (`num_samples > 1`): the upstream
-    /// `run(num_samples)` batching is emulated by running the deterministic
-    /// stages sequentially, sample `i` with seed `options.seed + i` over the
-    /// SAME injected conditioning and stage tensors. This is NOT batched DiT
-    /// inference; `num_samples = 1` is bit-identical to
+    /// `run(num_samples)` draw structure — one joint sparse-structure noise
+    /// draw `[N, 8, R, R, R]`, one joint SLAT noise draw per stage over all
+    /// samples' coords, one shared conditioning pass — with per-sample SLAT
+    /// sampling / decode / export. The injected `ss_init` seeds the batch
+    /// (a `[1, ...]` tensor is tiled over the samples, the legacy behavior);
+    /// `shape_init`/`tex_init` are validated per sample. `num_samples = 1`
+    /// keeps the unbatched single pass and is bit-identical to
     /// [`Self::run_with_latents`].
     pub fn run_many_with_latents(
         &self,
@@ -3081,12 +3779,10 @@ impl Trellis2Pipeline {
             Tensor::zeros_like(cond).map_err(|source| Lux3dError::CanonicalWeightsValidation {
                 message: format!("Trellis2 negative cond allocation failed: {source}"),
             })?;
-        let mut stages = Vec::with_capacity(count);
-        for index in 0..count {
-            let mut sample_options = options.clone();
-            sample_options.num_samples = 1;
-            sample_options.seed = options.seed.wrapping_add(index as u64);
-            stages.push(self.run_core(
+        if count == 1 {
+            // Keep the single-sample pass byte-for-byte: same call, same
+            // noise consumption order.
+            return Ok(vec![self.run_core(
                 cond,
                 &neg_cond,
                 None,
@@ -3096,19 +3792,26 @@ impl Trellis2Pipeline {
                 shape_init,
                 tex_init,
                 device,
-                &sample_options,
-            )?);
+                options,
+            )?]);
         }
-        Ok(stages)
+        self.run_batched_core(
+            cond,
+            &neg_cond,
+            None,
+            Some(ss_init),
+            shape_init,
+            tex_init,
+            device,
+            options,
+        )
     }
 
     /// Multi-sample surface from an image path (`num_samples > 1`): the
-    /// upstream `run(num_samples)` batching is emulated by running the
-    /// deterministic stages sequentially, sample `i` with seed
-    /// `options.seed + i` over the SAME preprocessing and conditioning (the
-    /// crop and both DINOv3 passes run once). This is NOT batched DiT
-    /// inference; `num_samples = 1` returns exactly one element and is
-    /// bit-identical to [`Self::run_from_path_with_stages`].
+    /// upstream `run(num_samples)` draw structure (see
+    /// [`Self::run_batched_core`]) over ONE preprocessing + DINOv3
+    /// conditioning pass. `num_samples = 1` returns exactly one element and
+    /// is bit-identical to [`Self::run_from_path_with_stages`].
     pub fn run_many_from_path(
         &self,
         path: &Path,
@@ -3137,12 +3840,10 @@ impl Trellis2Pipeline {
             let (cond, neg_cond) = self.image_conditioning(&prepared, device)?;
             (cond, neg_cond, None)
         };
-        let mut stages = Vec::with_capacity(options.num_samples);
-        for index in 0..options.num_samples {
-            let mut sample_options = options.clone();
-            sample_options.num_samples = 1;
-            sample_options.seed = options.seed.wrapping_add(index as u64);
-            stages.push(self.run_core(
+        if options.num_samples == 1 {
+            // Keep the single-sample pass byte-for-byte: same call, same
+            // noise consumption order.
+            return Ok(vec![self.run_core(
                 &cond,
                 &neg_cond,
                 cond_hr.as_ref(),
@@ -3152,10 +3853,19 @@ impl Trellis2Pipeline {
                 None,
                 None,
                 device,
-                &sample_options,
-            )?);
+                options,
+            )?]);
         }
-        Ok(stages)
+        self.run_batched_core(
+            &cond,
+            &neg_cond,
+            cond_hr.as_ref(),
+            None,
+            None,
+            None,
+            device,
+            options,
+        )
     }
 
     /// Write the mesh buffers with the TRELLIS.2 export stage.
@@ -3184,6 +3894,152 @@ impl Trellis2Pipeline {
 mod tests {
     use super::*;
     use crate::geometry::Trellis2MeshBuffers;
+
+    fn tensor_values(tensor: &Tensor) -> Vec<f32> {
+        tensor
+            .flatten_all()
+            .expect("flatten")
+            .to_vec1::<f32>()
+            .expect("to_vec1")
+    }
+
+    /// `num_samples > 1` draws ONE joint sparse-structure noise tensor
+    /// `[N, 8, 16, 16, 16]` from a single stream — the upstream
+    /// `torch.randn(num_samples, in_channels, reso, reso, reso)`
+    /// (`trellis2_image_to_3d.py:208`) — not the old per-sample
+    /// `seed + i` sequential emulation. The first sample slice is exactly
+    /// the `num_samples = 1` draw.
+    #[test]
+    fn batched_ss_noise_is_one_joint_draw() {
+        let device = Device::Cpu;
+        let seed = 1234_u64;
+        let config = Trellis2SsConfig::trellis_2_4b();
+        let samples = 2_usize;
+
+        let joint = draw_ss_noise(samples, seed, &device).expect("joint SS draw");
+        assert_eq!(
+            joint.dims(),
+            &[
+                samples,
+                config.in_channels,
+                config.resolution,
+                config.resolution,
+                config.resolution
+            ]
+        );
+        let values = tensor_values(&joint);
+        let expected = Trellis2Rng::new(seed ^ TRELLIS2_SS_NOISE_SALT)
+            .randn(samples * config.token_count() * config.in_channels);
+        assert_eq!(values, expected, "the batch must come from ONE draw");
+
+        let single = draw_ss_noise(1, seed, &device).expect("single SS draw");
+        let single_values = tensor_values(&single);
+        assert_eq!(
+            &values[..single_values.len()],
+            &single_values[..],
+            "sample 0 must be the num_samples = 1 draw"
+        );
+        let offset_draw = draw_ss_noise(1, seed + 1, &device).expect("seed + 1 draw");
+        assert_ne!(
+            &values[single_values.len()..],
+            &tensor_values(&offset_draw)[..],
+            "sample 1 must continue the joint stream, not use seed + 1"
+        );
+    }
+
+    /// One joint SLAT noise draw `[rows, 32]` over the concatenated
+    /// per-sample coords (`torch.randn(coords.shape[0], in_channels)`,
+    /// `trellis2_image_to_3d.py:253`): a prefix of a larger joint draw is
+    /// the smaller draw from the same seed/salt.
+    #[test]
+    fn batched_slat_noise_is_one_joint_draw() {
+        let device = Device::Cpu;
+        let seed = 99_u64;
+        let joint =
+            draw_slat_noise(13, seed, TRELLIS2_SHAPE_NOISE_SALT, &device).expect("joint SLAT draw");
+        assert_eq!(joint.dims(), &[13, 32]);
+        assert_eq!(
+            tensor_values(&joint),
+            Trellis2Rng::new(seed ^ TRELLIS2_SHAPE_NOISE_SALT).randn(13 * 32)
+        );
+
+        let prefix =
+            draw_slat_noise(5, seed, TRELLIS2_SHAPE_NOISE_SALT, &device).expect("prefix SLAT draw");
+        assert_eq!(
+            &tensor_values(&joint)[..5 * 32],
+            &tensor_values(&prefix)[..],
+            "the joint stream prefix must match the smaller draw"
+        );
+
+        // The per-sample slices are contiguous [rows_i, 32] views of the one
+        // joint tensor in row order.
+        let slice = noise_rows(&joint, 5, 4).expect("slice");
+        assert_eq!(slice.dims(), &[4, 32]);
+        assert_eq!(
+            tensor_values(&slice),
+            tensor_values(&joint)[5 * 32..9 * 32].to_vec()
+        );
+    }
+
+    /// Regression guard for `num_samples = 1`: the joint-draw helpers consume
+    /// the exact legacy single-sample stream values in the same order, so
+    /// the single-output path (and `run_many_*` with N = 1, which keeps the
+    /// unbatched call) is bit-identical to the pre-`num_samples` behavior.
+    #[test]
+    fn single_sample_noise_matches_the_legacy_single_pass() {
+        let device = Device::Cpu;
+        let seed = 42_u64;
+        let config = Trellis2SsConfig::trellis_2_4b();
+        assert_eq!(
+            tensor_values(&draw_ss_noise(1, seed, &device).expect("SS draw")),
+            Trellis2Rng::new(seed ^ TRELLIS2_SS_NOISE_SALT)
+                .randn(config.token_count() * config.in_channels),
+            "single-sample SS draw order changed"
+        );
+        let rows = 7_usize;
+        assert_eq!(
+            tensor_values(
+                &draw_slat_noise(rows, seed, TRELLIS2_SHAPE_NOISE_SALT, &device)
+                    .expect("shape draw")
+            ),
+            Trellis2Rng::new(seed ^ TRELLIS2_SHAPE_NOISE_SALT).randn(rows * 32),
+            "single-sample shape SLAT draw order changed"
+        );
+        assert_eq!(
+            tensor_values(
+                &draw_slat_noise(rows, seed, TRELLIS2_TEX_NOISE_SALT, &device)
+                    .expect("texture draw")
+            ),
+            Trellis2Rng::new(seed ^ TRELLIS2_TEX_NOISE_SALT).randn(rows * 32),
+            "single-sample texture SLAT draw order changed"
+        );
+    }
+
+    /// The `[1, L, C]` conditioning pass is tiled over the batch, and a
+    /// `[N, L, C]` tensor passes through unchanged.
+    #[test]
+    fn conditioning_batch_tiling_shares_one_pass() {
+        let device = Device::Cpu;
+        let cond = Tensor::from_vec(
+            (0..24).map(|v| v as f32).collect::<Vec<f32>>(),
+            (1, 6, 4),
+            &device,
+        )
+        .expect("cond");
+        let tiled = repeat_cond_to_batch(&cond, 3).expect("tile");
+        assert_eq!(tiled.dims(), &[3, 6, 4]);
+        let all = tensor_values(&tiled);
+        let one = tensor_values(&cond);
+        for sample in 0..3 {
+            assert_eq!(&all[sample * one.len()..(sample + 1) * one.len()], &one[..]);
+        }
+        assert_eq!(
+            repeat_cond_to_batch(&tiled, 3)
+                .expect("already batched")
+                .dims(),
+            &[3, 6, 4]
+        );
+    }
 
     /// Full `resolution^3` PBR grid whose base color ramps along Z (the same
     /// fixture the `pbr_bake` snap tests use): a sample at `z = 0` is the

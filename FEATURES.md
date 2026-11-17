@@ -733,19 +733,29 @@ As a user, I can override steps, guidance, rescale and guidance interval per sta
 **Tests:** `trellis2_variants::resolve_stage_params_merge_precedence`, CLI
 `run_trellis2_parses_1536_cascade_and_per_stage_flags` ✅
 
-### US-16.3: Sequential multi-sample runs
-As a user, I can generate N samples with distinct seeds.
+### US-16.3: Batched multi-sample runs
+As a user, I can generate N samples with the upstream joint-draw structure.
 
 **Functions:**
 - `runtime/trellis2.rs:Trellis2Pipeline::run_many_from_path()` /
-  `run_many_with_latents()` — sequential per-sample passes (seed `seed + i`, shared
-  conditioning); NOT batched DiT inference ✅
+  `run_many_with_latents()` — the upstream `run(num_samples)` draw structure
+  (`trellis2_image_to_3d.py:208, 253`): ONE joint sparse-structure noise
+  tensor `[N, 8, R, R, R]` (`torch.randn(num_samples, ...)`) and ONE joint
+  SLAT noise tensor per stage over all samples' concatenated coords
+  (`torch.randn(coords.shape[0], in_channels)`), one shared conditioning pass,
+  per-sample SLAT sampling / VAE decode / post-process / export. The Lux3D RNG
+  is not bit-identical to `torch.randn`, so the draws are
+  distribution-equivalent, not value-identical, to the reference ✅
 - `Trellis2RunOptions::num_samples`; `num_samples = 0` rejected; single-run entry points
-  reject `num_samples != 1` and point at `run_many_*` ✅
+  reject `num_samples != 1` and point at `run_many_*`; `num_samples = 1` keeps the
+  unbatched single pass (same call, same noise consumption order) ✅
 - `cli.rs:sample_output_path()` — `_0`, `_1`, ... suffixes on both the mesh output and
   `--return-latent` path ✅
 
 **Tests:** `pipeline_trellis2` (`num_samples > 1` rejection and `num_samples = 0`),
+`trellis2::tests::batched_ss_noise_is_one_joint_draw`,
+`trellis2::tests::batched_slat_noise_is_one_joint_draw`,
+`trellis2::tests::single_sample_noise_matches_the_legacy_single_pass`,
 CLI option-mapping tests ✅
 
 ### US-16.4: Latent NPZ export
