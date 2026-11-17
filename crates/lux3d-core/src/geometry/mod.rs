@@ -1,4 +1,5 @@
 mod dual_grid;
+mod mesh_bvh;
 mod mesh_ops;
 mod pbr_bake;
 mod pi3;
@@ -11,6 +12,7 @@ mod vggt;
 pub use dual_grid::{
     DualGridVoxelization, MAX_GRID_SIZE_PER_AXIS, MeshToDualGridOptions, mesh_to_flexible_dual_grid,
 };
+pub use mesh_bvh::{ClosestPoint, MeshBvh};
 pub use mesh_ops::{
     MeshEditResult, compact_mesh, fill_holes, fill_holes_with_centroids, merge_close_vertices,
     postprocess_mesh, remove_duplicate_faces, remove_small_connected_components,
