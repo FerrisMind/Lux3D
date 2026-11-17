@@ -20,7 +20,7 @@ As a user, I can run `lux3d inspect|weights normalize|run <family>` and get corr
 - `main.rs:main()` — Entry point ✅
 - `cli.rs:Cli` — Clap parser struct ✅
 - `cli.rs:Command::Inspect` / `Weights` / `Run` — Subcommand enum ✅
-- `cli.rs:Family` — Pi3 / Pi3x / Triposr enum ✅
+- `cli.rs:Family` — Pi3 / Pi3x / Triposr / Triposg / Vggt / Trellis2 enum ✅
 - `cli.rs:InjectCondition` — Pose / Depth / Ray / Intrinsic enum ✅
 
 **Tests:** `tests/run_args.rs` ✅
@@ -43,7 +43,7 @@ As a maintainer, I can run `lux3d weights normalize` to canonicalize raw weights
 **Functions:**
 - `cli.rs:normalize_weights()` — Calls Python baseline script ✅
 - `cli.rs:python_executable()` — Resolves Python binary ✅
-- `cli.rs:canonical_package_dir()` — Finds canonical weight package ✅
+- `lux3d_core::test_support::canonical_package_dir()` — Finds canonical weight package (test-support helper; imported by `cli.rs` tests) ✅
 
 **Tests:** None found 🔍
 
@@ -55,7 +55,7 @@ As a user, I can run `lux3d run <family> --source <input> --output <file>` to pr
 **Functions:**
 - `cli.rs:run_model()` — Main inference dispatcher ✅
 - `cli.rs:RunArgs` — All run parameters ✅
-- `cli.rs:Command::run()` — Builds RunArgs from parsed CLI ✅
+- `main.rs:25` (`Command::Run`) + `cli.rs:run_model()` — Dispatch from the parsed CLI ✅
 
 **Tests:** `tests/run_args.rs` covers model_path & cache_dir ✅
 
@@ -488,7 +488,7 @@ As the runtime, images are loaded and resized for model input.
 The library defines typed errors for all failure modes.
 
 **Functions:**
-- `error.rs:Lux3dError` — 18 error variants ✅
+- `error.rs:Lux3dError` — 17 error variants ✅
 - `error.rs:Result<T>` — Type alias ✅
 
 **Tests:** None needed ✅
