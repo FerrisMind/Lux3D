@@ -14,6 +14,7 @@ use image::imageops::FilterType;
 
 mod attention_math;
 mod nn_blocks;
+mod npy;
 
 /// Re-exported so the weights module (and its tests) can reshape GGUF-stored
 /// rank>4 tensors without reaching into the private `nn_blocks` module.

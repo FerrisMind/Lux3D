@@ -137,9 +137,10 @@ pub struct RunArgs {
 
     #[arg(
         long,
-        help = "Input source: a frame directory (.png/.jpg/.jpeg), a video file (.mp4/.mov/.avi/.mkv), or - for `vggt` - a single image file (.png/.jpg/.jpeg/.webp/.bmp/.tif/.tiff)."
+        required_unless_present = "surface_input",
+        help = "Input source: a frame directory (.png/.jpg/.jpeg), a video file (.mp4/.mov/.avi/.mkv), or - for `vggt` - a single image file (.png/.jpg/.jpeg/.webp/.bmp/.tif/.tiff). Mutually exclusive with `--surface-input`."
     )]
-    pub source: PathBuf,
+    pub source: Option<PathBuf>,
 
     #[arg(long)]
     pub interval: Option<usize>,
@@ -243,6 +244,13 @@ pub struct RunArgs {
         help = "TripoSG explicit timestep schedule override as comma-separated floats (e.g. 999,777,500,250,0): the denoise loop runs EXACTLY these timesteps and `--steps` is ignored (upstream `retrieve_timesteps` derives the step count from the list length)."
     )]
     pub timesteps: Option<String>,
+
+    #[arg(
+        long,
+        conflicts_with = "source",
+        help = "TripoSG VAE surface encode input (reference `scripts/inference_vae.py`): a `.npy` holding the pickled dict written by `np.save(path, {\"surface_points\": [N, 3], \"surface_normals\": [N, 3]})`. Skips image-to-3D/DINO/denoise, encodes the sampled 204800-point subset, and decodes the latent with the reference hierarchical extractor (flash decoder off, dense depth 8, hierarchical depth 9 unless overridden). Mutually exclusive with `--source`."
+    )]
+    pub surface_input: Option<PathBuf>,
 
     #[arg(
         long,
@@ -990,7 +998,7 @@ pub fn run_model(args: RunArgs) -> anyhow::Result<PathBuf> {
             reject_trellis2_only_options(&args, args.family)?;
             run_pi3(
                 model_assets,
-                &args.source,
+                required_source(&args, "pi3")?,
                 args.interval,
                 &args.output,
                 &device,
@@ -1002,7 +1010,7 @@ pub fn run_model(args: RunArgs) -> anyhow::Result<PathBuf> {
             reject_trellis2_only_options(&args, args.family)?;
             run_pi3x(
                 model_assets,
-                &args.source,
+                required_source(&args, "pi3x")?,
                 args.conditions.as_deref(),
                 args.interval,
                 args.vo,
@@ -1020,7 +1028,7 @@ pub fn run_model(args: RunArgs) -> anyhow::Result<PathBuf> {
             reject_trellis2_only_options(&args, args.family)?;
             run_triposr(
                 model_assets,
-                &args.source,
+                required_source(&args, "triposr")?,
                 args.mc_resolution.unwrap_or(256),
                 args.mc_threshold.unwrap_or(25.0),
                 &args.output,
@@ -1037,10 +1045,17 @@ pub fn run_model(args: RunArgs) -> anyhow::Result<PathBuf> {
                 .dtype
                 .map(candle_core::DType::from)
                 .unwrap_or(candle_core::DType::F32);
+            let input = match (args.source.as_deref(), args.surface_input.as_deref()) {
+                (_, Some(surface)) => TripoSgRunInput::Surface(surface),
+                (Some(source), None) => TripoSgRunInput::Image(source),
+                (None, None) => {
+                    anyhow::bail!("`--source` or `--surface-input` is required for `triposg`")
+                }
+            };
             run_triposg(
                 model_assets,
                 rmbg_model_path,
-                &args.source,
+                input,
                 options,
                 &args.output,
                 &device,
@@ -1058,12 +1073,13 @@ pub fn run_model(args: RunArgs) -> anyhow::Result<PathBuf> {
             reject_vggt_only_options(&args, args.family)?;
             validate_trellis2_texturing_mode(&args)?;
             let rmbg_model_path = resolve_trellis2_rmbg_model_path(&args);
+            let source = required_source(&args, "trellis2")?;
             if let Some(mesh_path) = args.texture_mesh.as_deref() {
                 let options = trellis2_texturing_options_from_args(&args)?;
                 run_trellis2_texturing(
                     model_assets,
                     rmbg_model_path,
-                    &args.source,
+                    source,
                     mesh_path,
                     &options,
                     &args.output,
@@ -1074,7 +1090,7 @@ pub fn run_model(args: RunArgs) -> anyhow::Result<PathBuf> {
                 run_trellis2(
                     model_assets,
                     rmbg_model_path,
-                    &args.source,
+                    source,
                     options,
                     &args.output,
                     args.return_latent.as_deref(),
@@ -1146,6 +1162,16 @@ pub fn run_model(args: RunArgs) -> anyhow::Result<PathBuf> {
     }
 
     Ok(args.output)
+}
+
+/// Resolve the required `--source` for families that do not accept
+/// `--surface-input`. Clap only makes `--source` optional when
+/// `--surface-input` is present, and the family guards reject that
+/// combination first; this is the defensive fallback.
+fn required_source<'a>(args: &'a RunArgs, family: &str) -> anyhow::Result<&'a Path> {
+    args.source
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("`--source` is required for `{family}`"))
 }
 
 fn run_pi3(
@@ -1280,10 +1306,16 @@ fn reject_unsupported_triposg_options(args: &RunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The `--steps`/`--guidance-scale`/`--seed`/`--num-tokens`/`--dense-octree-depth`/
-/// `--hierarchical-octree-depth` flags are TripoSG-only; every other family must
-/// reject them instead of silently ignoring them.
+/// The `--surface-input`/`--steps`/`--guidance-scale`/`--seed`/`--num-tokens`/
+/// `--dense-octree-depth`/`--hierarchical-octree-depth` flags are TripoSG-only;
+/// every other family must reject them instead of silently ignoring them.
 fn reject_triposg_only_options(args: &RunArgs, family: Family) -> anyhow::Result<()> {
+    if args.surface_input.is_some() {
+        anyhow::bail!(
+            "`--surface-input` is not supported for `{}`",
+            family.model_family()
+        );
+    }
     if args.steps.is_some() {
         anyhow::bail!("`--steps` is not supported for `{}`", family.model_family());
     }
@@ -1405,6 +1437,9 @@ fn reject_unsupported_trellis2_options(args: &RunArgs) -> anyhow::Result<()> {
     }
     if args.overlap.is_some() {
         anyhow::bail!("`--overlap` is not supported for `trellis2`");
+    }
+    if args.surface_input.is_some() {
+        anyhow::bail!("`--surface-input` is not supported for `trellis2`");
     }
     if args.conf_threshold.is_some() {
         anyhow::bail!("`--conf-threshold` is not supported for `trellis2`");
@@ -1776,9 +1811,13 @@ fn parse_timesteps_arg(value: &str) -> anyhow::Result<Vec<f32>> {
 }
 
 /// Build the TripoSG run options from the reference defaults plus explicit
-/// CLI overrides; `--chunk-size` doubles as the SDF query chunk.
+/// CLI overrides; `--chunk-size` doubles as the SDF query chunk. With
+/// `--surface-input` the decode defaults follow `scripts/inference_vae.py`
+/// (`hierarchical_extract_geometry`: flash off, dense 8 / hierarchical 9)
+/// unless the corresponding flags override them.
 fn triposg_run_options_from_args(args: &RunArgs) -> anyhow::Result<TripoSgRunOptions> {
     let defaults = TripoSgRunOptions::default();
+    let surface_decode_default = args.surface_input.is_none();
     let options = TripoSgRunOptions {
         steps: args.steps.unwrap_or(defaults.steps),
         guidance_scale: args.guidance_scale.unwrap_or(defaults.guidance_scale),
@@ -1790,7 +1829,7 @@ fn triposg_run_options_from_args(args: &RunArgs) -> anyhow::Result<TripoSgRunOpt
         hierarchical_octree_depth: args
             .hierarchical_octree_depth
             .unwrap_or(defaults.hierarchical_octree_depth),
-        use_flash_decoder: args.flash_decoder.unwrap_or(defaults.use_flash_decoder),
+        use_flash_decoder: args.flash_decoder.unwrap_or(surface_decode_default),
         flash_octree_depth: args
             .flash_octree_depth
             .unwrap_or(defaults.flash_octree_depth),
@@ -2161,6 +2200,7 @@ fn run_vggt(
     args: &RunArgs,
     device: &candle_core::Device,
 ) -> anyhow::Result<()> {
+    let source = required_source(args, "vggt")?;
     let vggt = &args.vggt;
     let options = vggt_run_options_from_args(args)?;
     let track_queries = match vggt.track_queries.as_deref() {
@@ -2183,7 +2223,7 @@ fn run_vggt(
     }
     let track_output = match &vggt.track_output {
         Some(path) => Some(path.clone()),
-        None if track_queries.is_some() => Some(vggt_default_track_output(&args.source)),
+        None if track_queries.is_some() => Some(vggt_default_track_output(source)),
         None => None,
     };
 
@@ -2195,7 +2235,7 @@ fn run_vggt(
     }
     let t1 = std::time::Instant::now();
     let prepared = pipeline.prepare_inputs_from_path_with_mode(
-        &args.source,
+        source,
         options.interval,
         options.preprocess_mode,
         device,
@@ -2222,7 +2262,7 @@ fn run_vggt(
             .map_err(anyhow::Error::from)?;
     }
     if let Some(colmap_dir) = vggt.colmap_dir.as_deref() {
-        let mut image_names = vggt_colmap_image_names(&args.source, prepared.interval);
+        let mut image_names = vggt_colmap_image_names(source, prepared.interval);
         if image_names.len() != prepared.original_coords.len() {
             // Frame names that disagree with the prepared frame order would
             // label the wrong cameras; fall back to `image_N` names.
@@ -2402,10 +2442,17 @@ fn run_triposr(
     Ok(())
 }
 
+/// TripoSG input selection: the image-to-3D path (`--source`) or the
+/// reference VAE surface encode path (`--surface-input`).
+enum TripoSgRunInput<'a> {
+    Image(&'a Path),
+    Surface(&'a Path),
+}
+
 fn run_triposg(
     model_assets: ModelAssetOptions,
     rmbg_model_path: Option<PathBuf>,
-    source: &Path,
+    input: TripoSgRunInput<'_>,
     options: TripoSgRunOptions,
     output: &Path,
     device: &candle_core::Device,
@@ -2422,12 +2469,28 @@ fn run_triposg(
         eprintln!("[stage] load: {:.2}s", t0.elapsed().as_secs_f64());
     }
     let t1 = std::time::Instant::now();
-    let inference = pipeline.infer_from_path(source, device, &options)?;
+    // `--surface-input` is the reference `scripts/inference_vae.py` path: the
+    // VAE encoder produces the latents directly, so preprocess/DINO/denoise
+    // are skipped. Clap guarantees exactly one of source/surface-input.
+    let is_surface = matches!(input, TripoSgRunInput::Surface(_));
+    let latents = match input {
+        TripoSgRunInput::Surface(surface_path) => {
+            pipeline.encode_surface_from_path(surface_path, device, &options)?
+        }
+        TripoSgRunInput::Image(source) => {
+            pipeline.infer_from_path(source, device, &options)?.latents
+        }
+    };
     if stage_time {
-        eprintln!("[stage] infer: {:.2}s", t1.elapsed().as_secs_f64());
+        let label = if is_surface {
+            "surface encode"
+        } else {
+            "infer"
+        };
+        eprintln!("[stage] {label}: {:.2}s", t1.elapsed().as_secs_f64());
     }
     let t2 = std::time::Instant::now();
-    let mesh = pipeline.extract_mesh(&inference.latents, &options)?;
+    let mesh = pipeline.extract_mesh(&latents, &options)?;
     if stage_time {
         eprintln!("[stage] mesh: {:.2}s", t2.elapsed().as_secs_f64());
     }
@@ -4527,6 +4590,138 @@ mod tests {
     }
 
     #[test]
+    fn run_triposg_surface_input_parses_without_source() {
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "triposg",
+            "--surface-input",
+            "surface.npy",
+            "--output",
+            "out.glb",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args.surface_input, Some(PathBuf::from("surface.npy")));
+        assert_eq!(args.source, None);
+        let options = super::triposg_run_options_from_args(&args).expect("surface options");
+        // `scripts/inference_vae.py:50-58` decodes with
+        // `hierarchical_extract_geometry` (no flash decoder, depths 8/9).
+        assert!(!options.use_flash_decoder);
+        assert_eq!(options.dense_octree_depth, 8);
+        assert_eq!(options.hierarchical_octree_depth, 9);
+        assert_eq!(options.num_tokens, 2048);
+        assert_eq!(options.seed, 42);
+    }
+
+    #[test]
+    fn run_triposg_surface_input_keeps_explicit_decoder_overrides() {
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "triposg",
+            "--surface-input",
+            "surface.npy",
+            "--flash-decoder",
+            "true",
+            "--dense-octree-depth",
+            "6",
+            "--hierarchical-octree-depth",
+            "7",
+            "--output",
+            "out.glb",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        let options = super::triposg_run_options_from_args(&args).expect("options");
+        assert!(options.use_flash_decoder);
+        assert_eq!(options.dense_octree_depth, 6);
+        assert_eq!(options.hierarchical_octree_depth, 7);
+    }
+
+    #[test]
+    fn run_triposg_surface_input_conflicts_with_source() {
+        let error = Cli::try_parse_from([
+            "lux3d",
+            "run",
+            "triposg",
+            "--source",
+            "image.png",
+            "--surface-input",
+            "surface.npy",
+            "--output",
+            "out.glb",
+        ])
+        .expect_err("`--source` and `--surface-input` must conflict");
+        let message = error.to_string();
+        assert!(
+            message.contains("cannot be used with"),
+            "unexpected conflict message: `{message}`"
+        );
+    }
+
+    #[test]
+    fn run_triposg_requires_source_or_surface_input() {
+        let error = Cli::try_parse_from(["lux3d", "run", "triposg", "--output", "out.glb"])
+            .expect_err("one input source is required");
+        let message = error.to_string();
+        assert!(
+            message.contains("--source"),
+            "unexpected missing-input message: `{message}`"
+        );
+    }
+
+    #[test]
+    fn surface_input_rejected_for_non_triposg_families() {
+        for family in ["pi3", "pi3x", "triposr", "vggt"] {
+            let cli = Cli::parse_from([
+                "lux3d",
+                "run",
+                family,
+                "--surface-input",
+                "surface.npy",
+                "--output",
+                "out",
+            ]);
+            let Command::Run(args) = cli.command else {
+                panic!("expected run command");
+            };
+            let error = super::reject_triposg_only_options(&args, args.family)
+                .expect_err(&format!("--surface-input must be rejected for {family}"));
+            let message = error.to_string();
+            assert!(
+                message.contains("--surface-input"),
+                "`--surface-input` missing in `{message}`"
+            );
+            assert!(
+                message.contains(&format!("is not supported for `{family}`")),
+                "unexpected message: `{message}`"
+            );
+        }
+
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "trellis2",
+            "--surface-input",
+            "surface.npy",
+            "--output",
+            "out.glb",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        let error = super::reject_unsupported_trellis2_options(&args)
+            .expect_err("--surface-input must be rejected for trellis2");
+        assert!(
+            error.to_string().contains("--surface-input"),
+            "unexpected message: `{error}`"
+        );
+    }
+
+    #[test]
     fn all_triposg_only_flags_rejected_for_triposr() {
         let flag_options: [&[&str]; 6] = [
             &["--steps", "10"],
@@ -4852,12 +5047,15 @@ mod tests {
         let args = RunArgs {
             family: super::Family::Pi3,
             device: super::DeviceBackend::Cuda,
-            source: repo_root()
-                .join("tp")
-                .join("3d")
-                .join("Pi3")
-                .join("examples")
-                .join("house"),
+            source: Some(
+                repo_root()
+                    .join("tp")
+                    .join("3d")
+                    .join("Pi3")
+                    .join("examples")
+                    .join("house"),
+            ),
+            surface_input: None,
             interval: None,
             conditions: None,
             vo: false,
@@ -4931,12 +5129,15 @@ mod tests {
         let args = RunArgs {
             family: super::Family::Triposr,
             device: super::DeviceBackend::Cuda,
-            source: repo_root()
-                .join("tp")
-                .join("3d")
-                .join("TripoSR")
-                .join("examples")
-                .join("horse.png"),
+            source: Some(
+                repo_root()
+                    .join("tp")
+                    .join("3d")
+                    .join("TripoSR")
+                    .join("examples")
+                    .join("horse.png"),
+            ),
+            surface_input: None,
             interval: None,
             conditions: None,
             vo: false,
@@ -5012,12 +5213,15 @@ mod tests {
         let args = RunArgs {
             family: super::Family::Triposr,
             device: super::DeviceBackend::Cuda,
-            source: repo_root()
-                .join("tp")
-                .join("3d")
-                .join("TripoSR")
-                .join("examples")
-                .join("horse.png"),
+            source: Some(
+                repo_root()
+                    .join("tp")
+                    .join("3d")
+                    .join("TripoSR")
+                    .join("examples")
+                    .join("horse.png"),
+            ),
+            surface_input: None,
             interval: None,
             conditions: None,
             vo: false,
@@ -5089,13 +5293,16 @@ mod tests {
         let args = RunArgs {
             family: super::Family::Pi3x,
             device: super::DeviceBackend::Cuda,
-            source: repo_root()
-                .join("tp")
-                .join("3d")
-                .join("Pi3")
-                .join("examples")
-                .join("room")
-                .join("rgb"),
+            source: Some(
+                repo_root()
+                    .join("tp")
+                    .join("3d")
+                    .join("Pi3")
+                    .join("examples")
+                    .join("room")
+                    .join("rgb"),
+            ),
+            surface_input: None,
             interval: Some(2),
             conditions: Some(
                 repo_root()
@@ -5177,12 +5384,15 @@ mod tests {
         let args = RunArgs {
             family: super::Family::Pi3x,
             device: super::DeviceBackend::Cuda,
-            source: repo_root()
-                .join("tp")
-                .join("3d")
-                .join("Pi3")
-                .join("examples")
-                .join("skating.mp4"),
+            source: Some(
+                repo_root()
+                    .join("tp")
+                    .join("3d")
+                    .join("Pi3")
+                    .join("examples")
+                    .join("skating.mp4"),
+            ),
+            surface_input: None,
             interval: None,
             conditions: None,
             vo: true,

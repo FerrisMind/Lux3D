@@ -38,7 +38,6 @@ use std::{path::Path, sync::Arc};
 use candle_core::{DType, Device, Tensor};
 
 use super::{
-    DeviceLocalCache, RmbgConfig, RmbgModel,
     triposg_dino::TripoSgDinoEncoder,
     triposg_dit::TripoSgDiT,
     triposg_field::hierarchical_sdf_grid,
@@ -46,19 +45,20 @@ use super::{
     triposg_vae::{
         TripoSgLatentDistribution, TripoSgVaeConfig, TripoSgVaeDecoder, TripoSgVaeEncoder,
     },
+    DeviceLocalCache, RmbgConfig, RmbgModel,
 };
 use crate::{
-    AuxiliaryWeightSetPaths, CanonicalWeightSetPaths, ModelAssetOptions, ModelFamily, Result,
     error::Lux3dError,
     export::{MeshFormat, TripoSgExportStage},
-    geometry::{TripoSgGeometryStage, TripoSgMeshCpu, merge_close_vertices, simplify_mesh},
+    geometry::{merge_close_vertices, simplify_mesh, TripoSgGeometryStage, TripoSgMeshCpu},
     load_auxiliary_canonical_weights, load_canonical_weights,
     neural::TripoSgNeuralStage,
     preprocess::TripoSgPreprocessStage,
+    AuxiliaryWeightSetPaths, CanonicalWeightSetPaths, ModelAssetOptions, ModelFamily, Result,
 };
 
 use super::triposg_dit::{
-    RectifiedFlowSchedule, SCHEDULER_SHIFT, TripoSgTransformerConfig, denoise_with_schedule,
+    denoise_with_schedule, RectifiedFlowSchedule, TripoSgTransformerConfig, SCHEDULER_SHIFT,
 };
 
 /// TripoSG latent channel count (`transformer.in_channels` ==
@@ -82,6 +82,35 @@ const CANONICAL_SDF_LEVEL: f32 = 0.0;
 /// Hard octree-depth cap for run options (grid side `2^depth` <= 1024, the
 /// same cap `hierarchical_sdf_grid` enforces).
 const MAX_OCTREE_DEPTH: u32 = 10;
+
+/// Surface points the reference `load_surface` draws before encoding
+/// (`scripts/inference_vae.py:12-23`, `num_pc = 204800`; the shipped demo has
+/// 500000 points, so the draw is without replacement).
+pub(crate) const TRIPOSG_SURFACE_POINT_COUNT: usize = 204_800;
+
+/// Deterministic surface-point subset selection for `--surface-input`.
+///
+/// The reference `load_surface` draws `num_pc` indices with
+/// `np.random.default_rng().choice(n, num_pc, replace=False)`. Lux3D replaces
+/// that draw with the documented SplitMix64 RNG (same distribution, not
+/// draw-identical). Inputs smaller than `count` (test fixtures) are upsampled
+/// with replacement instead of raising like the reference, because the
+/// shipped demo is the only 204800-point file.
+fn surface_selection_indices(total: usize, count: usize, seed: u64) -> Vec<usize> {
+    let mut rng = SeededNormalRng::new(seed);
+    if total >= count {
+        // Partial Fisher-Yates: `count` uniform draws without replacement.
+        let mut pool: Vec<usize> = (0..total).collect();
+        for index in 0..count {
+            let swap = index + rng.next_index(total - index);
+            pool.swap(index, swap);
+        }
+        pool.truncate(count);
+        pool
+    } else {
+        (0..count).map(|_| rng.next_index(total)).collect()
+    }
+}
 
 /// Per-run options for the TripoSG pipeline. Defaults replicate the reference
 /// `TripoSGPipeline` call in `pipeline_triposg.py` (`num_inference_steps=50`,
@@ -681,6 +710,58 @@ impl TripoSgPipeline {
             })
     }
 
+    /// Reference `scripts/inference_vae.py` surface entry point: load the
+    /// keyed `.npy` dict (`surface_points` / `surface_normals`), take the
+    /// reference `num_pc = 204800` subset, run the VAE encoder and sample the
+    /// latent distribution (`vae.encode(surface).latent_dist.sample()`).
+    ///
+    /// The image-to-3D preprocess, DINOv2 conditioning and denoise stages are
+    /// skipped entirely; the returned latent feeds [`Self::extract_mesh`]
+    /// directly. The sampled latent uses the Lux3D seeded RNG (documented RNG
+    /// deviation: same distribution, not torch-draw-identical).
+    pub fn encode_surface_from_path(
+        &self,
+        path: &Path,
+        device: &Device,
+        options: &TripoSgRunOptions,
+    ) -> Result<Tensor> {
+        options.validate()?;
+        let surface = super::npy::read_surface_arrays(path).map_err(|source| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "failed to load TripoSG surface input `{}`: {source}",
+                    path.display()
+                ),
+            }
+        })?;
+        if surface.is_empty() {
+            return Err(Lux3dError::InvalidInput(
+                "TripoSG surface input contains no points",
+            ));
+        }
+        let indices =
+            surface_selection_indices(surface.len(), TRIPOSG_SURFACE_POINT_COUNT, options.seed);
+        let mut features = Vec::with_capacity(TRIPOSG_SURFACE_POINT_COUNT * 6);
+        for &index in &indices {
+            let base = index * 3;
+            features.extend_from_slice(&surface.points[base..base + 3]);
+            features.extend_from_slice(&surface.normals[base..base + 3]);
+        }
+        let points = Tensor::from_vec(features, (1, TRIPOSG_SURFACE_POINT_COUNT, 6), &Device::Cpu)
+            .and_then(|points| points.to_device(device))
+            .and_then(|points| points.to_dtype(self.dtype))
+            .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                message: format!("failed to materialize TripoSG surface points: {source}"),
+            })?;
+        let distribution =
+            self.encode_point_cloud(&points, options.num_tokens, Some(options.seed))?;
+        distribution
+            .sample(options.seed)
+            .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                message: format!("TripoSG VAE latent sampling failed: {source}"),
+            })
+    }
+
     /// Decode the SDF field for `latents [1, num_tokens, 64]` at the run's
     /// bounds (canonical `+/-1.005` unless `options.bounds` overrides them)
     /// and assemble the level-0 marching-cubes mesh. The buffers are
@@ -944,11 +1025,68 @@ impl SeededNormalRng {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
 
+    /// Unbiased index in `0..n` via Lemire rejection (surface subset draw).
+    fn next_index(&mut self, n: usize) -> usize {
+        debug_assert!(n > 0);
+        let bound = n as u64;
+        let threshold = bound.wrapping_neg() % bound;
+        loop {
+            let value = self.next_u64();
+            let product = (value as u128) * (bound as u128);
+            let low = product as u64;
+            if low >= threshold {
+                return (product >> 64) as usize;
+            }
+        }
+    }
+
     /// One standard normal per two uniforms (Box-Muller, cosine branch).
     /// The first uniform is clamped away from zero so `ln` stays finite.
     fn next_standard_normal(&mut self) -> f64 {
         let u1 = self.next_uniform().max(f64::EPSILON);
         let u2 = self.next_uniform();
         (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
+}
+
+#[cfg(test)]
+mod surface_selection_tests {
+    use super::*;
+
+    #[test]
+    fn reference_point_count_is_204800() {
+        assert_eq!(TRIPOSG_SURFACE_POINT_COUNT, 204_800);
+    }
+
+    #[test]
+    fn selection_is_deterministic_and_seed_sensitive() {
+        let first = surface_selection_indices(1_000, 64, 42);
+        let second = surface_selection_indices(1_000, 64, 42);
+        assert_eq!(first, second, "same seed must reproduce the subset");
+        let other = surface_selection_indices(1_000, 64, 43);
+        assert_ne!(first, other, "different seeds must change the subset");
+    }
+
+    #[test]
+    fn selection_is_without_replacement_when_enough_points() {
+        let selected = surface_selection_indices(10_000, 4_096, 7);
+        assert_eq!(selected.len(), 4_096);
+        let mut sorted = selected.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), selected.len(), "indices must be unique");
+        assert!(selected.iter().all(|index| *index < 10_000));
+    }
+
+    #[test]
+    fn selection_upsamples_small_fixtures() {
+        let selected = surface_selection_indices(3, 16, 7);
+        assert_eq!(selected.len(), 16);
+        assert!(selected.iter().all(|index| *index < 3));
+        // A small pool must repeat points (with-replacement path).
+        let mut sorted = selected;
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert!(sorted.len() <= 3);
     }
 }
