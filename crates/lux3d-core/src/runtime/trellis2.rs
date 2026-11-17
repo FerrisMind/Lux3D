@@ -97,6 +97,14 @@
 //!    are not the 6-channel PBR layout, or the mesh has no faces.
 //!    CPU cost is material (xatlas charting + ~4M texel samples at
 //!    2048); see [`crate::geometry::BakedPbrTexture`] for details.
+//!    The to_glb path runs the upstream snap-back
+//!    ([`build_trellis2_textured_mesh_snapped`]): every covered texel's 3D
+//!    position is projected onto the pre-postprocess (original) surface
+//!    through a triangle BVH before the attribute volume is sampled
+//!    (`postprocess.py:249-266, 254-256`). The standalone texturing
+//!    pipeline (`runtime::trellis2_texture`) has no snap-back
+//!    (`trellis2_texturing.py:316-332`) and keeps calling the plain
+//!    [`build_trellis2_textured_mesh`].
 //!
 //! Stage weights load sequentially from the mmap-ed canonical package and
 //! drop after their stage; no more than one DiT is resident (the cascade
@@ -152,7 +160,8 @@ use crate::contracts::Trellis2PipelineType;
 use crate::error::Lux3dError;
 use crate::export::Trellis2ExportStage;
 use crate::geometry::{
-    area_weighted_vertex_normals, bake_pbr_texture, uv_unwrap, Trellis2GeometryStage,
+    area_weighted_vertex_normals, bake_pbr_texture, bake_pbr_texture_with_snap, uv_unwrap, MeshBvh,
+    Trellis2GeometryStage,
 };
 use crate::preprocess::{Trellis2BackgroundRemover, Trellis2Preprocess};
 use crate::runtime::Rmbg2Model;
@@ -936,6 +945,12 @@ pub struct Trellis2TexturedMesh {
 /// mesh, area-weighted vertex normals and the sparse-trilinear PBR bake at
 /// `texture_size`.
 ///
+/// This is the projection-free entry point used by the standalone texturing
+/// pipeline (no snap-back upstream either, `trellis2_texturing.py:316-332`).
+/// The image-to-3D to_glb path uses
+/// [`build_trellis2_textured_mesh_snapped`], which projects every covered
+/// texel onto the pre-postprocess surface first.
+///
 /// Skips cleanly (returns `None`, no error) when the options are disabled,
 /// `uv_unwrap` is off, the mesh carries no 6-channel PBR payload / vertex
 /// colors (geometry-only runs) or the mesh has no triangles. Real failures
@@ -946,15 +961,60 @@ pub fn build_trellis2_textured_mesh(
     mesh: &crate::geometry::Trellis2MeshBuffers,
     options: &Trellis2TextureExportOptions,
 ) -> Result<Option<Trellis2TexturedMesh>> {
-    if !options.enabled || !options.uv_unwrap {
+    build_trellis2_textured_mesh_impl(mesh, options, None)
+}
+
+/// [`build_trellis2_textured_mesh`] with the upstream `to_glb` bake
+/// snap-back (`postprocess.py:249-266`): the UV rasterization and 3D position
+/// interpolation run on the export mesh, then every covered texel position is
+/// projected onto the ORIGINAL pre-postprocess surface through a triangle
+/// BVH (`unsigned_distance(..., return_uvw=True)` and the barycentric
+/// reconstruction, `postprocess.py:254-256`) before the PBR attribute volume
+/// is sampled trilinearly.
+///
+/// `original_vertices` / `original_faces` are the decoded mesh as it enters
+/// [`Trellis2GeometryStage::postprocess_decoded_mesh`] — before remesh /
+/// simplify, exactly the surface the official BVH is built from
+/// (`postprocess.py:122`). The BVH is built here (median split, CPU); the
+/// exported atlas mesh keeps its own post-processed geometry.
+///
+/// Use this on the to_glb export path ONLY. The texturing pipeline never
+/// snaps back (`trellis2_texturing.py:316-332`).
+pub fn build_trellis2_textured_mesh_snapped(
+    mesh: &crate::geometry::Trellis2MeshBuffers,
+    options: &Trellis2TextureExportOptions,
+    original_vertices: &[f32],
+    original_faces: &[u32],
+) -> Result<Option<Trellis2TexturedMesh>> {
+    if !textured_export_will_run(mesh, options) {
         return Ok(None);
     }
-    if mesh.voxel_attr_channels != super::trellis2_tex::Trellis2PbrLayout::CHANNELS
-        || mesh.vertex_colors.is_none()
-    {
-        return Ok(None);
-    }
-    if mesh.face_count() == 0 {
+    let original_surface = MeshBvh::build(original_vertices, original_faces)?;
+    build_trellis2_textured_mesh_impl(mesh, options, Some(&original_surface))
+}
+
+/// Shared clean-skip gate of the textured-export entry points: the options
+/// are on, the mesh carries the 6-channel PBR payload with per-vertex colors
+/// and at least one triangle.
+fn textured_export_will_run(
+    mesh: &crate::geometry::Trellis2MeshBuffers,
+    options: &Trellis2TextureExportOptions,
+) -> bool {
+    options.enabled
+        && options.uv_unwrap
+        && mesh.voxel_attr_channels == super::trellis2_tex::Trellis2PbrLayout::CHANNELS
+        && mesh.vertex_colors.is_some()
+        && mesh.face_count() > 0
+}
+
+/// `original_surface`: `Some` = upstream to_glb snap-back; `None` = plain
+/// bake (texturing pipeline / standalone export).
+fn build_trellis2_textured_mesh_impl(
+    mesh: &crate::geometry::Trellis2MeshBuffers,
+    options: &Trellis2TextureExportOptions,
+    original_surface: Option<&MeshBvh<'_>>,
+) -> Result<Option<Trellis2TexturedMesh>> {
+    if !textured_export_will_run(mesh, options) {
         return Ok(None);
     }
     mesh.validate()?;
@@ -976,15 +1036,27 @@ pub fn build_trellis2_textured_mesh(
         }
     })?;
     let normals = area_weighted_vertex_normals(&atlas.vertices, &atlas.indices);
-    let texture = bake_pbr_texture(
-        &atlas.vertices,
-        &atlas.uvs,
-        &atlas.indices,
-        &voxel_coords,
-        &mesh.voxel_attrs,
-        mesh.resolution,
-        options.texture_size,
-    )
+    let texture = match original_surface {
+        Some(original_surface) => bake_pbr_texture_with_snap(
+            &atlas.vertices,
+            &atlas.uvs,
+            &atlas.indices,
+            original_surface,
+            &voxel_coords,
+            &mesh.voxel_attrs,
+            mesh.resolution,
+            options.texture_size,
+        ),
+        None => bake_pbr_texture(
+            &atlas.vertices,
+            &atlas.uvs,
+            &atlas.indices,
+            &voxel_coords,
+            &mesh.voxel_attrs,
+            mesh.resolution,
+            options.texture_size,
+        ),
+    }
     .map_err(|source| Lux3dError::CanonicalWeightsValidation {
         message: format!("Trellis2 PBR texture bake failed: {source}"),
     })?;
@@ -2104,13 +2176,66 @@ impl Trellis2Pipeline {
 
     /// Texture-export stage (upstream `to_glb` UV unwrap + bake); see
     /// [`build_trellis2_textured_mesh`] for the behavior and the clean-skip
-    /// conditions.
+    /// conditions. `original_surface` is the pre-postprocess snapshot that
+    /// enables the upstream texel snap-back
+    /// ([`build_trellis2_textured_mesh_snapped`]); `None` keeps the plain
+    /// texturing-pipeline bake.
     fn build_textured_mesh(
         &self,
         mesh: &crate::geometry::Trellis2MeshBuffers,
         options: &Trellis2TextureExportOptions,
+        original_surface: Option<&(Vec<f32>, Vec<u32>)>,
     ) -> Result<Option<Trellis2TexturedMesh>> {
-        build_trellis2_textured_mesh(mesh, options)
+        match original_surface {
+            Some((vertices, faces)) => {
+                build_trellis2_textured_mesh_snapped(mesh, options, vertices, faces)
+            }
+            None => build_trellis2_textured_mesh(mesh, options),
+        }
+    }
+
+    /// Snapshot the pre-postprocess surface for the bake snap-back.
+    ///
+    /// Upstream `to_glb` builds its BVH from the cleaned decoded mesh right
+    /// before the remesh/simplify branches (`postprocess.py:122`) and keeps
+    /// it for the texel projection (`postprocess.py:254-256`). Our
+    /// [`Self::postprocess_decoded_mesh`] owns that whole chain (starting
+    /// with the same `fill_holes(3e-2)` pre-pass), so the snapshot is taken
+    /// from the decoded mesh immediately before it; the ≤3e-2-perimeter
+    /// hole-fill fan patches it would add are the only difference from the
+    /// official BVH surface.
+    ///
+    /// Returns `None` when no textured mesh will be baked (`with_texture`
+    /// off, texture export disabled / unwrap off, empty mesh) or when the
+    /// geometry post-process is disabled — then the bake mesh IS the
+    /// original surface and the projection is the identity, so the BVH is
+    /// not built.
+    fn capture_bake_snap_surface(
+        mesh: &crate::geometry::Trellis2MeshBuffers,
+        options: &Trellis2RunOptions,
+    ) -> Result<Option<(Vec<f32>, Vec<u32>)>> {
+        if !options.postprocess.enabled
+            || !options.with_texture
+            || !options.texture_export.enabled
+            || !options.texture_export.uv_unwrap
+            || mesh.face_count() == 0
+        {
+            return Ok(None);
+        }
+        let vertex_count = mesh.vertex_count();
+        let mut faces = Vec::with_capacity(mesh.faces.len());
+        for &index in &mesh.faces {
+            let index = usize::try_from(index).map_err(|_| {
+                Lux3dError::InvalidInput("Trellis2 bake snap-back rejected a negative face index")
+            })?;
+            if index >= vertex_count {
+                return Err(Lux3dError::InvalidInput(
+                    "Trellis2 bake snap-back rejected a face index outside the vertex buffer",
+                ));
+            }
+            faces.push(index as u32);
+        }
+        Ok(Some((mesh.vertices.clone(), faces)))
     }
 
     fn assemble_mesh(
@@ -2403,6 +2528,11 @@ impl Trellis2Pipeline {
         stage_done!("shape vae");
         let mut mesh =
             self.assemble_mesh(shape_resolution, mesh, &decoded.coords, &decoded.feats)?;
+        // Bake snap-back source: the decoded mesh BEFORE the geometry
+        // post-process (upstream builds its BVH before remesh/simplify,
+        // `postprocess.py:122`, and projects texels onto it,
+        // `postprocess.py:254-256`).
+        let snap_surface = Self::capture_bake_snap_surface(&mesh, options)?;
         // Geometry post-process (upstream `to_glb` cleaning) BEFORE the
         // texture stage: the re-topologized vertices are the ones the
         // per-vertex PBR color sampling sees.
@@ -2423,8 +2553,10 @@ impl Trellis2Pipeline {
             None => None,
         };
         // Texture export (upstream `to_glb` UV unwrap + bake). Skips cleanly
-        // for geometry-only runs (see `build_textured_mesh`).
-        let textured = self.build_textured_mesh(&mesh, &options.texture_export)?;
+        // for geometry-only runs (see `build_textured_mesh`); the snap-back
+        // projects onto the pre-postprocess surface captured above.
+        let textured =
+            self.build_textured_mesh(&mesh, &options.texture_export, snap_surface.as_ref())?;
         stage_done!("texture export");
         Ok(Trellis2Stages {
             cond: cond_ss.clone(),
@@ -2615,6 +2747,11 @@ impl Trellis2Pipeline {
         let (decoded, mesh) =
             self.decode_shape_vae(&quant_coords, &hr_slat, device, hr_resolution)?;
         let mut mesh = self.assemble_mesh(hr_resolution, mesh, &decoded.coords, &decoded.feats)?;
+        // Bake snap-back source: the decoded mesh BEFORE the geometry
+        // post-process (upstream builds its BVH before remesh/simplify,
+        // `postprocess.py:122`, and projects texels onto it,
+        // `postprocess.py:254-256`).
+        let snap_surface = Self::capture_bake_snap_surface(&mesh, options)?;
         // Geometry post-process (upstream `to_glb` cleaning) BEFORE the
         // texture stage: the re-topologized vertices are the ones the
         // per-vertex PBR color sampling sees.
@@ -2637,8 +2774,10 @@ impl Trellis2Pipeline {
             None => None,
         };
         // Texture export (upstream `to_glb` UV unwrap + bake). Skips cleanly
-        // for geometry-only runs (see `build_textured_mesh`).
-        let textured = self.build_textured_mesh(&mesh, &options.texture_export)?;
+        // for geometry-only runs (see `build_textured_mesh`); the snap-back
+        // projects onto the pre-postprocess surface captured above.
+        let textured =
+            self.build_textured_mesh(&mesh, &options.texture_export, snap_surface.as_ref())?;
         Ok(Trellis2Stages {
             cond: cond.clone(),
             neg_cond: neg_cond.clone(),
@@ -3038,5 +3177,184 @@ impl Trellis2Pipeline {
         path: &Path,
     ) -> Result<std::path::PathBuf> {
         self.export.write_mesh_with_pbr(mesh, path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::Trellis2MeshBuffers;
+
+    /// Full `resolution^3` PBR grid whose base color ramps along Z (the same
+    /// fixture the `pbr_bake` snap tests use): a sample at `z = 0` is the
+    /// ramp midpoint 0.5 (127 after quantization), at `z = 0.25` it is
+    /// ~0.8333 (212).
+    fn z_ramp_grid(resolution: u32) -> (Vec<i32>, Vec<f32>) {
+        let resolution_i = resolution as i32;
+        let mut voxel_coords =
+            Vec::with_capacity((resolution * resolution * resolution) as usize * 3);
+        let mut attrs = Vec::with_capacity((resolution * resolution * resolution) as usize * 6);
+        for z in 0..resolution_i {
+            let value = z as f32 / (resolution_i - 1) as f32;
+            for y in 0..resolution_i {
+                for x in 0..resolution_i {
+                    voxel_coords.extend([x, y, z]);
+                    attrs.extend([value, value, value, 0.0, 0.0, 1.0]);
+                }
+            }
+        }
+        (voxel_coords, attrs)
+    }
+
+    /// Flat quad in the plane `z = plane_z` spanning `[-0.4, 0.4]^2` with
+    /// the full `[0, 1]` UV square; returns the flat f32 vertices, `i64`
+    /// triangle indices and per-corner UVs.
+    fn plane_quad(plane_z: f32) -> (Vec<f32>, Vec<i64>, Vec<[f32; 2]>) {
+        let vertices = vec![
+            [-0.4_f32, -0.4, plane_z],
+            [0.4, -0.4, plane_z],
+            [0.4, 0.4, plane_z],
+            [-0.4, 0.4, plane_z],
+        ];
+        (
+            vertices.iter().flatten().copied().collect(),
+            vec![0, 1, 2, 0, 2, 3],
+            vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+        )
+    }
+
+    /// A texture-export-ready mesh: the drifted quad (`z = 0.25`) with the
+    /// 6-channel PBR payload and per-vertex colors present.
+    fn drifted_pbr_buffers() -> Trellis2MeshBuffers {
+        let resolution = 4_u32;
+        let (voxel_coords, voxel_attrs) = z_ramp_grid(resolution);
+        let (vertices, faces, _uvs) = plane_quad(0.25);
+        Trellis2MeshBuffers {
+            resolution,
+            vertices,
+            faces,
+            voxel_coords,
+            voxel_attrs,
+            voxel_attr_channels: 6,
+            vertex_colors: Some(vec![0.0; 12]),
+        }
+    }
+
+    /// The to_glb texture export snaps every covered texel onto the
+    /// pre-postprocess surface before sampling the PBR volume
+    /// (`postprocess.py:249-266, 254-256`). The drifted export mesh samples
+    /// the z = 0 plateau (127) with the snap-back and the z = 0.25 plateau
+    /// (~212) without it.
+    #[test]
+    fn snapped_texture_export_projects_texels_onto_the_pre_postprocess_surface() {
+        let mesh = drifted_pbr_buffers();
+        // The ORIGINAL surface (pre-postprocess) is the plane z = 0.
+        let (original_vertices, original_faces, _uvs) = plane_quad(0.0);
+        let original_faces_u32: Vec<u32> = original_faces.iter().map(|&f| f as u32).collect();
+        let options = Trellis2TextureExportOptions {
+            enabled: true,
+            texture_size: 32,
+            uv_unwrap: true,
+        };
+
+        let snapped = build_trellis2_textured_mesh_snapped(
+            &mesh,
+            &options,
+            &original_vertices,
+            &original_faces_u32,
+        )
+        .expect("snapped texture export")
+        .expect("PBR payload present");
+        let plain = build_trellis2_textured_mesh(&mesh, &options)
+            .expect("plain texture export")
+            .expect("PBR payload present");
+
+        let texture = &snapped.texture;
+        let mut covered = 0_usize;
+        for texel in 0..texture.valid_mask.len() {
+            if !texture.valid_mask[texel] {
+                continue;
+            }
+            covered += 1;
+            assert_eq!(
+                127,
+                texture.base_color_rgba[texel * 4],
+                "snapped texel {texel} must sample the original z = 0 surface"
+            );
+            let plain_red = plain.texture.base_color_rgba[texel * 4];
+            assert!(
+                (211..=213).contains(&plain_red),
+                "unprojected texel {texel} red {plain_red} must sample the drifted z = 0.25 surface"
+            );
+        }
+        assert!(covered > 0, "the atlas must cover texels");
+        // Same atlas layout, same coverage: only the sampled surface differs.
+        assert_eq!(texture.valid_mask, plain.texture.valid_mask);
+        assert_eq!(texture.stats.valid_texels, plain.texture.stats.valid_texels);
+    }
+
+    /// The snap-back source is captured only for textured to_glb runs and
+    /// only when the geometry post-process will actually move the surface.
+    #[test]
+    fn bake_snap_surface_capture_matches_the_textured_to_glb_gate() {
+        let mesh = drifted_pbr_buffers();
+        let options = Trellis2RunOptions::default();
+        let captured = Trellis2Pipeline::capture_bake_snap_surface(&mesh, &options)
+            .expect("capture")
+            .expect("default run captures the decoded surface");
+        assert_eq!(captured.0, mesh.vertices);
+        assert_eq!(
+            captured.1,
+            mesh.faces.iter().map(|&f| f as u32).collect::<Vec<u32>>()
+        );
+
+        // Geometry-only run: no bake, no BVH.
+        let geometry_only = Trellis2RunOptions {
+            with_texture: false,
+            ..Trellis2RunOptions::default()
+        };
+        assert!(
+            Trellis2Pipeline::capture_bake_snap_surface(&mesh, &geometry_only)
+                .expect("capture")
+                .is_none()
+        );
+
+        // Texture export disabled: no bake, no BVH.
+        let no_export = Trellis2RunOptions {
+            texture_export: Trellis2TextureExportOptions {
+                enabled: false,
+                ..Trellis2TextureExportOptions::default()
+            },
+            ..Trellis2RunOptions::default()
+        };
+        assert!(
+            Trellis2Pipeline::capture_bake_snap_surface(&mesh, &no_export)
+                .expect("capture")
+                .is_none()
+        );
+
+        // Post-process disabled: the bake mesh is the original surface, so
+        // the projection would be the identity — skip the snapshot.
+        let no_postprocess = Trellis2RunOptions {
+            postprocess: Trellis2MeshPostprocessOptions {
+                enabled: false,
+                ..Trellis2MeshPostprocessOptions::default()
+            },
+            ..Trellis2RunOptions::default()
+        };
+        assert!(
+            Trellis2Pipeline::capture_bake_snap_surface(&mesh, &no_postprocess)
+                .expect("capture")
+                .is_none()
+        );
+
+        // Invalid face indices fail descriptively (never panic / wrap).
+        let mut broken = drifted_pbr_buffers();
+        broken.faces.push(99);
+        let error = Trellis2Pipeline::capture_bake_snap_surface(&broken, &options)
+            .expect_err("out-of-range face rejected");
+        assert!(error
+            .to_string()
+            .contains("face index outside the vertex buffer"));
     }
 }

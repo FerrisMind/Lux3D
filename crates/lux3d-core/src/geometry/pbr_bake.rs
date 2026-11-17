@@ -31,6 +31,17 @@
 //!   huge intermediate buffer is kept).
 //! * Quantization: `clamp(v, 0, 1) * 255` floor — the same truncation as the
 //!   reference `np.clip(attrs * 255, 0, 255).astype(np.uint8)`.
+//! * Snap-back ([`bake_pbr_texture_with_snap`], to_glb export path only):
+//!   after UV rasterization and 3D position interpolation, every covered
+//!   texel's position is projected onto the ORIGINAL (pre-postprocess)
+//!   surface through a [`MeshBvh`] and the attribute volume is sampled at the
+//!   projected position — the exact upstream order
+//!   (`postprocess.py:249-266`): `bvh.unsigned_distance(valid_pos,
+//!   return_uvw=True)` then `valid_pos = (vertices[faces[face_id]] *
+//!   uvw).sum(dim=1)` (`postprocess.py:254-256`), correcting the geometric
+//!   error introduced by simplification/remeshing. [`bake_pbr_texture`]
+//!   itself stays projection-free (the texturing pipeline has no snap-back,
+//!   `trellis2_texturing.py:316-332`).
 //! * Inpaint: a TELEA-approximation (see [`inpaint_channels`]): iterative
 //!   onion-peel nearest-valid propagation with `1 / distance^2` weighting
 //!   over a square window of the requested radius, each channel group
@@ -44,9 +55,11 @@
 //! only in bounded chunks ([`SAMPLE_CHUNK_TEXELS`] texels at a time). For a
 //! 2048 atlas that is ~40 MiB steady state, no per-pixel allocations.
 
-use crate::Result;
 use crate::error::Lux3dError;
-use crate::runtime::{Trellis2PbrLayout, query_vertex_attrs};
+use crate::runtime::{query_vertex_attrs, Trellis2PbrLayout};
+use crate::Result;
+
+use super::mesh_bvh::MeshBvh;
 
 /// Conservative rasterization dilation in texels: pixel centers up to this
 /// far outside a triangle still count as covered (crack prevention at shared
@@ -109,6 +122,10 @@ pub struct BakeStats {
 ///   `attach_texture` does. Boundary vertices clamp naturally (the sparse
 ///   trilinear drops out-of-grid neighbors and renormalizes the rest).
 ///
+/// This entry point does NOT run the upstream texel snap-back: it is the
+/// texturing-pipeline bake (`trellis2_texturing.py:316-332` never projects
+/// texels). The to_glb export path uses [`bake_pbr_texture_with_snap`].
+///
 /// Errors are descriptive (no panics): mismatched buffers, empty inputs, or
 /// zero rasterized coverage.
 pub fn bake_pbr_texture(
@@ -119,6 +136,70 @@ pub fn bake_pbr_texture(
     voxel_attrs: &[f32],
     resolution: u32,
     texture_size: usize,
+) -> Result<BakedPbrTexture> {
+    bake_pbr_texture_impl(
+        vertices,
+        uvs,
+        indices,
+        voxel_coords,
+        voxel_attrs,
+        resolution,
+        texture_size,
+        None,
+    )
+}
+
+/// [`bake_pbr_texture`] with the upstream `to_glb` snap-back onto the
+/// ORIGINAL surface (`postprocess.py:249-266`).
+///
+/// After the UV triangles are rasterized and each covered texel's 3D position
+/// is interpolated from the atlas mesh (the post-simplify/remesh export
+/// mesh), the position is projected onto `original_surface` — the BVH built
+/// from the pre-postprocess mesh (`postprocess.py:122`) — exactly like the
+/// reference:
+///
+/// 1. `bvh.unsigned_distance(valid_pos, return_uvw=True)` returns the
+///    nearest triangle and its barycentric `uvw`,
+/// 2. `valid_pos = (vertices[faces[face_id]] * uvw).sum(dim=1)` reconstructs
+///    the position on the original surface
+///    ([`MeshBvh::closest_point`]'s `position` is that same reconstruction),
+/// 3. the attribute volume is sampled trilinearly at the projected position.
+///
+/// The projection is skipped for uncovered texels (they are inpainted from
+/// covered ones, identical to the reference order).
+#[allow(clippy::too_many_arguments)]
+pub fn bake_pbr_texture_with_snap(
+    vertices: &[[f32; 3]],
+    uvs: &[[f32; 2]],
+    indices: &[u32],
+    original_surface: &MeshBvh<'_>,
+    voxel_coords: &[[i32; 3]],
+    voxel_attrs: &[f32],
+    resolution: u32,
+    texture_size: usize,
+) -> Result<BakedPbrTexture> {
+    bake_pbr_texture_impl(
+        vertices,
+        uvs,
+        indices,
+        voxel_coords,
+        voxel_attrs,
+        resolution,
+        texture_size,
+        Some(original_surface),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bake_pbr_texture_impl(
+    vertices: &[[f32; 3]],
+    uvs: &[[f32; 2]],
+    indices: &[u32],
+    voxel_coords: &[[i32; 3]],
+    voxel_attrs: &[f32],
+    resolution: u32,
+    texture_size: usize,
+    original_surface: Option<&MeshBvh<'_>>,
 ) -> Result<BakedPbrTexture> {
     let channels = Trellis2PbrLayout::CHANNELS;
     if indices.is_empty() || indices.len() % 3 != 0 {
@@ -204,9 +285,10 @@ pub fn bake_pbr_texture(
         },
     };
 
-    // Per-texel 3D position -> sparse trilinear sampling, in bounded chunks.
-    // The winning face id is re-evaluated (barycentric interpolation of the
-    // triangle vertices) instead of storing per-texel barycentrics.
+    // Per-texel 3D position -> optional snap-back -> sparse trilinear
+    // sampling, in bounded chunks. The winning face id is re-evaluated
+    // (barycentric interpolation of the triangle vertices) instead of
+    // storing per-texel barycentrics.
     let mut chunk_positions: Vec<[f32; 3]> = Vec::with_capacity(SAMPLE_CHUNK_TEXELS);
     let mut chunk_texels: Vec<usize> = Vec::with_capacity(SAMPLE_CHUNK_TEXELS);
     for texel in 0..texel_count {
@@ -214,14 +296,16 @@ pub fn bake_pbr_texture(
         if face < 0 {
             continue;
         }
-        chunk_positions.push(interpolate_texel_position(
-            texel,
-            face as usize,
-            uvs,
-            vertices,
-            indices,
-            texture_size,
-        )?);
+        let mut position =
+            interpolate_texel_position(texel, face as usize, uvs, vertices, indices, texture_size)?;
+        if let Some(original_surface) = original_surface {
+            // Upstream `bvh.unsigned_distance(valid_pos, return_uvw=True)`
+            // then `(vertices[faces[face_id]] * uvw).sum(dim=1)`
+            // (`postprocess.py:254-256`); `ClosestPoint::position` is that
+            // same barycentric reconstruction on the original triangle.
+            position = original_surface.closest_point(position).position;
+        }
+        chunk_positions.push(position);
         chunk_texels.push(texel);
         if chunk_positions.len() == SAMPLE_CHUNK_TEXELS {
             sample_chunk_into_textures(
@@ -782,6 +866,148 @@ mod tests {
         assert_eq!(first, second);
     }
 
+    /// Full `resolution^3` sparse grid whose base color ramps with the voxel
+    /// Z index (`0, 1/(R-1), ..., 1`), so the trilinear sample is a Z
+    /// plateau independent of x/y: `0.5` at `z = 0`, `~0.8333` at
+    /// `z = 0.25` for `R = 4`.
+    fn z_ramp_grid(resolution: u32) -> (Vec<[i32; 3]>, Vec<f32>) {
+        let resolution_i = resolution as i32;
+        let mut coords = Vec::with_capacity((resolution * resolution * resolution) as usize);
+        let mut attrs = Vec::with_capacity((resolution * resolution * resolution) as usize * 6);
+        for z in 0..resolution_i {
+            let value = z as f32 / (resolution_i - 1) as f32;
+            for y in 0..resolution_i {
+                for x in 0..resolution_i {
+                    coords.push([x, y, z]);
+                    attrs.extend([value, value, value, 0.0, 0.0, 1.0]);
+                }
+            }
+        }
+        (coords, attrs)
+    }
+
+    /// Flat quad in the plane `z = plane_z` spanning `[-0.4, 0.4]^2`, with
+    /// the full `[0, 1]` UV square.
+    fn plane_quad(plane_z: f32) -> (Vec<[f32; 3]>, Vec<[f32; 2]>, Vec<u32>) {
+        let vertices = vec![
+            [-0.4, -0.4, plane_z],
+            [0.4, -0.4, plane_z],
+            [0.4, 0.4, plane_z],
+            [-0.4, 0.4, plane_z],
+        ];
+        let uvs = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        (vertices, uvs, vec![0, 1, 2, 0, 2, 3])
+    }
+
+    /// Upstream `to_glb` snap-back (`postprocess.py:249-266`): a deliberately
+    /// drifted export mesh must sample the volume at the projected
+    /// ORIGINAL-surface position, not at its own drifted position.
+    #[test]
+    fn snap_back_projects_texels_onto_the_original_surface() {
+        let resolution = 4_u32;
+        let (coords, attrs) = z_ramp_grid(resolution);
+
+        // Original (pre-postprocess) surface: the plane z = 0.
+        let (original_vertices, _, original_faces) = plane_quad(0.0);
+        let original_flat: Vec<f32> = original_vertices.iter().flatten().copied().collect();
+        let bvh = MeshBvh::build(&original_flat, &original_faces).expect("build bvh");
+
+        // Export mesh drifted +0.25 in Z (stand-in for the geometric error
+        // introduced by simplification/remeshing).
+        let (drifted_vertices, uvs, indices) = plane_quad(0.25);
+
+        // The projection itself moves the sample position toward the
+        // original surface: nearest point at z = 0, 0.25 away from the
+        // drifted point.
+        let hit = bvh.closest_point([0.0, 0.0, 0.25]);
+        assert!((hit.unsigned_distance - 0.25).abs() <= 1e-6);
+        assert!(
+            hit.position[2].abs() <= 1e-6,
+            "projection must land on the original plane, got {:?}",
+            hit.position
+        );
+
+        let unprojected = bake_pbr_texture(
+            &drifted_vertices,
+            &uvs,
+            &indices,
+            &coords,
+            &attrs,
+            resolution,
+            16,
+        )
+        .expect("unprojected bake");
+        let snapped = bake_pbr_texture_with_snap(
+            &drifted_vertices,
+            &uvs,
+            &indices,
+            &bvh,
+            &coords,
+            &attrs,
+            resolution,
+            16,
+        )
+        .expect("snapped bake");
+        let original = bake_pbr_texture(
+            &original_vertices,
+            &uvs,
+            &indices,
+            &coords,
+            &attrs,
+            resolution,
+            16,
+        )
+        .expect("original bake");
+
+        let mut covered = 0_usize;
+        for texel in 0..16 * 16 {
+            if !snapped.valid_mask[texel] {
+                continue;
+            }
+            covered += 1;
+            // z = 0 samples the ramp midpoint 0.5 -> floor(127.5) = 127.
+            assert_eq!(
+                127,
+                snapped.base_color_rgba[texel * 4],
+                "snapped texel {texel} must sample the original surface"
+            );
+            // The unprojected sample sits at z = 0.25 -> ~0.8333 -> >= 211.
+            let unprojected_red = unprojected.base_color_rgba[texel * 4];
+            assert!(
+                (211..=213).contains(&unprojected_red),
+                "unprojected texel {texel} red {unprojected_red} must sample the drifted plane"
+            );
+        }
+        assert!(covered > 0, "the quad must cover texels");
+
+        // Projection recovers exactly what baking the undrifted export mesh
+        // produces: same coverage, samples and inpaint result.
+        assert_eq!(original, snapped);
+        // And the drift really is observable without the snap-back.
+        assert_ne!(original.base_color_rgba, unprojected.base_color_rgba);
+    }
+
+    /// Snapping is a no-op when the export mesh already IS the original
+    /// surface (the post-process-disabled path is not the only case: a
+    /// pass-through export must not perturb samples).
+    #[test]
+    fn snap_back_on_the_original_mesh_keeps_the_bake_identical() {
+        let resolution = 4_u32;
+        let (coords, attrs) = z_ramp_grid(resolution);
+        let (vertices, uvs, indices) = plane_quad(0.0);
+        let flat: Vec<f32> = vertices.iter().flatten().copied().collect();
+        let bvh = MeshBvh::build(&flat, &indices).expect("build bvh");
+
+        let unprojected =
+            bake_pbr_texture(&vertices, &uvs, &indices, &coords, &attrs, resolution, 16)
+                .expect("unprojected bake");
+        let snapped = bake_pbr_texture_with_snap(
+            &vertices, &uvs, &indices, &bvh, &coords, &attrs, resolution, 16,
+        )
+        .expect("snapped bake");
+        assert_eq!(unprojected, snapped);
+    }
+
     #[test]
     fn bake_boundary_vertices_clamp_to_single_voxel() {
         // resolution 1, single voxel (0, 0, 0); quad corners EXACTLY on the
@@ -827,29 +1053,23 @@ mod tests {
         let mut broken = gradient_fixture();
         broken.indices = vec![0, 1, 9];
         let error = broken.bake(16).expect_err("bad face index");
-        assert!(
-            error
-                .to_string()
-                .contains("outside the atlas vertex buffer")
-        );
+        assert!(error
+            .to_string()
+            .contains("outside the atlas vertex buffer"));
 
         let mut broken = gradient_fixture();
         broken.attrs.truncate(6);
         let error = broken.bake(16).expect_err("attr row mismatch");
-        assert!(
-            error
-                .to_string()
-                .contains("6 channels per voxel coordinate")
-        );
+        assert!(error
+            .to_string()
+            .contains("6 channels per voxel coordinate"));
 
         let mut broken = gradient_fixture();
         broken.coords.clear();
         let error = broken.bake(16).expect_err("empty voxel grid");
-        assert!(
-            error
-                .to_string()
-                .contains("non-empty sparse PBR voxel grid")
-        );
+        assert!(error
+            .to_string()
+            .contains("non-empty sparse PBR voxel grid"));
 
         // Degenerate UV triangles cover nothing.
         let mut broken = gradient_fixture();

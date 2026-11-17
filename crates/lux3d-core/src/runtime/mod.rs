@@ -125,8 +125,9 @@ pub use trellis2::{
     TRELLIS2_TEX_SLAT_STD, TRELLIS2_VOXEL_MARGIN, Trellis2CascadeShape,
     Trellis2MeshPostprocessOptions, Trellis2Pipeline, Trellis2PipelineConfig, Trellis2Rng,
     Trellis2RunOptions, Trellis2SamplerOverrides, Trellis2Stages, Trellis2TextureExportOptions,
-    Trellis2TexturedMesh, build_trellis2_textured_mesh, quantize_hr_coords,
-    quantize_hr_coords_with_stop, resolve_stage_params,
+    Trellis2TexturedMesh, build_trellis2_textured_mesh,
+    build_trellis2_textured_mesh_snapped, quantize_hr_coords, quantize_hr_coords_with_stop,
+    resolve_stage_params,
 };
 pub use trellis2_blocks::{
     Trellis2AdaLn, Trellis2CrossAttention, Trellis2DenseBlock, Trellis2FeedForward,
