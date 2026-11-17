@@ -139,7 +139,8 @@ pub use trellis2_blocks::{
 pub use trellis2_dino::{Trellis2Dino, Trellis2DinoConfig};
 pub use trellis2_dit::{Trellis2SlatConfig, Trellis2SlatDit, Trellis2SsConfig, Trellis2SsDit};
 pub use trellis2_mesh::{
-    DualGridFields, DualGridMesh, flexible_dual_grid_to_mesh, softplus_stable,
+    DualGridFields, DualGridMesh, flexible_dual_grid_to_mesh,
+    flexible_dual_grid_to_mesh_auto_split, softplus_stable,
 };
 pub use trellis2_sampler::{
     Trellis2SampleTrace, Trellis2SamplerParams, guided_velocity, pred_to_xstart, sample_dense,
@@ -157,7 +158,8 @@ pub use trellis2_sparse::{
 pub use trellis2_ss_dec::{Trellis2SsDecoder, Trellis2SsDecoderConfig, occupancy_coords};
 pub use trellis2_tex::{
     TexDecodeOutput, Trellis2PbrLayout, Trellis2TexDecoder, Trellis2TexDit, concat_tex_input,
-    pbr_attrs_from_raw, query_vertex_attrs, query_vertex_colors, split_pbr_attrs,
+    pbr_attrs_from_raw, query_vertex_attrs, query_vertex_attrs_in_aabb, query_vertex_colors,
+    split_pbr_attrs,
 };
 pub use trellis2_texture::{
     TRELLIS2_SHAPE_ENC_STAGE_REL, Trellis2TexturingOptions, Trellis2TexturingOutput,
@@ -176,7 +178,8 @@ pub use triposg::{
     TRIPOSG_SCRIBBLE_PROMPT_CONFIDENCE, TRIPOSG_SCRIBBLE_STEPS, TripoSgInferenceOutput,
     TripoSgMeshBuffers, TripoSgPipeline, TripoSgPreparedInputs, TripoSgRunOptions,
     TripoSgScribbleInferenceOutput, TripoSgScribblePipeline, TripoSgScribbleRunOptions,
-    resolve_triposg_scribble_model_dir, resolve_triposg_scribble_model_source,
+    repeat_interleave_batch, resolve_triposg_scribble_model_dir,
+    resolve_triposg_scribble_model_source,
 };
 pub use triposg_dino::TripoSgDinoEncoder;
 pub use triposg_dit::{

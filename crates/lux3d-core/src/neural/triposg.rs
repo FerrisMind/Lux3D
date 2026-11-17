@@ -6,11 +6,13 @@
 use candle_core::Tensor;
 
 use crate::{
-    Result,
     contracts::{ModelFamily, NeuralStage, TensorContract, TripoSgPreparedImage, TripoSgSceneCode},
+    error::Lux3dError,
     runtime::{
-        TRIPOSG_LATENT_CHANNELS, TripoSgInferenceOutput, TripoSgPipeline, TripoSgRunOptions,
+        repeat_interleave_batch, TripoSgInferenceOutput, TripoSgPipeline, TripoSgRunOptions,
+        TRIPOSG_LATENT_CHANNELS,
     },
+    Result,
 };
 
 /// Static description of the TripoSG latent scene produced by the DiT
@@ -39,19 +41,54 @@ impl NeuralStage<TripoSgPreparedImage, TripoSgSceneCode> for TripoSgNeuralStage 
 }
 
 impl TripoSgNeuralStage {
-    /// Conditioning -> latents: DINOv2 image embeds, the Lux3D-seeded
-    /// `[1, num_tokens, 64]` init latents, then the CFG denoise loop.
-    /// Delegates every numerical step to the pipeline.
+    /// Conditioning -> latents for a single image and a single shape (the
+    /// historical entry point). Delegates to
+    /// [`Self::infer_latents_batched`] with `num_shapes = 1`, which is the
+    /// identity expansion and keeps the seeded draw byte-identical.
     pub fn infer_latents(
         &self,
         pipeline: &TripoSgPipeline,
         pixel_values: &Tensor,
         options: &TripoSgRunOptions,
     ) -> Result<TripoSgInferenceOutput> {
+        self.infer_latents_batched(pipeline, pixel_values, 1, options)
+    }
+
+    /// Batched conditioning -> latents: DINOv2 embeds for the `N` images in
+    /// `pixel_values [N, 3, 224, 224]`, expanded with
+    /// `repeat_interleave(num_shapes)` exactly like the reference
+    /// `encode_image` (`pipeline_triposg.py:138-149`), the Lux3D-seeded
+    /// `[N * num_shapes, num_tokens, 64]` init latents drawn as ONE tensor
+    /// (`prepare_latents`, `:151-174`), then the batched CFG denoise loop
+    /// (`:243-275`). The official RNG deviation stays documented: the draw
+    /// STRUCTURE matches (one `[B, ...]` tensor), not the torch values.
+    pub fn infer_latents_batched(
+        &self,
+        pipeline: &TripoSgPipeline,
+        pixel_values: &Tensor,
+        num_shapes: usize,
+        options: &TripoSgRunOptions,
+    ) -> Result<TripoSgInferenceOutput> {
+        if num_shapes == 0 {
+            return Err(Lux3dError::InvalidInput(
+                "TripoSG num_shapes must be at least 1, got 0",
+            ));
+        }
         let image_embeds = pipeline.image_embeds(pixel_values)?;
         crate::runtime::log_wgpu_alloc(pixel_values.device(), "wgpu-dino");
-        let latents_init = TripoSgPipeline::sample_latents(
+        // Reference `image_embeds.repeat_interleave(num_images_per_prompt,
+        // dim=0)` (`pipeline_triposg.py:146`): image-major order, each image
+        // repeated `num_shapes` times.
+        let image_embeds = repeat_interleave_batch(&image_embeds, num_shapes)?;
+        let batch =
+            image_embeds
+                .dim(0)
+                .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                    message: format!("TripoSG conditioning batch dim unavailable: {source}"),
+                })?;
+        let latents_init = TripoSgPipeline::sample_latents_batched(
             options.seed,
+            batch,
             options.num_tokens,
             TRIPOSG_LATENT_CHANNELS,
             pixel_values.device(),

@@ -147,9 +147,9 @@ pub struct RunArgs {
     #[arg(
         long,
         required_unless_present = "surface_input",
-        help = "Input source: a frame directory (.png/.jpg/.jpeg), a video file (.mp4/.mov/.avi/.mkv), or - for `vggt` - a single image file (.png/.jpg/.jpeg/.webp/.bmp/.tif/.tiff). Mutually exclusive with `--surface-input`."
+        help = "Input source: a frame directory (.png/.jpg/.jpeg), a video file (.mp4/.mov/.avi/.mkv), or - for `vggt` - a single image file (.png/.jpg/.jpeg/.webp/.bmp/.tif/.tiff). Repeatable for `triposg` image mode only: each `--source` adds one image to the batch (total batch = N images * `--num-shapes`). Mutually exclusive with `--surface-input`."
     )]
-    pub source: Option<PathBuf>,
+    pub source: Vec<PathBuf>,
 
     #[arg(long)]
     pub interval: Option<usize>,
@@ -203,6 +203,12 @@ pub struct RunArgs {
 
     #[arg(long, help = "TripoSG latent token count (default 2048).")]
     pub num_tokens: Option<usize>,
+
+    #[arg(
+        long,
+        help = "TripoSG number of shapes per prompt (upstream `num_shapes_per_prompt`, default 1). With N > 1 the conditioning is expanded with repeat_interleave, one batched DiT denoise pass draws all samples, and one output mesh is written per sample (total batch = number of `--source` images * N) with a `_0`, `_1`, ... suffix."
+    )]
+    pub num_shapes: Option<usize>,
 
     #[arg(
         long,
@@ -1203,9 +1209,16 @@ pub fn run_model(args: RunArgs) -> anyhow::Result<PathBuf> {
                         .dtype
                         .map(candle_core::DType::from)
                         .unwrap_or(candle_core::DType::F32);
-                    let source = args.source.as_deref().ok_or_else(|| {
-                        anyhow::anyhow!("`--source` is required for `triposg --mode scribble`")
-                    })?;
+                    let source = match args.source.as_slice() {
+                        [source] => source.as_path(),
+                        [] => anyhow::bail!("`--source` is required for `triposg --mode scribble`"),
+                        sources => anyhow::bail!(
+                            "`triposg --mode scribble` accepts exactly one `--source`, got {}: \
+                             the official scribble script runs a single scribble image \
+                             (`scripts/inference_triposg_scribble.py:30`)",
+                            sources.len()
+                        ),
+                    };
                     run_triposg_scribble(
                         model_dir,
                         dit_gguf,
@@ -1224,10 +1237,10 @@ pub fn run_model(args: RunArgs) -> anyhow::Result<PathBuf> {
                         .dtype
                         .map(candle_core::DType::from)
                         .unwrap_or(candle_core::DType::F32);
-                    let input = match (args.source.as_deref(), args.surface_input.as_deref()) {
+                    let input = match (args.source.as_slice(), args.surface_input.as_deref()) {
                         (_, Some(surface)) => TripoSgRunInput::Surface(surface),
-                        (Some(source), None) => TripoSgRunInput::Image(source),
-                        (None, None) => {
+                        (sources, None) if !sources.is_empty() => TripoSgRunInput::Image(sources),
+                        (_, None) => {
                             anyhow::bail!(
                                 "`--source` or `--surface-input` is required for `triposg`"
                             )
@@ -1238,6 +1251,7 @@ pub fn run_model(args: RunArgs) -> anyhow::Result<PathBuf> {
                         rmbg_model_path,
                         input,
                         options,
+                        args.num_shapes.unwrap_or(1),
                         &args.output,
                         &device,
                         dtype,
@@ -1351,10 +1365,20 @@ pub fn run_model(args: RunArgs) -> anyhow::Result<PathBuf> {
 /// `--surface-input`. Clap only makes `--source` optional when
 /// `--surface-input` is present, and the family guards reject that
 /// combination first; this is the defensive fallback.
+///
+/// `--source` is repeatable at the clap layer because `triposg` image mode
+/// accepts a batch; every other family accepts exactly one image/frame
+/// source and fails fast on extra values instead of silently ignoring them.
 fn required_source<'a>(args: &'a RunArgs, family: &str) -> anyhow::Result<&'a Path> {
-    args.source
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("`--source` is required for `{family}`"))
+    match args.source.as_slice() {
+        [] => Err(anyhow::anyhow!("`--source` is required for `{family}`")),
+        [source] => Ok(source),
+        sources => anyhow::bail!(
+            "`{family}` accepts exactly one `--source`, got {} (multiple sources are \
+             only supported for `triposg` image mode)",
+            sources.len()
+        ),
+    }
 }
 
 fn run_pi3(
@@ -1558,6 +1582,12 @@ fn reject_unsupported_triposg_options(args: &RunArgs) -> anyhow::Result<()> {
         anyhow::bail!("`--mc-threshold` is not supported for `triposg`");
     }
     if args.mode == TriposgMode::Image {
+        if args.surface_input.is_some() && args.num_shapes.is_some() {
+            anyhow::bail!(
+                "`--num-shapes` is not supported with `--surface-input`: the reference VAE \
+                 surface-encode path (`scripts/inference_vae.py`) produces a single latent"
+            );
+        }
         if args.prompt.is_some() {
             anyhow::bail!("`--prompt` requires `triposg --mode scribble`");
         }
@@ -1582,6 +1612,12 @@ fn reject_unsupported_triposg_options(args: &RunArgs) -> anyhow::Result<()> {
 fn reject_scribble_mode_conflicts(args: &RunArgs) -> anyhow::Result<()> {
     if args.surface_input.is_some() {
         anyhow::bail!("`--surface-input` is not supported for `triposg --mode scribble`");
+    }
+    if args.num_shapes.is_some() {
+        anyhow::bail!(
+            "`--num-shapes` is not supported for `triposg --mode scribble`: the official \
+             scribble script runs a single shape (`scripts/inference_triposg_scribble.py:32-41`)"
+        );
     }
     if args.rmbg_model_path.is_some() {
         anyhow::bail!(
@@ -1640,6 +1676,12 @@ fn reject_triposg_only_options(args: &RunArgs, family: Family) -> anyhow::Result
     if args.num_tokens.is_some() {
         anyhow::bail!(
             "`--num-tokens` is not supported for `{}`",
+            family.model_family()
+        );
+    }
+    if args.num_shapes.is_some() {
+        anyhow::bail!(
+            "`--num-shapes` is not supported for `{}`",
             family.model_family()
         );
     }
@@ -1791,6 +1833,9 @@ fn reject_unsupported_trellis2_options(args: &RunArgs) -> anyhow::Result<()> {
     }
     if args.num_tokens.is_some() {
         anyhow::bail!("`--num-tokens` is not supported for `trellis2`; use `--max-num-tokens`");
+    }
+    if args.num_shapes.is_some() {
+        anyhow::bail!("`--num-shapes` is not supported for `trellis2`; use `--num-samples`");
     }
     if args.dense_octree_depth.is_some() {
         anyhow::bail!("`--dense-octree-depth` is not supported for `trellis2`");
@@ -3029,23 +3074,28 @@ fn run_triposr(
     Ok(())
 }
 
-/// TripoSG input selection: the image-to-3D path (`--source`) or the
-/// reference VAE surface encode path (`--surface-input`).
+/// TripoSG input selection: the image-to-3D path (`--source`, repeatable for
+/// a batched run) or the reference VAE surface encode path (`--surface-input`).
 enum TripoSgRunInput<'a> {
-    Image(&'a Path),
+    Image(&'a [PathBuf]),
     Surface(&'a Path),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_triposg(
     model_assets: ModelAssetOptions,
     rmbg_model_path: Option<PathBuf>,
     input: TripoSgRunInput<'_>,
     options: TripoSgRunOptions,
+    num_shapes: usize,
     output: &Path,
     device: &candle_core::Device,
     dtype: candle_core::DType,
 ) -> anyhow::Result<()> {
     options.validate().map_err(anyhow::Error::from)?;
+    if num_shapes == 0 {
+        anyhow::bail!("`--num-shapes` must be >= 1");
+    }
     let stage_time = std::env::var_os("LUX3D_STAGE_TIME").is_some();
     let t0 = std::time::Instant::now();
     // `--dtype` selects the pipeline load dtype (default F32 = the reference
@@ -3062,10 +3112,26 @@ fn run_triposg(
     let is_surface = matches!(input, TripoSgRunInput::Surface(_));
     let latents = match input {
         TripoSgRunInput::Surface(surface_path) => {
+            // The surface-encode path produces ONE latent; `--num-shapes` is
+            // rejected in `reject_unsupported_triposg_options` (defensive
+            // guard here as well).
+            if num_shapes != 1 {
+                anyhow::bail!("`--num-shapes` is not supported with `--surface-input`");
+            }
             pipeline.encode_surface_from_path(surface_path, device, &options)?
         }
-        TripoSgRunInput::Image(source) => {
-            pipeline.infer_from_path(source, device, &options)?.latents
+        TripoSgRunInput::Image(sources) => {
+            let inference =
+                pipeline.infer_batch_from_paths(sources, device, num_shapes, &options)?;
+            if stage_time {
+                eprintln!(
+                    "[conditioning] triposg: {} image(s), num_shapes {}, batch {}",
+                    sources.len(),
+                    num_shapes,
+                    inference.latents.dims()[0]
+                );
+            }
+            inference.latents
         }
     };
     if stage_time {
@@ -3077,27 +3143,54 @@ fn run_triposg(
         eprintln!("[stage] {label}: {:.2}s", t1.elapsed().as_secs_f64());
     }
     let t2 = std::time::Instant::now();
-    let mesh = pipeline.extract_mesh(&latents, &options)?;
+    // `num_shapes = 1` + one source (and every surface-input run) uses the
+    // same single-sample `extract_mesh` call as the pre-batch pipeline
+    // (byte-identical mesh); a real batch decodes per sample via
+    // `extract_meshes`.
+    let meshes = if latents.dims()[0] == 1 {
+        vec![pipeline.extract_mesh(&latents, &options)?]
+    } else {
+        pipeline.extract_meshes(&latents, &options)?
+    };
     if stage_time {
         eprintln!("[stage] mesh: {:.2}s", t2.elapsed().as_secs_f64());
     }
-    // `extract_mesh` already returned the post-simplified buffers when
-    // `--faces` triggered the merge-close + quadric pass, so these counts
-    // (and the mesh written by `export_mesh` below) reflect the
+    // `extract_mesh`/`extract_meshes` already returned the post-simplified
+    // buffers when `--faces` triggered the merge-close + quadric pass, so
+    // these counts (and the meshes written below) reflect the
     // simplification.
-    eprintln!(
-        "[mesh] triposg: {} vertices, {} faces{}",
-        mesh.vertices.dims()[0],
-        mesh.faces.dims()[0],
-        match options.faces {
+    let num_outputs = meshes.len();
+    for (index, mesh) in meshes.iter().enumerate() {
+        let path = sample_output_path(output, index, num_outputs);
+        let faces_note = match options.faces {
             Some(faces) => format!(" (target {faces})"),
             None => String::new(),
+        };
+        if num_outputs == 1 {
+            // Preserve the historical single-output log line verbatim
+            // (`--num-shapes 1` + one source).
+            eprintln!(
+                "[mesh] triposg: {} vertices, {} faces{}",
+                mesh.vertices.dims()[0],
+                mesh.faces.dims()[0],
+                faces_note
+            );
+        } else {
+            eprintln!(
+                "[mesh] triposg {}/{}: {} vertices, {} faces{} -> {}",
+                index + 1,
+                num_outputs,
+                mesh.vertices.dims()[0],
+                mesh.faces.dims()[0],
+                faces_note,
+                path.display()
+            );
         }
-    );
-    let t3 = std::time::Instant::now();
-    pipeline.export_mesh(&mesh, output)?;
-    if stage_time {
-        eprintln!("[stage] export: {:.2}s", t3.elapsed().as_secs_f64());
+        let t3 = std::time::Instant::now();
+        pipeline.export_mesh(mesh, &path)?;
+        if stage_time {
+            eprintln!("[stage] export: {:.2}s", t3.elapsed().as_secs_f64());
+        }
     }
     Ok(())
 }
@@ -5843,6 +5936,154 @@ mod tests {
     }
 
     #[test]
+    fn run_triposg_source_is_repeatable_with_num_shapes() {
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "triposg",
+            "--source",
+            "first.png",
+            "--source",
+            "second.png",
+            "--num-shapes",
+            "2",
+            "--output",
+            "out.glb",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(
+            args.source,
+            vec![PathBuf::from("first.png"), PathBuf::from("second.png")]
+        );
+        assert_eq!(args.num_shapes, Some(2));
+        // The options builder is source-agnostic; the batch size is passed to
+        // the runner separately (`num_shapes` defaults to 1).
+        let options = super::triposg_run_options_from_args(&args).expect("options");
+        assert_eq!(options.num_tokens, 2048);
+    }
+
+    #[test]
+    fn run_triposg_num_shapes_rejected_for_scribble_and_surface_input() {
+        // `--mode scribble`: the official scribble script runs a single shape.
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "triposg",
+            "--mode",
+            "scribble",
+            "--source",
+            "scribble.png",
+            "--prompt",
+            "a chair",
+            "--num-shapes",
+            "2",
+            "--output",
+            "out.glb",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        let error = super::reject_scribble_mode_conflicts(&args)
+            .expect_err("--num-shapes must be rejected for scribble mode");
+        assert!(
+            error.to_string().contains("--num-shapes"),
+            "unexpected message: `{error}`"
+        );
+
+        // `--surface-input` produces exactly one latent.
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "triposg",
+            "--surface-input",
+            "surface.npy",
+            "--num-shapes",
+            "2",
+            "--output",
+            "out.glb",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        let error = super::reject_unsupported_triposg_options(&args)
+            .expect_err("--num-shapes must be rejected with --surface-input");
+        assert!(
+            error.to_string().contains("--num-shapes"),
+            "unexpected message: `{error}`"
+        );
+    }
+
+    #[test]
+    fn multiple_sources_rejected_for_single_source_families() {
+        for family in ["pi3", "pi3x", "triposr", "trellis2", "vggt"] {
+            let cli = Cli::parse_from([
+                "lux3d", "run", family, "--source", "first", "--source", "second", "--output",
+                "out",
+            ]);
+            let Command::Run(args) = cli.command else {
+                panic!("expected run command");
+            };
+            let error = super::required_source(&args, family)
+                .expect_err(&format!("multiple sources must be rejected for {family}"));
+            assert!(
+                error.to_string().contains("exactly one `--source`"),
+                "unexpected message for {family}: `{error}`"
+            );
+        }
+    }
+
+    #[test]
+    fn num_shapes_rejected_for_other_families() {
+        for family in ["pi3", "pi3x", "triposr", "vggt"] {
+            let cli = Cli::parse_from([
+                "lux3d",
+                "run",
+                family,
+                "--source",
+                "input",
+                "--num-shapes",
+                "2",
+                "--output",
+                "out",
+            ]);
+            let Command::Run(args) = cli.command else {
+                panic!("expected run command");
+            };
+            let error = super::reject_triposg_only_options(&args, args.family)
+                .expect_err(&format!("--num-shapes must be rejected for {family}"));
+            assert!(
+                error.to_string().contains("--num-shapes"),
+                "unexpected message for {family}: `{error}`"
+            );
+        }
+
+        // `trellis2` does not route through `reject_triposg_only_options`;
+        // its own guard must reject the flag (use `--num-samples` instead).
+        let cli = Cli::parse_from([
+            "lux3d",
+            "run",
+            "trellis2",
+            "--source",
+            "input",
+            "--num-shapes",
+            "2",
+            "--output",
+            "out",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        let error = super::reject_unsupported_trellis2_options(&args)
+            .expect_err("--num-shapes must be rejected for trellis2");
+        assert!(
+            error.to_string().contains("--num-shapes"),
+            "unexpected message for trellis2: `{error}`"
+        );
+    }
+
+    #[test]
     fn run_triposg_surface_input_parses_without_source() {
         let cli = Cli::parse_from([
             "lux3d",
@@ -5857,7 +6098,7 @@ mod tests {
             panic!("expected run command");
         };
         assert_eq!(args.surface_input, Some(PathBuf::from("surface.npy")));
-        assert_eq!(args.source, None);
+        assert!(args.source.is_empty());
         let options = super::triposg_run_options_from_args(&args).expect("surface options");
         // `scripts/inference_vae.py:50-58` decodes with
         // `hierarchical_extract_geometry` (no flash decoder, depths 8/9).
@@ -6419,14 +6660,12 @@ mod tests {
         let args = RunArgs {
             family: super::Family::Pi3,
             device: super::DeviceBackend::Cuda,
-            source: Some(
-                repo_root()
-                    .join("tp")
-                    .join("3d")
-                    .join("Pi3")
-                    .join("examples")
-                    .join("house"),
-            ),
+            source: vec![repo_root()
+                .join("tp")
+                .join("3d")
+                .join("Pi3")
+                .join("examples")
+                .join("house")],
             surface_input: None,
             mode: super::TriposgMode::Image,
             prompt: None,
@@ -6445,6 +6684,7 @@ mod tests {
             guidance_scale: None,
             seed: None,
             num_tokens: None,
+            num_shapes: None,
             dense_octree_depth: None,
             hierarchical_octree_depth: None,
             flash_decoder: None,
@@ -6509,14 +6749,12 @@ mod tests {
         let args = RunArgs {
             family: super::Family::Triposr,
             device: super::DeviceBackend::Cuda,
-            source: Some(
-                repo_root()
-                    .join("tp")
-                    .join("3d")
-                    .join("TripoSR")
-                    .join("examples")
-                    .join("horse.png"),
-            ),
+            source: vec![repo_root()
+                .join("tp")
+                .join("3d")
+                .join("TripoSR")
+                .join("examples")
+                .join("horse.png")],
             surface_input: None,
             mode: super::TriposgMode::Image,
             prompt: None,
@@ -6535,6 +6773,7 @@ mod tests {
             guidance_scale: None,
             seed: None,
             num_tokens: None,
+            num_shapes: None,
             dense_octree_depth: None,
             hierarchical_octree_depth: None,
             flash_decoder: None,
@@ -6601,14 +6840,12 @@ mod tests {
         let args = RunArgs {
             family: super::Family::Triposr,
             device: super::DeviceBackend::Cuda,
-            source: Some(
-                repo_root()
-                    .join("tp")
-                    .join("3d")
-                    .join("TripoSR")
-                    .join("examples")
-                    .join("horse.png"),
-            ),
+            source: vec![repo_root()
+                .join("tp")
+                .join("3d")
+                .join("TripoSR")
+                .join("examples")
+                .join("horse.png")],
             surface_input: None,
             mode: super::TriposgMode::Image,
             prompt: None,
@@ -6627,6 +6864,7 @@ mod tests {
             guidance_scale: None,
             seed: None,
             num_tokens: None,
+            num_shapes: None,
             dense_octree_depth: None,
             hierarchical_octree_depth: None,
             flash_decoder: None,
@@ -6689,15 +6927,13 @@ mod tests {
         let args = RunArgs {
             family: super::Family::Pi3x,
             device: super::DeviceBackend::Cuda,
-            source: Some(
-                repo_root()
-                    .join("tp")
-                    .join("3d")
-                    .join("Pi3")
-                    .join("examples")
-                    .join("room")
-                    .join("rgb"),
-            ),
+            source: vec![repo_root()
+                .join("tp")
+                .join("3d")
+                .join("Pi3")
+                .join("examples")
+                .join("room")
+                .join("rgb")],
             surface_input: None,
             mode: super::TriposgMode::Image,
             prompt: None,
@@ -6724,6 +6960,7 @@ mod tests {
             guidance_scale: None,
             seed: None,
             num_tokens: None,
+            num_shapes: None,
             dense_octree_depth: None,
             hierarchical_octree_depth: None,
             flash_decoder: None,
@@ -6788,14 +7025,12 @@ mod tests {
         let args = RunArgs {
             family: super::Family::Pi3x,
             device: super::DeviceBackend::Cuda,
-            source: Some(
-                repo_root()
-                    .join("tp")
-                    .join("3d")
-                    .join("Pi3")
-                    .join("examples")
-                    .join("skating.mp4"),
-            ),
+            source: vec![repo_root()
+                .join("tp")
+                .join("3d")
+                .join("Pi3")
+                .join("examples")
+                .join("skating.mp4")],
             surface_input: None,
             mode: super::TriposgMode::Image,
             prompt: None,
@@ -6818,6 +7053,7 @@ mod tests {
             guidance_scale: None,
             seed: None,
             num_tokens: None,
+            num_shapes: None,
             dense_octree_depth: None,
             hierarchical_octree_depth: None,
             flash_decoder: None,

@@ -359,11 +359,13 @@ fn surface_selection_indices(total: usize, count: usize, seed: u64) -> Vec<usize
 /// depth 9, `num_chunks`-equivalent query chunk 16384).
 ///
 /// Upstream knobs without a field here:
-/// - `num_shapes_per_prompt` (>1) is not supported: every TripoSG path in
-///   Lux3D is batch-1 by contract (the VAE decoder and the CFG denoise loop
-///   both enforce batch 1), so multi-shape generation would need a batched
-///   rewrite of the whole decode stack. `num_shapes_per_prompt = 1` (the
-///   reference default) is the only behavior.
+/// - `num_shapes_per_prompt`: exposed as the explicit `num_shapes` argument
+///   of [`TripoSgPipeline::infer_batch_from_paths`] (CLI `--num-shapes`).
+///   The batch contract is `num_images * num_shapes`; the conditioning pass
+///   expands via `repeat_interleave` (`pipeline_triposg.py:146`) and the DiT
+///   runs batched, while the VAE decode loops per sample (the reference
+///   decode helpers are effectively batch-1). The `num_shapes = 1` +
+///   single-image path is byte-identical to the pre-batch pipeline.
 /// - `latents` / `generator` / `attention_kwargs` / callback hooks: latents
 ///   are injected through `infer_with_latents`, the Lux3D RNG replaces the
 ///   torch generator (module docs), and the remaining plumbing has no
@@ -565,14 +567,18 @@ impl TripoSgRunOptions {
 pub use crate::preprocess::TripoSgPreparedInputs;
 
 /// TripoSG inference output: DINOv2 conditioning embeds, the seeded initial
-/// latents and the denoised latents (all F32).
+/// latents and the denoised latents (all F32). The batch axis is
+/// `num_images * num_shapes`, in image-major `repeat_interleave` order
+/// (`pipeline_triposg.py:146, 233-241`); a single image with `num_shapes = 1`
+/// keeps the historical `[1, ...]` shapes.
 #[derive(Debug, Clone)]
 pub struct TripoSgInferenceOutput {
-    /// `[1, 257, 1024]` last hidden state of the DINOv2-large encoder.
+    /// `[B, 257, 1024]` last hidden state of the DINOv2-large encoder after
+    /// the `repeat_interleave(num_shapes)` conditioning expansion.
     pub image_embeds: Tensor,
-    /// `[1, num_tokens, 64]` seeded standard-normal init latents.
+    /// `[B, num_tokens, 64]` seeded standard-normal init latents (ONE draw).
     pub latents_init: Tensor,
-    /// `[1, num_tokens, 64]` latents after the rectified-flow Euler schedule
+    /// `[B, num_tokens, 64]` latents after the rectified-flow Euler schedule
     /// (`steps` steps, or exactly `options.timesteps` when the explicit
     /// schedule override is set).
     pub latents: Tensor,
@@ -604,6 +610,49 @@ pub struct TripoSgMeshBuffers {
     pub vertices: Tensor,
     /// `[F, 3]` I64 zero-based triangle indices on the latents' device.
     pub faces: Tensor,
+}
+
+/// `repeat_interleave(repeats, dim=0)` on the batch axis of `[N, S, D]`
+/// conditioning embeds (`pipeline_triposg.py:146`): the output is
+/// `[N * repeats, S, D]` with image-major order, i.e. rows
+/// `[0, 0, ..., 1, 1, ..., N - 1, N - 1, ...]`.
+///
+/// `repeats == 1` returns the input unchanged (the historical single-shape
+/// path stays byte-identical), and `repeats == 0` is rejected.
+pub fn repeat_interleave_batch(embeds: &Tensor, repeats: usize) -> Result<Tensor> {
+    if repeats == 0 {
+        return Err(Lux3dError::InvalidInput(
+            "TripoSG repeat_interleave repeats must be at least 1, got 0",
+        ));
+    }
+    if repeats == 1 {
+        return Ok(embeds.clone());
+    }
+    let batch = embeds
+        .dim(0)
+        .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+            message: format!("TripoSG conditioning embeds must be rank >= 1: {source}"),
+        })?;
+    if batch == 0 {
+        return Err(Lux3dError::InvalidInput(
+            "TripoSG conditioning batch must be at least 1, got 0",
+        ));
+    }
+    let mut rows = Vec::with_capacity(batch * repeats);
+    for index in 0..batch {
+        let row = embeds.narrow(0, index, 1).map_err(|source| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!("failed to slice TripoSG conditioning row {index}: {source}"),
+            }
+        })?;
+        for _ in 0..repeats {
+            rows.push(row.clone());
+        }
+    }
+    let refs: Vec<&Tensor> = rows.iter().collect();
+    Tensor::cat(&refs, 0).map_err(|source| Lux3dError::CanonicalWeightsValidation {
+        message: format!("failed to expand TripoSG conditioning batch: {source}"),
+    })
 }
 
 /// Everything the pipeline needs per device: the DINOv2 image encoder, the
@@ -1243,6 +1292,30 @@ impl TripoSgPipeline {
         channels: usize,
         device: &Device,
     ) -> Result<Tensor> {
+        Self::sample_latents_batched(seed, 1, num_tokens, channels, device)
+    }
+
+    /// Batched variant of [`Self::sample_latents`]: ONE `[batch, num_tokens,
+    /// channels]` draw from the Lux3D RNG, matching the reference
+    /// `prepare_latents` shape (`pipeline_triposg.py:164-174`: a single
+    /// `randn_tensor((batch_size * num_shapes_per_prompt, num_tokens,
+    /// channels), generator=...)`). `batch = 1` is **bit-identical** to
+    /// [`Self::sample_latents`] (same RNG sequence, same tensor shape), and
+    /// for `batch > 1` sample `i` occupies rows `[i, ...]` in draw order —
+    /// the documented RNG deviation still applies (values are
+    /// distribution-equivalent, not torch-draw-identical).
+    pub fn sample_latents_batched(
+        seed: u64,
+        batch: usize,
+        num_tokens: usize,
+        channels: usize,
+        device: &Device,
+    ) -> Result<Tensor> {
+        if batch == 0 {
+            return Err(Lux3dError::InvalidInput(
+                "TripoSG latent batch must be at least 1, got 0",
+            ));
+        }
         if num_tokens == 0 || channels == 0 {
             return Err(Lux3dError::CanonicalWeightsValidation {
                 message: format!(
@@ -1252,11 +1325,11 @@ impl TripoSgPipeline {
             });
         }
         let mut rng = SeededNormalRng::new(seed);
-        let mut values = Vec::with_capacity(num_tokens * channels);
-        for _ in 0..(num_tokens * channels) {
+        let mut values = Vec::with_capacity(batch * num_tokens * channels);
+        for _ in 0..(batch * num_tokens * channels) {
             values.push(rng.next_standard_normal() as f32);
         }
-        Tensor::from_vec(values, (1, num_tokens, channels), &Device::Cpu)
+        Tensor::from_vec(values, (batch, num_tokens, channels), &Device::Cpu)
             .and_then(|tensor| tensor.to_device(device))
             .map_err(|source| Lux3dError::CanonicalWeightsValidation {
                 message: format!("failed to materialize TripoSG seeded latents: {source}"),
@@ -1327,11 +1400,78 @@ impl TripoSgPipeline {
             .infer_latents(self, &prepared.pixel_values, options)
     }
 
+    /// Stack the DINOv2 `pixel_values` of every source into `[N, 3, 224,
+    /// 224]`: each source goes through the full per-image preprocess (alpha
+    /// or RMBG foreground path), matching the reference script calling
+    /// `prepare_image` per input before the pipeline consumes a batch
+    /// (`scripts/inference_triposg.py:33` + `pipeline_triposg.py:203-210`).
+    /// A single source returns its tensor unchanged.
+    pub fn prepare_batch_from_paths(&self, sources: &[PathBuf], device: &Device) -> Result<Tensor> {
+        if sources.is_empty() {
+            return Err(Lux3dError::InvalidInput(
+                "TripoSG batch inference requires at least one image source",
+            ));
+        }
+        if sources.len() == 1 {
+            return Ok(self
+                .prepare_inputs_from_path(&sources[0], device)?
+                .pixel_values);
+        }
+        let mut pixel_values = Vec::with_capacity(sources.len());
+        for source in sources {
+            pixel_values.push(self.prepare_inputs_from_path(source, device)?.pixel_values);
+        }
+        let refs: Vec<&Tensor> = pixel_values.iter().collect();
+        Tensor::cat(&refs, 0).map_err(|source| Lux3dError::CanonicalWeightsValidation {
+            message: format!("failed to stack TripoSG batch pixel values: {source}"),
+        })
+    }
+
+    /// Batched inference over `N` image sources with `num_shapes` samples per
+    /// image: total batch `B = N * num_shapes`.
+    ///
+    /// Mirrors the reference pipeline call shape
+    /// (`pipeline_triposg.py:203-241`): ONE conditioning pass over the
+    /// stacked `[N, 3, 224, 224]` pixel values, `repeat_interleave` on the
+    /// batch axis by `num_shapes` (`:146`), one `[B, num_tokens, 64]` latent
+    /// draw (`:164-174, :233-241`) and the batched DiT denoise loop
+    /// (`:243-275`). The single-source + `num_shapes = 1` case delegates to
+    /// [`Self::infer_from_path`], so that path is byte-identical to the
+    /// pre-batch pipeline.
+    pub fn infer_batch_from_paths(
+        &self,
+        sources: &[PathBuf],
+        device: &Device,
+        num_shapes: usize,
+        options: &TripoSgRunOptions,
+    ) -> Result<TripoSgInferenceOutput> {
+        options.validate()?;
+        if num_shapes == 0 {
+            return Err(Lux3dError::InvalidInput(
+                "TripoSG num_shapes must be at least 1, got 0",
+            ));
+        }
+        if sources.is_empty() {
+            return Err(Lux3dError::InvalidInput(
+                "TripoSG batch inference requires at least one image source",
+            ));
+        }
+        if sources.len() == 1 && num_shapes == 1 {
+            return self.infer_from_path(&sources[0], device, options);
+        }
+        let pixel_values = self.prepare_batch_from_paths(sources, device)?;
+        self.neural
+            .infer_latents_batched(self, &pixel_values, num_shapes, options)
+    }
+
     /// Denoise caller-supplied initial latents with classifier-free guidance.
     /// The latents are NOT regenerated here: `latents_init` must already be
-    /// `[1, num_tokens, 64]` (batch 1), e.g. from [`Self::sample_latents`] or
-    /// a parity baseline. `image_embeds` is the conditional DINOv2 context;
-    /// the uncond branch is `zeros_like` inside the denoise loop.
+    /// `[B, num_tokens, 64]` (`B = num_images * num_shapes`; `B = 1` is the
+    /// historical single-sample contract), e.g. from [`Self::sample_latents`]
+    /// / [`Self::sample_latents_batched`] or a parity baseline.
+    /// `image_embeds` is the conditional DINOv2 context and must have the
+    /// same batch dimension; the uncond branch is `zeros_like` inside the
+    /// denoise loop.
     ///
     /// The schedule is the linear rectified-flow Euler schedule for
     /// `options.steps`, or — when `options.timesteps` is `Some` — the exact
@@ -1345,7 +1485,27 @@ impl TripoSgPipeline {
         options: &TripoSgRunOptions,
     ) -> Result<Tensor> {
         options.validate()?;
-        Self::validate_latents(latents_init, options.num_tokens)?;
+        Self::validate_batched_latents(latents_init, options.num_tokens)?;
+        let latent_batch =
+            latents_init
+                .dim(0)
+                .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                    message: format!("TripoSG latents batch dim unavailable: {source}"),
+                })?;
+        let (cond_batch, _cond_seq, _cond_dim) =
+            image_embeds
+                .dims3()
+                .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                    message: format!("TripoSG image embeds must be [B, S, D]: {source}"),
+                })?;
+        if cond_batch != latent_batch {
+            return Err(Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "TripoSG conditioning batch {cond_batch} does not match latent batch \
+                     {latent_batch} (expected num_images * num_shapes)"
+                ),
+            });
+        }
         let bundle = self.bundle_for(latents_init.device())?;
         let scheduler = match &options.timesteps {
             Some(timesteps) => RectifiedFlowSchedule::from_timesteps(timesteps, SCHEDULER_SHIFT),
@@ -1505,6 +1665,51 @@ impl TripoSgPipeline {
     ) -> Result<TripoSgMeshBuffers> {
         options.validate()?;
         Self::validate_latents(latents, options.num_tokens)?;
+        let mesh_cpu = self.decode_mesh(latents, options)?;
+        triposg_mesh_buffers(&mesh_cpu, latents.device())
+    }
+
+    /// Batched decode for `latents [B, num_tokens, 64]` (`B = num_images *
+    /// num_shapes`): one mesh per sample, returned in batch order (which is
+    /// image-major after the `repeat_interleave` conditioning expansion).
+    ///
+    /// The reference decode helpers are effectively batch-1 (`flash_extract_
+    /// geometry` squeezes the latent batch, `inference_utils.py:384-385`;
+    /// the hierarchical path feeds one dense query grid through a batch-1 kv
+    /// cache), so Lux3D loops the existing single-sample decode per row —
+    /// exactly the same flash/DiffDMC and dense/hierarchical marching-cubes
+    /// code, `--faces` postprocess included. Conditioning and the DiT stay
+    /// batched.
+    pub fn extract_meshes(
+        &self,
+        latents: &Tensor,
+        options: &TripoSgRunOptions,
+    ) -> Result<Vec<TripoSgMeshBuffers>> {
+        options.validate()?;
+        Self::validate_batched_latents(latents, options.num_tokens)?;
+        let batch = latents
+            .dim(0)
+            .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                message: format!("TripoSG latents batch dim unavailable: {source}"),
+            })?;
+        let device = latents.device().clone();
+        let mut meshes = Vec::with_capacity(batch);
+        for index in 0..batch {
+            let sample = latents.narrow(0, index, 1).map_err(|source| {
+                Lux3dError::CanonicalWeightsValidation {
+                    message: format!("failed to slice TripoSG latent sample {index}: {source}"),
+                }
+            })?;
+            let mesh_cpu = self.decode_mesh(&sample, options)?;
+            meshes.push(triposg_mesh_buffers(&mesh_cpu, &device)?);
+        }
+        Ok(meshes)
+    }
+
+    /// Shared per-sample decode body (latents `[1, num_tokens, 64]` already
+    /// validated/converted by the callers below): flash or hierarchical SDF
+    /// grid -> mesh -> `--faces` postprocess.
+    fn decode_mesh(&self, latents: &Tensor, options: &TripoSgRunOptions) -> Result<TripoSgMeshCpu> {
         let bundle = self.bundle_for(latents.device())?;
         let latents = latents.to_dtype(self.dtype).map_err(|source| {
             Lux3dError::CanonicalWeightsValidation {
@@ -1570,23 +1775,7 @@ impl TripoSgPipeline {
                 mesh_cpu = simplified;
             }
         }
-
-        let device = latents.device().clone();
-        let vertex_count = mesh_cpu.vertices.len() / 3;
-        let face_count = mesh_cpu.faces.len() / 3;
-        let vertices =
-            Tensor::from_vec(mesh_cpu.vertices, (vertex_count, 3), &device).map_err(|source| {
-                Lux3dError::CanonicalWeightsValidation {
-                    message: format!("failed to materialize TripoSG mesh vertices: {source}"),
-                }
-            })?;
-        let faces =
-            Tensor::from_vec(mesh_cpu.faces, (face_count, 3), &device).map_err(|source| {
-                Lux3dError::CanonicalWeightsValidation {
-                    message: format!("failed to materialize TripoSG mesh faces: {source}"),
-                }
-            })?;
-        Ok(TripoSgMeshBuffers { vertices, faces })
+        Ok(mesh_cpu)
     }
 
     /// Export mesh buffers in the format selected by `path`'s extension:
@@ -1602,19 +1791,41 @@ impl TripoSgPipeline {
         self.export.write_obj(&mesh_cpu, path)
     }
 
-    /// `latents` must be `[1, num_tokens, 64]` (batch 1 — the VAE decoder and
-    /// the CFG denoise loop are batch-1 paths).
+    /// `latents` must be `[1, num_tokens, 64]` (batch 1 — the single-sample
+    /// VAE decode path).
     fn validate_latents(latents: &Tensor, num_tokens: usize) -> Result<()> {
+        Self::validate_latents_shape(latents, num_tokens, Some(1))
+    }
+
+    /// `latents` must be `[B, num_tokens, 64]` with `B >= 1` (batched decode
+    /// and batched denoise).
+    fn validate_batched_latents(latents: &Tensor, num_tokens: usize) -> Result<()> {
+        Self::validate_latents_shape(latents, num_tokens, None)
+    }
+
+    fn validate_latents_shape(
+        latents: &Tensor,
+        num_tokens: usize,
+        expected_batch: Option<usize>,
+    ) -> Result<()> {
         let dims = latents.dims();
+        let batch_ok = match expected_batch {
+            Some(expected) => dims.first() == Some(&expected),
+            None => dims.first().is_some_and(|batch| *batch >= 1),
+        };
         if dims.len() != 3
-            || dims[0] != 1
+            || !batch_ok
             || dims[1] != num_tokens
             || dims[2] != TRIPOSG_LATENT_CHANNELS
         {
+            let batch_description = match expected_batch {
+                Some(expected) => format!("{expected}"),
+                None => "B >= 1".to_string(),
+            };
             return Err(Lux3dError::CanonicalWeightsValidation {
                 message: format!(
-                    "TripoSG latents must be [1, {num_tokens}, {TRIPOSG_LATENT_CHANNELS}] \
-                     (batch 1), got {dims:?}"
+                    "TripoSG latents must be [{batch_description}, {num_tokens}, \
+                     {TRIPOSG_LATENT_CHANNELS}], got {dims:?}"
                 ),
             });
         }
@@ -1836,6 +2047,132 @@ mod surface_selection_tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert!(sorted.len() <= 3);
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    fn embeds(rows: &[[f32; 2]]) -> Tensor {
+        let values = rows
+            .iter()
+            .flat_map(|row| row.iter().copied())
+            .collect::<Vec<_>>();
+        Tensor::from_vec(values, (rows.len(), 1, 2), &Device::Cpu).unwrap()
+    }
+
+    fn embed_values(tensor: &Tensor) -> Vec<f32> {
+        tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    #[test]
+    fn repeat_interleave_matches_reference_order() {
+        // Reference: `image_embeds.repeat_interleave(num_shapes, dim=0)`
+        // (pipeline_triposg.py:146) -> image-major, each image repeated.
+        let input = embeds(&[[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]]);
+        let expanded = repeat_interleave_batch(&input, 2).unwrap();
+        assert_eq!(expanded.dims(), &[6, 1, 2]);
+        assert_eq!(
+            embed_values(&expanded),
+            vec![0.0, 1.0, 0.0, 1.0, 2.0, 3.0, 2.0, 3.0, 4.0, 5.0, 4.0, 5.0]
+        );
+
+        // Factor 1 is the identity (keeps the historical path byte-identical).
+        let identity = repeat_interleave_batch(&input, 1).unwrap();
+        assert_eq!(identity.dims(), input.dims());
+        assert_eq!(embed_values(&identity), embed_values(&input));
+
+        // Total batch is always N * num_shapes.
+        for repeats in 1..=4 {
+            let expanded = repeat_interleave_batch(&input, repeats).unwrap();
+            assert_eq!(expanded.dims()[0], 3 * repeats);
+        }
+    }
+
+    #[test]
+    fn repeat_interleave_rejects_zero() {
+        let input = embeds(&[[0.0, 1.0]]);
+        let error = repeat_interleave_batch(&input, 0).unwrap_err();
+        assert!(error.to_string().contains("repeats must be at least 1"));
+    }
+
+    #[test]
+    fn batched_latents_have_one_draw_per_sample() {
+        let device = Device::Cpu;
+        let single = TripoSgPipeline::sample_latents(42, 8, 4, &device).unwrap();
+        assert_eq!(single.dims(), &[1, 8, 4]);
+
+        let batch = TripoSgPipeline::sample_latents_batched(42, 3, 8, 4, &device).unwrap();
+        assert_eq!(batch.dims(), &[3, 8, 4]);
+
+        // Batch = 1 is exactly the historical single-sample draw.
+        let batch_one = TripoSgPipeline::sample_latents_batched(42, 1, 8, 4, &device).unwrap();
+        assert_eq!(
+            batch_one.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            single.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+
+        // Sample 0 of a batch starts from the same RNG sequence as the
+        // single-sample draw: the batch draw is one continuation, not a
+        // per-row reseed.
+        let first_row = batch
+            .narrow(0, 0, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(
+            first_row,
+            single.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+
+        // Batch rows are independent draws (no accidental broadcast).
+        let rows = batch
+            .narrow(0, 0, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let second = batch
+            .narrow(0, 1, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_ne!(rows, second);
+    }
+
+    #[test]
+    fn batched_latents_reject_empty_batch() {
+        let error = TripoSgPipeline::sample_latents_batched(42, 0, 8, 4, &Device::Cpu).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("latent batch must be at least 1"));
+    }
+
+    #[test]
+    fn batched_latent_shape_validation() {
+        let device = Device::Cpu;
+        // [2, 8, 64] is the batched shape (`num_images * num_shapes`).
+        let batched = Tensor::zeros((2, 8, TRIPOSG_LATENT_CHANNELS), DType::F32, &device).unwrap();
+        TripoSgPipeline::validate_batched_latents(&batched, 8).unwrap();
+        // The single-sample decode path still requires batch 1.
+        TripoSgPipeline::validate_latents(&batched, 8).unwrap_err();
+        TripoSgPipeline::validate_latents(&batched.narrow(0, 0, 1).unwrap(), 8).unwrap();
+
+        // Wrong token count / channel count / rank are rejected on both.
+        let wrong_tokens =
+            Tensor::zeros((2, 7, TRIPOSG_LATENT_CHANNELS), DType::F32, &device).unwrap();
+        TripoSgPipeline::validate_batched_latents(&wrong_tokens, 8).unwrap_err();
+        let wrong_channels = Tensor::zeros((2, 8, 63), DType::F32, &device).unwrap();
+        TripoSgPipeline::validate_batched_latents(&wrong_channels, 8).unwrap_err();
+        let wrong_rank = Tensor::zeros((2, 8), DType::F32, &device).unwrap();
+        TripoSgPipeline::validate_batched_latents(&wrong_rank, 8).unwrap_err();
+        TripoSgPipeline::validate_latents(&wrong_rank, 8).unwrap_err();
     }
 }
 
