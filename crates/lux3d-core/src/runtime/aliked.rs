@@ -1144,9 +1144,10 @@ mod tests {
             .into_iter()
             .map(|value| f32::from(value) / 255.0)
             .collect();
-        let input = Tensor::from_vec(values, (1, channels, height, width), &Device::Cpu).unwrap();
+        let (device, _guard) = crate::runtime::keypoints::test_device();
+        let input = Tensor::from_vec(values, (1, channels, height, width), &device).unwrap();
 
-        let detector = AlikedDetector::load(weights, &Device::Cpu, DType::F32).unwrap();
+        let detector = AlikedDetector::load(weights, &device, DType::F32).unwrap();
         let got = detector.detect(&input, &official_options()).unwrap();
         assert_eq!(
             got.len(),
@@ -1249,7 +1250,8 @@ mod tests {
             );
             return;
         }
-        let detector = AlikedDetector::load(weights, &Device::Cpu, DType::F32).unwrap();
+        let (device, _guard) = crate::runtime::keypoints::test_device();
+        let detector = AlikedDetector::load(weights, &device, DType::F32).unwrap();
         let (height, width) = (128_usize, 128_usize);
         let mut values = Vec::with_capacity(3 * height * width);
         for channel in 0..3 {
@@ -1266,7 +1268,7 @@ mod tests {
                 }
             }
         }
-        let input = Tensor::from_vec(values, (3, height, width), &Device::Cpu).unwrap();
+        let input = Tensor::from_vec(values, (3, height, width), &device).unwrap();
         let got = detector.detect(&input, &official_options()).unwrap();
         assert!(
             !got.is_empty(),
@@ -1300,7 +1302,7 @@ mod tests {
                 }
             }
         }
-        let input = Tensor::from_vec(values, (3, height, width), &Device::Cpu).unwrap();
+        let input = Tensor::from_vec(values, (3, height, width), &device).unwrap();
         let options = KeypointOptions {
             resize_long_side: Some(128),
             ..official_options()

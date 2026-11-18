@@ -822,12 +822,13 @@ mod tests {
             return;
         }
 
+        let (device, _guard) = crate::runtime::keypoints::test_device();
         let detector =
-            SuperPointDetector::load(weights, &Device::Cpu, DType::F32).expect("load SuperPoint");
+            SuperPointDetector::load(weights, &device, DType::F32).expect("load SuperPoint");
         let mut npz =
             NpzReader::new(File::open(fixture).expect("open golden")).expect("read golden npz");
 
-        let image = u8_tensor(npz.by_name("image").expect("golden image"), &Device::Cpu);
+        let image = u8_tensor(npz.by_name("image").expect("golden image"), &device);
         let expected_keypoints = f32_array(&mut npz, "keypoints");
         let expected_scores = f32_array(&mut npz, "scores");
         let expected_descriptors = f32_array(&mut npz, "descriptors");
@@ -913,7 +914,7 @@ mod tests {
     }
 
     #[test]
-    fn superpoint_real_weights_128_cpu() {
+    fn superpoint_real_weights_128() {
         let weights = Path::new(WEIGHTS);
         if !weights.is_file() {
             eprintln!(
@@ -922,10 +923,11 @@ mod tests {
             );
             return;
         }
+        let (device, _guard) = crate::runtime::keypoints::test_device();
         let detector =
-            SuperPointDetector::load(weights, &Device::Cpu, DType::F32).expect("load SuperPoint");
+            SuperPointDetector::load(weights, &device, DType::F32).expect("load SuperPoint");
 
-        let rgb = synthetic_rgb(128, 128);
+        let rgb = synthetic_rgb(128, 128, &device);
         let options = KeypointOptions {
             max_keypoints: 4096,
             detection_threshold: 0.005,
@@ -1028,7 +1030,7 @@ mod tests {
         assert_eq!(simple_nms(&scores, 5, 5, 1), expected);
     }
 
-    fn synthetic_rgb(width: usize, height: usize) -> Tensor {
+    fn synthetic_rgb(width: usize, height: usize, device: &Device) -> Tensor {
         let mut values = Vec::with_capacity(3 * width * height);
         for channel in 0..3 {
             for y in 0..height {
@@ -1044,6 +1046,6 @@ mod tests {
                 }
             }
         }
-        Tensor::from_vec(values, (3, height, width), &Device::Cpu).expect("synthetic image")
+        Tensor::from_vec(values, (3, height, width), device).expect("synthetic image")
     }
 }

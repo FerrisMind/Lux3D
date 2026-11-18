@@ -667,11 +667,22 @@ track reconstruction for external bundle adjustment.
 
 **Tests:** `vggt_auto_query` unit tests (DINO ranking, FPS, confidence pruning,
 index mappings), `runtime::aliked` official LightGlue golden (735/735 keypoints, exact
-order; max score error 6.2e-6), `runtime::superpoint` official golden (415/415;
-resize 882/882), `runtime::vggt_keypoints` ALIKED+SuperPoint composition (gated on the
-converted checkpoints), `vggt_track` tensor-name/query validation, `export::colmap`
-unit tests (feedforward write + parse-back, seeded point limiting, track gates,
-`>= 2` observations, 3000-coordinate gate) ✅
+order), `runtime::superpoint` official golden (415/415; resize 882/882),
+`runtime::vggt_keypoints` ALIKED+SuperPoint composition (gated on the converted
+checkpoints), `vggt_track` tensor-name/query validation, `export::colmap` unit tests
+(feedforward write + parse-back, seeded point limiting, track gates, `>= 2`
+observations, 3000-coordinate gate) ✅
+
+**Backend matrix:** the detector suite passes on **CPU, CUDA, Vulkan and WGPU**
+(RTX 3060): ALIKED 735/735 with worst keypoint drift 1.5e-5, score error
+7.7e-6 and descriptor cosine 0.999999; SuperPoint 415/415 (resize 882/882) with
+score error 3.6e-6 and descriptor cosine 0.9999996; the composition test passes
+on all four. `LUX3D_KEYPOINT_TEST_DEVICE=cpu|cuda|vulkan|wgpu` selects the test
+device (default `cpu`); GPU runs serialize through `GpuTestLock`, and a requested
+backend whose cargo feature/device is unavailable is a hard error rather than a
+silent CPU pass. Remesh, O-Voxel, server URL-policy and COLMAP-BA tests are
+device-independent host code and also pass under the `vulkan` and `wgpu` feature
+builds.
 
 ### US-13.6: VGGT GLB scene export
 As a user, I can write the same downloadable GLB scene as the official Gradio demo.

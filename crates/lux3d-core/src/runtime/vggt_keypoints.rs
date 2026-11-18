@@ -298,7 +298,8 @@ mod tests {
             superpoint_weights: Some(superpoint_path),
             ..VggtKeypointOptions::default()
         };
-        let detectors = preflight_keypoint_detectors(&options, &Device::Cpu)
+        let (device, _guard) = crate::runtime::keypoints::test_device();
+        let detectors = preflight_keypoint_detectors(&options, &device)
             .expect("load both detectors")
             .expect("detectors are loaded for aliked-sp");
 
@@ -318,7 +319,7 @@ mod tests {
                 }
             }
         }
-        let rgb = Tensor::from_vec(pixels, (3, side, side), &Device::Cpu).expect("image tensor");
+        let rgb = Tensor::from_vec(pixels, (3, side, side), &device).expect("image tensor");
 
         let keypoint_options = options.keypoint_options();
         let aliked = detectors

@@ -867,6 +867,8 @@ Warm-loop criterion (10 samples, steady state — the candle-bench protocol, one
 
 Correctness: outputs of every backend × model combination were verified against the CUDA reference meshes (bounding box / center / mean delta within 1% of max extent, vertex/face counts within 0.5% — all PASS); the fused kernel is additionally unit-tested exact to 0.0 diff against the composed form on both backends.
 
+Tracking stage-A detectors are tested on all four backends: the official ALIKED-n16 golden matches 735/735 keypoints and SuperPoint matches 415/415 (resize 882/882) on CPU, CUDA, Vulkan and WGPU, with worst keypoint drift 1.5e-5, score error ≤7.7e-6 and descriptor cosine ≥0.999999; the ALIKED+SuperPoint composition test passes on all four. Set `LUX3D_KEYPOINT_TEST_DEVICE=cpu|cuda|vulkan|wgpu` (default `cpu`) and enable the matching cargo feature; an unavailable requested backend is a hard test error, never a silent CPU pass. Remesh, O-Voxel export/fixtures, the server URL policy and the external-COLMAP BA path are host-side code independent of the candle device; their tests also pass in the `vulkan` and `wgpu` feature builds.
+
 Memory behavior under repeated inference (10-iteration loop, same process):
 
 - **CUDA** — flat; the decoder attention scores buffer is bounded to 768 MiB by query-axis chunking (`LUX3D_MAX_SDPA_SCORES_BYTES`), which removes a ~4 GiB transient that previously fragmented the CUDA memory pool and stalled a 12 GiB card ~100×. VGGT peaks at 6.5 GiB for 3 frames on the 12 GiB card, with DPT frames processed one at a time (`LUX3D_VGGT_DPT_CHUNK`, default 1).

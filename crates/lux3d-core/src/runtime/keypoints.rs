@@ -89,3 +89,55 @@ impl Default for KeypointOptions {
         }
     }
 }
+
+/// Device selected by `LUX3D_KEYPOINT_TEST_DEVICE` (`cpu|cuda|vulkan|wgpu`,
+/// default `cpu`) plus the process-wide GPU test lock for non-CPU backends.
+///
+/// The matching cargo feature must be enabled; a requested backend that cannot
+/// be constructed is a hard error, so a typo or a missing driver cannot turn
+/// into a silent CPU pass. The default stays CPU so the ordinary test suite
+/// works on machines without a GPU.
+#[cfg(test)]
+pub(crate) fn test_device() -> (
+    candle_core::Device,
+    Option<crate::test_support::GpuTestLock>,
+) {
+    use candle_core::Device;
+
+    let requested = std::env::var("LUX3D_KEYPOINT_TEST_DEVICE")
+        .unwrap_or_else(|_| "cpu".to_string())
+        .to_lowercase();
+    let (device, lock) = match requested.as_str() {
+        "cpu" => (Device::Cpu, None),
+        "cuda" => {
+            let lock = crate::test_support::GpuTestLock::acquire().expect("gpu test lock");
+            (
+                Device::new_cuda(0).expect(
+                    "LUX3D_KEYPOINT_TEST_DEVICE=cuda requires a CUDA device and the cuda feature",
+                ),
+                Some(lock),
+            )
+        }
+        "vulkan" => {
+            let lock = crate::test_support::GpuTestLock::acquire().expect("gpu test lock");
+            (
+                Device::new_vulkan(0).expect(
+                    "LUX3D_KEYPOINT_TEST_DEVICE=vulkan requires a Vulkan device and the vulkan feature",
+                ),
+                Some(lock),
+            )
+        }
+        "wgpu" => {
+            let lock = crate::test_support::GpuTestLock::acquire().expect("gpu test lock");
+            (
+                Device::new_wgpu(0).expect(
+                    "LUX3D_KEYPOINT_TEST_DEVICE=wgpu requires a wgpu device and the wgpu feature",
+                ),
+                Some(lock),
+            )
+        }
+        other => panic!("LUX3D_KEYPOINT_TEST_DEVICE must be cpu|cuda|vulkan|wgpu, got `{other}`"),
+    };
+    eprintln!("[keypoint-test] device={device:?}");
+    (device, lock)
+}
