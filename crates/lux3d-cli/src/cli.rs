@@ -331,7 +331,7 @@ pub struct QuantizeArgs {
     #[arg(
         long,
         requires = "scribble",
-        help = "Build one standalone TripoSG-scribble GGUF containing the DINOv2 image encoder, DiT, VAE decoder, CLIP text encoder and tokenizer. `--source` must be the raw `VAST-AI/TripoSG-scribble` checkpoint directory. Only transformer linear weights are quantized; the other components stay in the fallback dtype."
+        help = "Build one standalone TripoSG-scribble GGUF containing the DINOv2 image encoder, DiT, VAE decoder, CLIP text encoder and tokenizer. `--source` must be the raw `VAST-AI/TripoSG-scribble` checkpoint directory. By default only transformer linear weights are quantized; add `--prefix vae.` for a near-lossless VAE Q8_0 build, or `--prefix image_encoder.`/`--prefix text_encoder.` for smaller packages with measurable conditioning drift."
     )]
     pub standalone: bool,
 }

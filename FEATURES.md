@@ -826,8 +826,11 @@ scribble image) from a standalone one-file GGUF package, the raw
 - `weights quantize triposg --scribble --standalone` — builds one self-contained
   GGUF from the raw checkpoint: `transformer.`, `vae.`, `image_encoder.` and
   `text_encoder.` tensors plus an embedded resolved config and CLIP
-  tokenizer documents. Only the dual-cross-attention DiT linears are quantized;
-  the text encoder, VAE and DINOv2 stay in the F16 fallback ✅
+  tokenizer documents. Only the dual-cross-attention DiT linears are quantized
+  by default; the text encoder, VAE and DINOv2 stay in the F16 fallback.
+  Repeatable `--prefix` flags can add `vae.` (Q8_0 is near-lossless), or
+  `image_encoder.`/`text_encoder.` (supported, but conditioning drift reaches
+  the mesh) ✅
 - `weights quantize triposg --scribble` (without `--standalone`) — legacy
   DiT-only override; `--source` accepts the raw checkpoint directory or its
   transformer shard; output may be written to `<checkpoint>/transformer/model.gguf`
@@ -841,8 +844,12 @@ scribble image) from a standalone one-file GGUF package, the raw
 `--num-shapes`; it accepts exactly one `--source` and uses the reference defaults
 (16 steps, 512 tokens, dense depth 8, hierarchical depth 8). Reference f32 vs quantized
 DiT drift is substantial (voxel IoU 0.17–0.27 across q8_0/q6_k/q5_k/q4_k), so q8_0 is the
-recommended quantized variant. The scribble bicubic resize port can differ on purely
-upscaled synthetic inputs (real scribbles are downscaled).
+recommended quantized variant. Adding `vae.` to the Q8_0 prefix set is near-lossless
+(CD rel 0.006%, F@1% = 1.000, voxel IoU 0.991 against transformer-only Q8_0) and saves
+~0.22 GiB. Adding DINOv2 or CLIP Q8_0 is supported but measurably drifts conditioning
+(CD rel 0.18%/0.16%, F@1% 0.94/0.96); all four components together give CD rel 1.02%
+and voxel IoU 0.56. The scribble bicubic resize port can differ on purely upscaled
+synthetic inputs (real scribbles are downscaled).
 
 **Tests:** `scribble_triposg` (tokenizer goldens, CLIP text forward, gated CUDA e2e),
 `preprocess_triposg` (BitImageProcessor golden, alpha-drop), `pipeline_triposg_scribble`

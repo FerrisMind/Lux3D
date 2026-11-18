@@ -339,6 +339,23 @@ the resulting file is a complete model package. The legacy DiT-only override
 still works with the raw checkpoint and is smaller (1.67 / 1.29 / 1.08 /
 0.88 GiB for q8_0/q6_k/q5_k/q4_k).
 
+Other components can be added with repeatable `--prefix` flags. Measured on
+CUDA against the transformer-only q8 mesh (same `mesh-input.png`, prompt
+"a cat"):
+
+| quantized prefixes | package size | CD rel | F@1% | voxel IoU | note |
+|---|---|---|---|---|---|
+| `transformer.` (default) | 2.92 GiB | — | — | — | baseline |
+| `transformer.` + `vae.` | 2.70 GiB | 0.006% | 1.000 | 0.991 | near-lossless |
+| `transformer.` + `image_encoder.` | 2.65 GiB | 0.184% | 0.939 | 0.700 | noticeable drift |
+| `transformer.` + `text_encoder.` | 2.81 GiB | 0.159% | 0.960 | 0.710 | noticeable drift |
+| all four | 2.33 GiB | 1.017% | 0.812 | 0.558 | topology drift |
+
+The VAE decoder is the only extra component that stays effectively lossless
+under Q8_0. DINOv2 and CLIP Q8_0 are supported (CLIP dequantizes at load), but
+their conditioning drift propagates into the mesh, so they are opt-in rather
+than part of the default package.
+
 The reference run is the raw checkpoint's native F16 DiT promoted to F32
 (`--dtype` default `f32`), with the same seed/steps/image. Standalone and
 DiT-only builds produce byte-identical meshes for the same quantized DiT and
