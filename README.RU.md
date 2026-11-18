@@ -186,6 +186,15 @@ cargo run -p lux3d-cli -- weights quantize trellis2 `
   --prefix ss_flow. --prefix shape_dit_512. --prefix shape_dit_1024. `
   --prefix tex_dit_512. --prefix tex_dit_1024.
 
+# TripoSG-scribble canonical-пакет: нормализатор видит дополнительный шард
+# `text_encoder/model.safetensors`, сливает transformer/vae/image_encoder/
+# text_encoder в один safetensors и встраивает конфиги, pipeline defaults и
+# CLIP-токенизатор. `--model-path <dir>` загружает его напрямую.
+cargo run -p lux3d-cli -- weights normalize `
+  --repo-root <runtime-root> `
+  --raw-model-dir <raw-TripoSG-scribble-dir> `
+  --output-dir <canonical-triposg-scribble-dir> triposg
+
 # TripoSG-scribble standalone-пакет: один GGUF с DINOv2 image-энкодером,
 # DiT с двойным cross-attention, SDF VAE-декодером, CLIP text-энкодером и
 # CLIP-токенизатором. --source — каталог сырого чекпойнта
@@ -227,6 +236,13 @@ cargo run -p lux3d-cli -- run triposg --device cuda `
 cargo run -p lux3d-cli -- run trellis2 --device cuda `
   --model-path <gguf-trellis2-dir> --rmbg-model-path <gguf-rmbg2-f16-dir> `
   --source <image> --output out.glb
+
+# TripoSG-scribble canonical-пакет: передайте каталог с `model.safetensors`,
+# `resolved_config.json`, `manifest.json` и `checksums.json`. Сырой чекпойнт
+# не нужен.
+cargo run -p lux3d-cli -- run triposg --device cuda --mode scribble `
+  --prompt "a cat with wings" --model-path <canonical-triposg-scribble-dir> `
+  --source <scribble.png> --output out.glb
 
 # TripoSG-scribble standalone-пакет: передайте `.gguf` или каталог, где лежит
 # только `model.gguf`. Сырой чекпойнт, safetensors и файлы токенизатора не нужны.
@@ -299,6 +315,7 @@ TripoSR 1 изображение при `--mc-resolution 256`):
 | TRELLIS.2-4B | q5_k | 6.61 GiB | 1070 |
 | TRELLIS.2-4B | q4_k | 5.86 GiB | 1070 |
 | TripoSG-scribble | сырой чекпойнт F16 | 4.38 GiB | — |
+| TripoSG-scribble | canonical F16 | 4.38 GiB | — |
 | TripoSG-scribble | q8_0 standalone | 2.92 GiB | 308 матриц |
 | TripoSG-scribble | q6_k standalone | 2.54 GiB | 307 |
 | TripoSG-scribble | q5_k standalone | 2.33 GiB | 307 |
@@ -333,9 +350,11 @@ TripoSG-scribble сохраняет ту же DiT-only политику кван
 DINOv2-энкодер скетча остаются в F16 fallback (не квантуются). Встроенный
 `lux3d.resolved_config` содержит конфиги всех компонентов, pipeline-дефолты и
 CLIP `vocab.json`/`merges.txt`/конфиги токенизатора, поэтому файл является
-полным пакетом модели. Legacy DiT-only override по-прежнему работает с сырым
-чекпойнтом и меньше по размеру (1.67 / 1.29 / 1.08 / 0.88 GiB для
-q8_0/q6_k/q5_k/q4_k).
+полным пакетом модели. Canonical-пакет safetensors использует то же слияние и
+встроенные конфиги/токенизатор, сохраняет сырые F16-веса и загружается через
+`--model-path <canonical-triposg-scribble-dir>`. Legacy DiT-only override
+по-прежнему работает с сырым чекпойнтом и меньше по размеру (1.67 / 1.29 /
+1.08 / 0.88 GiB для q8_0/q6_k/q5_k/q4_k).
 
 Другие компоненты можно добавить повторяемыми `--prefix`. Замеры на CUDA
 относительно меша с квантованным только transformer (тот же `mesh-input.png`,

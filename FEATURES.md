@@ -810,8 +810,8 @@ surface-input mapping/conflict/family-rejection cases ✅
 
 ### US-14.5: TripoSG-scribble mode
 As a user, I can run the TripoSG-scribble dual-conditioning pipeline (CLIP prompt +
-scribble image) from a standalone one-file GGUF package, the raw
-`VAST-AI/TripoSG-scribble` checkpoint, or a legacy quantized DiT.
+scribble image) from a canonical safetensors package, a standalone one-file GGUF
+package, the raw `VAST-AI/TripoSG-scribble` checkpoint, or a legacy quantized DiT.
 
 **Functions:**
 - CLI `--mode image|scribble` (default image), `--prompt` (required in scribble mode),
@@ -835,9 +835,14 @@ scribble image) from a standalone one-file GGUF package, the raw
   DiT-only override; `--source` accepts the raw checkpoint directory or its
   transformer shard; output may be written to `<checkpoint>/transformer/model.gguf`
   for automatic pickup ✅
-- `runtime/triposg.rs:TripoSgScribblePipeline` — accepts a standalone `.gguf`
-  file or a directory containing only `model.gguf`, with no raw checkpoint,
-  safetensors, config or tokenizer files present ✅
+- `weights normalize ... triposg` — auto-detects the scribble raw layout from
+  `text_encoder/model.safetensors`, merges all four component shards into one
+  F16 `model.safetensors`, embeds the configs, pipeline defaults and CLIP
+  tokenizer, and writes `variant: "triposg-scribble"` into the manifest ✅
+- `runtime/triposg.rs:TripoSgScribblePipeline` — accepts a canonical
+  `triposg-scribble` package directory (`model.safetensors` + resolved config +
+  manifest + checksums), a standalone `.gguf` file, or a directory containing
+  only `model.gguf`, with no raw checkpoint, config or tokenizer files present ✅
 
 **Limits:** scribble mode rejects `--surface-input`, `--guidance-scale`,
 `--flash-decoder`, `--flash-octree-depth`, `--rmbg-model-path`, `--cache-dir` and
@@ -855,8 +860,10 @@ synthetic inputs (real scribbles are downscaled).
 `preprocess_triposg` (BitImageProcessor golden, alpha-drop), `pipeline_triposg_scribble`
 option validation, CLI scribble flag mapping/guards, quantize `--scribble` CLI tests,
 standalone quantizer merge/metadata/tokenizer unit test, standalone loader
-file/package-directory detection test ✅. On CUDA, standalone and DiT-only q8_0/q6_k/q5_k/
-q4_k builds produced byte-identical OBJ meshes for the same input and prompt.
+file/package-directory detection test, canonical package load test ✅. On CUDA,
+standalone and DiT-only q8_0/q6_k/q5_k/q4_k builds produced byte-identical OBJ
+meshes for the same input and prompt; on CPU, a canonical package and the raw
+checkpoint produced a byte-identical OBJ for the same input, prompt and step count.
 
 ### US-14.6: Batched sources and `--num-shapes`
 As a user, I can generate a batch from several images and multiple shapes per prompt.

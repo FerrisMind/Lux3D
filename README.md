@@ -188,6 +188,15 @@ cargo run -p lux3d-cli -- weights quantize trellis2 `
   --prefix ss_flow. --prefix shape_dit_512. --prefix shape_dit_1024. `
   --prefix tex_dit_512. --prefix tex_dit_1024.
 
+# TripoSG-scribble canonical package: the normalizer detects the extra
+# `text_encoder/model.safetensors` shard, merges transformer/vae/image_encoder/
+# text_encoder under one safetensors file, and embeds the configs, pipeline
+# defaults and CLIP tokenizer. `--model-path <dir>` loads it directly.
+cargo run -p lux3d-cli -- weights normalize `
+  --repo-root <runtime-root> `
+  --raw-model-dir <raw-TripoSG-scribble-dir> `
+  --output-dir <canonical-triposg-scribble-dir> triposg
+
 # TripoSG-scribble standalone package: one GGUF with the DINOv2 image encoder,
 # dual-cross-attention DiT, SDF VAE decoder, CLIP text encoder and CLIP
 # tokenizer. --source is the raw `VAST-AI/TripoSG-scribble` checkpoint
@@ -229,6 +238,13 @@ cargo run -p lux3d-cli -- run triposg --device cuda `
 cargo run -p lux3d-cli -- run trellis2 --device cuda `
   --model-path <gguf-trellis2-dir> --rmbg-model-path <gguf-rmbg2-f16-dir> `
   --source <image> --output out.glb
+
+# TripoSG-scribble canonical package: pass the directory containing
+# `model.safetensors`, `resolved_config.json`, `manifest.json` and
+# `checksums.json`. No raw checkpoint is needed.
+cargo run -p lux3d-cli -- run triposg --device cuda --mode scribble `
+  --prompt "a cat with wings" --model-path <canonical-triposg-scribble-dir> `
+  --source <scribble.png> --output out.glb
 
 # TripoSG-scribble standalone package: pass the `.gguf` file or a directory
 # containing only `model.gguf`. No raw checkpoint, safetensors or tokenizer
@@ -302,6 +318,7 @@ TripoSR 1 image at `--mc-resolution 256`):
 | TRELLIS.2-4B | q5_k | 6.61 GiB | 1070 |
 | TRELLIS.2-4B | q4_k | 5.86 GiB | 1070 |
 | TripoSG-scribble | raw checkpoint F16 | 4.38 GiB | — |
+| TripoSG-scribble | canonical F16 | 4.38 GiB | — |
 | TripoSG-scribble | q8_0 standalone | 2.92 GiB | 308 matrices |
 | TripoSG-scribble | q6_k standalone | 2.54 GiB | 307 |
 | TripoSG-scribble | q5_k standalone | 2.33 GiB | 307 |
@@ -335,9 +352,11 @@ transformer is quantized, while the CLIP text encoder, the VAE SDF decoder and
 the DINOv2 scribble encoder stay in the F16 fallback (they are not quantized).
 The embedded `lux3d.resolved_config` carries every component config, the
 pipeline defaults and the CLIP `vocab.json`/`merges.txt`/tokenizer configs, so
-the resulting file is a complete model package. The legacy DiT-only override
-still works with the raw checkpoint and is smaller (1.67 / 1.29 / 1.08 /
-0.88 GiB for q8_0/q6_k/q5_k/q4_k).
+the resulting file is a complete model package. The canonical safetensors
+package uses the same merge and embedded config/tokenizer, preserves the raw
+F16 weights, and is loaded with `--model-path <canonical-triposg-scribble-dir>`.
+The legacy DiT-only override still works with the raw checkpoint and is smaller
+(1.67 / 1.29 / 1.08 / 0.88 GiB for q8_0/q6_k/q5_k/q4_k).
 
 Other components can be added with repeatable `--prefix` flags. Measured on
 CUDA against the transformer-only q8 mesh (same `mesh-input.png`, prompt
