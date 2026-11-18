@@ -51,9 +51,9 @@ Lux3D / candle-3d — это Rust 2024 workspace, который предост�
   коммерческий checkpoint распространяется отдельно.
 - `triposg` — TripoSG: image-to-mesh инференс (DINOv2-large encoder, 21-блочный rectified-flow
   DiT, SDF VAE decoder/encoder, flash decoder + clean-room DiffDMC по умолчанию), плюс
-  TripoSG-scribble с двойным conditioning (`--mode scribble`), батчевые прогоны
-  `--num-shapes` по нескольким изображениям и референсный VAE surface-encode
-  (`--surface-input`). Лицензия MIT; BriaRMBG 1.4 для RGB-входа поставляется отдельным
+  TripoSG-scribble с двойным conditioning (`--mode scribble`, standalone one-file GGUF
+  пакет), батчевые прогоны `--num-shapes` по нескольким изображениям и референсный VAE
+  surface-encode (`--surface-input`). Лицензия MIT; BriaRMBG 1.4 для RGB-входа поставляется отдельным
   пакетом `rmbg-1.4` под лицензией BRIA.
 - `trellis2` — TRELLIS.2-4B: image-to-3D инференс (DINOv3 ViT-L/16 encoder, SS flow DiT,
   shape/texture SLAT flow-трансформеры, FlexiDualGrid VAE, O-Voxel dual-grid меш с PBR-атрибутами
@@ -186,13 +186,20 @@ cargo run -p lux3d-cli -- weights quantize trellis2 `
   --prefix ss_flow. --prefix shape_dit_512. --prefix shape_dit_1024. `
   --prefix tex_dit_512. --prefix tex_dit_1024.
 
-# TripoSG-scribble: квантуется ТОЛЬКО DiT с двойным cross-attention (текстовый
-# энкодер, VAE и DINOv2 остаются float). --source — каталог сырого чекпойнта
-# `VAST-AI/TripoSG-scribble` (shard transformer находится автоматически);
-# FAMILY — `triposg`. Запись в `<checkpoint>/transformer/model.gguf` включает
-# авто-подхват; можно также передать сам `.gguf` в `--model-path`.
-# У GGUF нет встроенного resolved config (в сыром чекпойнте его нет), поэтому
-# это DiT-override, а не standalone-пакет.
+# TripoSG-scribble standalone-пакет: один GGUF с DINOv2 image-энкодером,
+# DiT с двойным cross-attention, SDF VAE-декодером, CLIP text-энкодером и
+# CLIP-токенизатором. --source — каталог сырого чекпойнта
+# `VAST-AI/TripoSG-scribble`. Квантуются только линейные веса transformer;
+# остальные компоненты остаются в fallback dtype.
+cargo run -p lux3d-cli -- weights quantize triposg --scribble --standalone `
+  --source <raw-TripoSG-scribble-dir> `
+  --output triposg-scribble-q8_0.gguf `
+  --dtype q8_0 --fallback-dtype f16
+
+# Legacy-вариант DiT-only: квантуется только DiT с двойным cross-attention;
+# text-энкодер, VAE и DINOv2 остаются в сыром чекпойнте. Запись в
+# `<checkpoint>/transformer/model.gguf` включает авто-подхват; сам `.gguf`
+# можно передать в `--model-path`.
 cargo run -p lux3d-cli -- weights quantize triposg --scribble `
   --source <raw-TripoSG-scribble-dir> `
   --output <raw-TripoSG-scribble-dir>/transformer/model.gguf `
@@ -221,10 +228,18 @@ cargo run -p lux3d-cli -- run trellis2 --device cuda `
   --model-path <gguf-trellis2-dir> --rmbg-model-path <gguf-rmbg2-f16-dir> `
   --source <image> --output out.glb
 
-# TripoSG-scribble сам подхватывает соседний `transformer/model.gguf`;
-# standalone DiT `.gguf` можно передать прямо в `--model-path`. Float-веса
-# текстового энкодера/VAE/DINOv2 берутся из LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR
-# (по умолчанию `models/TripoSG-scribble`).
+# TripoSG-scribble standalone-пакет: передайте `.gguf` или каталог, где лежит
+# только `model.gguf`. Сырой чекпойнт, safetensors и файлы токенизатора не нужны.
+cargo run -p lux3d-cli -- run triposg --device cuda --mode scribble `
+  --prompt "a cat with wings" --model-path triposg-scribble-q8_0.gguf `
+  --source <scribble.png> --output out.glb
+cargo run -p lux3d-cli -- run triposg --device cuda --mode scribble `
+  --prompt "a cat with wings" --model-path <dir-containing-model.gguf> `
+  --source <scribble.png> --output out.glb
+
+# Legacy DiT-only override: сырой чекпойнт даёт float text-энкодер/VAE/DINOv2
+# и токенизатор. Соседний `transformer/model.gguf` подхватывается сам; `.gguf`
+# можно передать и напрямую.
 cargo run -p lux3d-cli -- run triposg --device cuda --mode scribble `
   --prompt "a cat with wings" --model-path models/TripoSG-scribble `
   --source <scribble.png> --output out.glb
@@ -247,7 +262,7 @@ cargo run -p lux3d-cli -- run triposg --device cuda --mode scribble `
 `--steps 2 --num-tokens 1024 --flash-octree-depth 5`, VGGT/Pi3/Pi3X 3 кадра,
 TripoSR 1 изображение при `--mc-resolution 256`):
 
-| модель | вариант | размер GGUF | квантовано матриц |
+| модель | вариант | размер пакета | квантовано матриц |
 |---|---|---|---|
 | TripoSG | canonical F32 | 7.40 GiB | — |
 | TripoSG | q8_0 | 1.97 GiB | 527 |
@@ -283,11 +298,11 @@ TripoSR 1 изображение при `--mc-resolution 256`):
 | TRELLIS.2-4B | q6_k | 7.41 GiB | 1070 |
 | TRELLIS.2-4B | q5_k | 6.61 GiB | 1070 |
 | TRELLIS.2-4B | q4_k | 5.86 GiB | 1070 |
-| TripoSG-scribble DiT | чекпойнт F16 | 3.13 GiB | — |
-| TripoSG-scribble DiT | q8_0 | 1.67 GiB | 308 матриц |
-| TripoSG-scribble DiT | q6_k | 1.29 GiB | 307 |
-| TripoSG-scribble DiT | q5_k | 1.08 GiB | 307 |
-| TripoSG-scribble DiT | q4_k | 0.88 GiB | 307 |
+| TripoSG-scribble | сырой чекпойнт F16 | 4.38 GiB | — |
+| TripoSG-scribble | q8_0 standalone | 2.92 GiB | 308 матриц |
+| TripoSG-scribble | q6_k standalone | 2.54 GiB | 307 |
+| TripoSG-scribble | q5_k standalone | 2.33 GiB | 307 |
+| TripoSG-scribble | q4_k standalone | 2.13 GiB | 307 |
 
 F16 — чистое преобразование точности, не блочное квантование: все тензоры
 хранятся в 16 битах, линейные слои идут обычным путём без `QMatMul`. Цена —
@@ -312,13 +327,23 @@ F@1% = 1.000 на каждом бэкенде. Сборка:
 RMBG-1.4 (вспомогательный): F32 0.16 GiB → F16 0.08 GiB; записано 686
 тензоров, 112 rank-0 тренировочных буферов опущено.
 
-TripoSG-scribble следует той же DiT-only политике: квантуется только
-трансформер с двойным cross-attention, а CLIP-энкодер, VAE SDF-декодер и
-DINOv2-энкодер скетча остаются в сырых float safetensors. Эталон — нативный
-F16 DiT чекпойнта, поднятый до F32 (`--dtype` по умолчанию `f32`), с теми же
-seed/шагами/изображением. Дрейф scribble (CUDA, RTX 3060;
-`cat_with_wings.png`, промпт "a cat with wings", 16 шагов, 512 токенов,
-dense/hierarchical depth 8, seed 42; эталон 80 109 вершин / 159 976 граней):
+TripoSG-scribble сохраняет ту же DiT-only политику квантования, но с
+`--standalone` все четыре сети сливаются в один GGUF: квантуется только
+трансформер с двойным cross-attention, а CLIP text-энкодер, VAE SDF-декодер и
+DINOv2-энкодер скетча остаются в F16 fallback (не квантуются). Встроенный
+`lux3d.resolved_config` содержит конфиги всех компонентов, pipeline-дефолты и
+CLIP `vocab.json`/`merges.txt`/конфиги токенизатора, поэтому файл является
+полным пакетом модели. Legacy DiT-only override по-прежнему работает с сырым
+чекпойнтом и меньше по размеру (1.67 / 1.29 / 1.08 / 0.88 GiB для
+q8_0/q6_k/q5_k/q4_k).
+
+Эталон — нативный F16 DiT чекпойнта, поднятый до F32 (`--dtype` по умолчанию
+`f32`), с теми же seed/шагами/изображением. Standalone- и DiT-only-сборки дают
+байт-в-байт одинаковый меш при том же квантованном DiT и входе (проверено на
+CUDA для всех четырёх вариантов), поэтому таблица ниже общая. Дрейф scribble
+(CUDA, RTX 3060; `cat_with_wings.png`, промпт "a cat with wings", 16 шагов,
+512 токенов, dense/hierarchical depth 8, seed 42; эталон 80 109 вершин /
+159 976 граней):
 
 | вариант | CD rel | F@0.5% | F@1% | voxel IoU | normal | вершин | граней | max drift | mean drift |
 |---|---|---|---|---|---|---|---|---|---|
@@ -333,10 +358,9 @@ Max/mean drift — существующие nearest-neighbour метрики
 до 6%). CFG-distilled scribble DiT заметно чувствительнее к квантованию, чем
 image-модель TripoSG: только Q8_0 удерживает F@1% выше 0.90, а все K-кванты
 существенно меняют топологию поверхности. Для scribble предпочтителен Q8_0;
-Q6_K — компактный fallback, Q5_K/Q4_K — preview-уровень. DiT GGUF — это
-override, а не standalone-пакет: в сырых чекпойнтах нет
-`resolved_config.json`, поэтому остальные веса всегда грузятся из каталога
-чекпойнта.
+Q6_K — компактный fallback, Q5_K/Q4_K — preview-уровень. Standalone-пакет —
+основной формат распространения; DiT-only GGUF остаётся для тех, у кого уже
+есть сырой чекпойнт.
 
 ### Метрики Качества Квантования
 
@@ -378,10 +402,11 @@ python scripts/eval_quantization.py trellis2 --binary target/release/lux3d-cli.e
   --source <input-image> --device cuda --output-dir out/eval-trellis2 -- `
   --pipeline-type 512 --steps 12 --texture false --seed 42
 
-# TripoSG-scribble (варианты — DiT `.gguf`; каталог сырого эталона
-# экспортируется как LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR для variant-прогонов)
+# TripoSG-scribble (варианты — standalone или DiT-only `.gguf`; каталог сырого
+# эталона экспортируется как LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR для reference-
+# прогона и legacy DiT-only вариантов)
 python scripts/eval_quantization.py triposg --scribble `
-  --reference <raw-TripoSG-scribble-dir> --variant q8_0=<scribble-dit-q8_0.gguf> `
+  --reference <raw-TripoSG-scribble-dir> --variant q8_0=triposg-scribble-q8_0.gguf `
   --source <scribble.png> --device cuda --output-dir out/eval-scribble -- `
   --mode scribble --prompt "a cat with wings"
 ```
@@ -606,10 +631,11 @@ cargo run -p lux3d-cli --features cuda -- run triposg --model-path <canonical-tr
 # 204800 точек; меньший вход завершается ошибкой, а не ресемплингом).
 cargo run -p lux3d-cli --features cuda -- run triposg --model-path <canonical-triposg-dir> --surface-input <surface.npy> --output <output.glb>
 
-# TripoSG-scribble: двойной conditioning CLIP-промпта и scribble-изображения (сырой
-# checkpoint VAST-AI/TripoSG-scribble или квантованный DiT .gguf); --prompt обязателен,
-# --scribble-conf/--prompt-conf переопределяют веса ветвей (0.4 / 1.0)
-cargo run -p lux3d-cli --features cuda -- run triposg --mode scribble --prompt "a cat with wings" --model-path models/TripoSG-scribble --source <scribble.png> --scribble-conf 0.4 --prompt-conf 1.0 --output <output.glb>
+# TripoSG-scribble: двойной conditioning CLIP-промпта и scribble-изображения. Передайте
+# standalone-пакет (.gguf или каталог с model.gguf), сырой checkpoint VAST-AI/TripoSG-scribble
+# или legacy DiT-only .gguf; --prompt обязателен, --scribble-conf/--prompt-conf
+# переопределяют веса ветвей (0.4 / 1.0)
+cargo run -p lux3d-cli --features cuda -- run triposg --mode scribble --prompt "a cat with wings" --model-path triposg-scribble-q8_0.gguf --source <scribble.png> --scribble-conf 0.4 --prompt-conf 1.0 --output <output.glb>
 
 # Опции референсного post-process/загрузки: `--faces <n>` (целевое число граней после merge-close +
 # meshopt quadric simplification — clean-room аппроксимация upstream pymeshlab; 0 = выкл.,

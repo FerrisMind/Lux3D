@@ -810,7 +810,8 @@ surface-input mapping/conflict/family-rejection cases ✅
 
 ### US-14.5: TripoSG-scribble mode
 As a user, I can run the TripoSG-scribble dual-conditioning pipeline (CLIP prompt +
-scribble image) from the raw `VAST-AI/TripoSG-scribble` checkpoint or a quantized DiT.
+scribble image) from a standalone one-file GGUF package, the raw
+`VAST-AI/TripoSG-scribble` checkpoint, or a legacy quantized DiT.
 
 **Functions:**
 - CLI `--mode image|scribble` (default image), `--prompt` (required in scribble mode),
@@ -822,10 +823,18 @@ scribble image) from the raw `VAST-AI/TripoSG-scribble` checkpoint or a quantize
 - `preprocess/triposg.rs:prepare_scribble_inputs_from_path()` — official
   RGB-only BitImageProcessor recipe (shortest edge 256, center crop 224, BICUBIC,
   ImageNet normalization; alpha is dropped, no RMBG/composite/square padding) ✅
-- `weights quantize triposg --scribble` — quantizes only the dual-cross-attention
-  DiT; `--source` accepts the raw checkpoint directory or its transformer shard;
-  text encoder, VAE and DINOv2 stay float; output may be written to
-  `<checkpoint>/transformer/model.gguf` for automatic pickup ✅
+- `weights quantize triposg --scribble --standalone` — builds one self-contained
+  GGUF from the raw checkpoint: `transformer.`, `vae.`, `image_encoder.` and
+  `text_encoder.` tensors plus an embedded resolved config and CLIP
+  tokenizer documents. Only the dual-cross-attention DiT linears are quantized;
+  the text encoder, VAE and DINOv2 stay in the F16 fallback ✅
+- `weights quantize triposg --scribble` (without `--standalone`) — legacy
+  DiT-only override; `--source` accepts the raw checkpoint directory or its
+  transformer shard; output may be written to `<checkpoint>/transformer/model.gguf`
+  for automatic pickup ✅
+- `runtime/triposg.rs:TripoSgScribblePipeline` — accepts a standalone `.gguf`
+  file or a directory containing only `model.gguf`, with no raw checkpoint,
+  safetensors, config or tokenizer files present ✅
 
 **Limits:** scribble mode rejects `--surface-input`, `--guidance-scale`,
 `--flash-decoder`, `--flash-octree-depth`, `--rmbg-model-path`, `--cache-dir` and
@@ -837,7 +846,10 @@ upscaled synthetic inputs (real scribbles are downscaled).
 
 **Tests:** `scribble_triposg` (tokenizer goldens, CLIP text forward, gated CUDA e2e),
 `preprocess_triposg` (BitImageProcessor golden, alpha-drop), `pipeline_triposg_scribble`
-option validation, CLI scribble flag mapping/guards, quantize `--scribble` CLI tests ✅
+option validation, CLI scribble flag mapping/guards, quantize `--scribble` CLI tests,
+standalone quantizer merge/metadata/tokenizer unit test, standalone loader
+file/package-directory detection test ✅. On CUDA, standalone and DiT-only q8_0/q6_k/q5_k/
+q4_k builds produced byte-identical OBJ meshes for the same input and prompt.
 
 ### US-14.6: Batched sources and `--num-shapes`
 As a user, I can generate a batch from several images and multiple shapes per prompt.
@@ -1373,11 +1385,12 @@ Also touched: `crates/lux3d-core/tests/vggt_export.rs` (fixture gains empty `pos
   CLI flags, and the "Show Points from Frame" selector is not exposed.
 - **VGGT dtypes:** F32 is the parity mode. F16/BF16 are wired but the automated numeric
   suite is F32/CUDA-only; BF16 is unverified.
-- **TripoSG scribble:** shipped (`--mode scribble`, dual conditioning, raw checkpoint or
-  quantized DiT). Documented deviations: RGB-only BitImageProcessor preprocessing (alpha
-  dropped, no RMBG), and the bicubic resize port can differ on purely upscaled synthetic
-  inputs. Quantized scribble DiTs are much more topology-sensitive than the image DiT
-  (voxel IoU 0.17–0.27), so use Q8_0 as the compact variant.
+- **TripoSG scribble:** shipped (`--mode scribble`, dual conditioning, standalone one-file
+  GGUF package, raw checkpoint, or legacy DiT-only override). Documented deviations: RGB-only
+  BitImageProcessor preprocessing (alpha dropped, no RMBG), and the bicubic resize port can
+  differ on purely upscaled synthetic inputs. Quantized scribble DiTs are much more
+  topology-sensitive than the image DiT (voxel IoU 0.17–0.27), so use Q8_0 as the compact
+  variant.
 - **TripoSG surface input:** `--surface-input` reproduces `scripts/inference_vae.py`
   (keyed `.npy` dict, 204800-point subset, VAE encode + latent sample); the sampled
   latent uses the Lux3D RNG (distribution-equivalent, not torch-draw-identical).

@@ -47,17 +47,17 @@ Examples:
   python scripts/eval_quantization.py triposg --scribble \
       --binary target/release/lux3d-cli.exe \
       --reference models/TripoSG-scribble \
-      --variant q8_0=out/scribble-q8_0.gguf \
+      --variant q8_0=out/scribble-standalone/triposg-scribble-q8_0.gguf \
       --source assets/example_scribble_data/cat_with_wings.png --device cuda \
       --output-dir out/eval-scribble -- \
       --mode scribble --prompt "a cat with wings"
 
 Scribble reference safety:
   The TripoSG-scribble loader prefers a sibling `transformer/model.gguf` over
-  `transformer/diffusion_pytorch_model.safetensors`. Because the documented
-  quantize command writes that sibling inside the raw checkpoint, a scribble
-  eval would silently compare a quantized artifact against itself and report
-  near-zero drift. This script therefore refuses a `--reference` directory
+  `transformer/diffusion_pytorch_model.safetensors`. If a DiT-only override is
+  written into the raw checkpoint, a scribble eval would silently compare a
+  quantized artifact against itself and report near-zero drift. This script
+  therefore refuses a `--reference` directory
   containing `transformer/model.gguf` unless `--allow-reference-gguf` is
   passed. Use a pristine checkpoint copy (or move the GGUF out) instead.
 """
@@ -171,9 +171,10 @@ def main() -> int:
         action="store_true",
         help=(
             "TripoSG-scribble eval: `--reference` is the raw checkpoint directory and "
-            "every `--variant NAME=PATH` is a standalone quantized DiT `.gguf`. The "
-            "reference directory is exported as LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR so the "
-            "variant runs find the float text encoder/VAE/DINOv2 weights. The reference "
+            "every `--variant NAME=PATH` is a standalone or DiT-only `.gguf`. The "
+            "reference directory is exported as LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR so "
+            "legacy DiT-only variants find the float text encoder/VAE/DINOv2 weights; "
+            "standalone variants ignore it. The reference "
             "must not contain `transformer/model.gguf` (the loader prefers it over the "
             "float safetensors shard); see --allow-reference-gguf. Pass "
             "`-- --mode scribble --prompt <text>` for the run flags."
@@ -245,7 +246,7 @@ def main() -> int:
             raise SystemExit(f"--variant expects NAME=PATH, got {spec!r}")
         if args.scribble and not path.lower().endswith(".gguf"):
             raise SystemExit(
-                f"--scribble variants must be standalone DiT .gguf files, got {path!r}"
+                f"--scribble variants must be .gguf files, got {path!r}"
             )
         artifact = out_dir / f"{name}.{suffix}"
         npz_path = out_dir / f"{name}.npz" if args.family == "vggt" else None
