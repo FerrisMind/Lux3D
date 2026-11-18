@@ -21,7 +21,10 @@ use candle_core::{Device, Tensor};
 use crate::{
     contracts::ModelFamily,
     error::Lux3dError,
-    weights::{GGUF_FAMILY_KEY, GGUF_RESOLVED_CONFIG_KEY, RESOLVED_CONFIG_FILENAME},
+    weights::{
+        GGUF_FAMILY_KEY, GGUF_RESOLVED_CONFIG_KEY, GGUF_VARIANT_KEY, RESOLVED_CONFIG_FILENAME,
+        TRIPOSG_SCRIBBLE_VARIANT,
+    },
     Result,
 };
 
@@ -129,6 +132,209 @@ pub fn resolve_scribble_dit_source(source: &Path) -> Result<PathBuf> {
     Err(Lux3dError::MissingCanonicalArtifact {
         path: source.to_path_buf(),
     })
+}
+
+/// Components merged into one standalone TripoSG-scribble GGUF.
+///
+/// The order is fixed so the output tensor order is deterministic. Only the
+/// `transformer.` prefix is quantized by default; the other components stay in
+/// the fallback dtype, matching the evaluated DiT-only quantization policy.
+const SCRIBBLE_STANDALONE_COMPONENTS: [(&str, &str); 4] = [
+    (
+        "transformer",
+        "transformer/diffusion_pytorch_model.safetensors",
+    ),
+    ("vae", "vae/diffusion_pytorch_model.safetensors"),
+    ("image_encoder", "image_encoder_dinov2/model.safetensors"),
+    ("text_encoder", "text_encoder/model.safetensors"),
+];
+
+/// Build one self-contained GGUF from a raw `VAST-AI/TripoSG-scribble`
+/// checkpoint.
+///
+/// The output contains all four network components under `transformer.`,
+/// `vae.`, `image_encoder.` and `text_encoder.` prefixes plus the embedded
+/// resolved config and CLIP tokenizer documents. The quantizer keeps the
+/// reference policy: only rank-2 `.weight` tensors inside `transformer.` are
+/// quantized; every other tensor (including the whole VAE, DINOv2 and CLIP
+/// text encoder) is stored in the fallback dtype.
+pub fn quantize_scribble_standalone(
+    source: &Path,
+    output: &Path,
+    options: QuantizeOptions,
+) -> Result<QuantizeReport> {
+    if !source.is_dir() {
+        return Err(Lux3dError::MissingCanonicalArtifact {
+            path: source.to_path_buf(),
+        });
+    }
+    if matches!(options.dtype, GgmlDType::Q8K | GgmlDType::Q8_1) {
+        return Err(Lux3dError::CanonicalWeightsValidation {
+            message: format!(
+                "{} is an activation-side GGML type, not a weight quantization; use q8_0",
+                dtype_name(options.dtype)
+            ),
+        });
+    }
+
+    let mut options = options;
+    if options.prefixes.is_empty() {
+        options.prefixes.push("transformer.".to_string());
+    }
+
+    let mut tensors = Vec::new();
+    let mut quantized = 0usize;
+    let mut fallback = 0usize;
+    let mut skipped = 0usize;
+    let mut source_bytes = 0u64;
+    for (prefix, relative) in SCRIBBLE_STANDALONE_COMPONENTS {
+        let path = source.join(relative);
+        if !path.is_file() {
+            return Err(Lux3dError::MissingCanonicalArtifact { path });
+        }
+        source_bytes += fs::metadata(&path)
+            .map_err(|source| Lux3dError::ModelAssetIo {
+                path: path.clone(),
+                source,
+            })?
+            .len();
+        // SAFETY: the raw checkpoint is read-only for the duration of this
+        // function and the mapping is dropped before returning.
+        let mmap = unsafe { MmapedSafetensors::new(&path) }.map_err(|source| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!("failed to open {}: {source}", path.display()),
+            }
+        })?;
+        for (name, _) in mmap.tensors() {
+            let tensor = mmap.load(&name, &Device::Cpu).map_err(|source| {
+                Lux3dError::CanonicalWeightsValidation {
+                    message: format!(
+                        "failed to load tensor `{name}` from {}: {source}",
+                        path.display()
+                    ),
+                }
+            })?;
+            if tensor.rank() == 0 {
+                skipped += 1;
+                continue;
+            }
+            let full_name = format!("{prefix}.{name}");
+            let use_quant = should_quantize(&full_name, &tensor, &options);
+            let stored = if tensor.rank() > 4 {
+                tensor
+                    .flatten_all()
+                    .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                        message: format!("failed to flatten tensor `{full_name}`: {source}"),
+                    })?
+            } else {
+                tensor
+            };
+            let dtype = if use_quant {
+                quantized += 1;
+                options.dtype
+            } else {
+                fallback += 1;
+                options.fallback
+            };
+            let qtensor = QTensor::quantize(&stored, dtype).map_err(|source| {
+                Lux3dError::CanonicalWeightsValidation {
+                    message: format!(
+                        "failed to quantize tensor `{full_name}` {:?} to {dtype:?}: {source}",
+                        stored.shape()
+                    ),
+                }
+            })?;
+            tensors.push((full_name, qtensor));
+        }
+    }
+    tensors.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let resolved_config = build_scribble_standalone_config(source)?;
+    let serialized = serde_json::to_string(&resolved_config).map_err(|source| {
+        Lux3dError::CanonicalWeightsValidation {
+            message: format!("failed to serialize TripoSG-scribble resolved config: {source}"),
+        }
+    })?;
+
+    write_quantized_package(
+        output,
+        "triposg",
+        "triposg",
+        &options,
+        &tensors,
+        quantized,
+        fallback,
+        skipped,
+        source_bytes,
+        Some(serialized),
+        &[
+            (GGUF_VARIANT_KEY, TRIPOSG_SCRIBBLE_VARIANT.to_string()),
+            (
+                "lux3d.components",
+                "image_encoder,transformer,vae,text_encoder".to_string(),
+            ),
+        ],
+    )
+}
+
+fn build_scribble_standalone_config(source: &Path) -> Result<serde_json::Value> {
+    let model_index = read_scribble_json(source, "model_index.json")?;
+    let preprocessor =
+        read_scribble_json(source, "feature_extractor_dinov2/preprocessor_config.json")?;
+    let image_encoder = read_scribble_json(source, "image_encoder_dinov2/config.json")?;
+    let transformer = read_scribble_json(source, "transformer/config.json")?;
+    let vae = read_scribble_json(source, "vae/config.json")?;
+    let text_encoder = read_scribble_json(source, "text_encoder/config.json")?;
+    let scheduler_config = read_scribble_json(source, "scheduler/scheduler_config.json")?;
+    let tokenizer_config = read_scribble_json(source, "tokenizer/tokenizer_config.json")?;
+    let special_tokens_map = read_scribble_json(source, "tokenizer/special_tokens_map.json")?;
+    let vocab_json = read_scribble_text(source, "tokenizer/vocab.json")?;
+    let merges_txt = read_scribble_text(source, "tokenizer/merges.txt")?;
+
+    Ok(serde_json::json!({
+        "family": "triposg",
+        "variant": TRIPOSG_SCRIBBLE_VARIANT,
+        "model_index": model_index,
+        "preprocessor": preprocessor,
+        "image_encoder": image_encoder,
+        "transformer": transformer,
+        "vae": vae,
+        "text_encoder": text_encoder,
+        "scheduler_config": scheduler_config,
+        "pipeline_defaults": {
+            "num_tokens": 512,
+            "num_inference_steps": 16,
+            "guidance_scale": 0.0,
+            "scribble_confidence": 0.4,
+            "prompt_confidence": 1.0,
+            "bounds": [-1.005, -1.005, -1.005, 1.005, 1.005, 1.005],
+            "dense_octree_depth": 8,
+            "hierarchical_octree_depth": 8,
+            "sdf_level": 0.0
+        },
+        "tokenizer": {
+            "vocab_json": vocab_json,
+            "merges_txt": merges_txt,
+            "config": tokenizer_config,
+            "special_tokens_map": special_tokens_map
+        }
+    }))
+}
+
+fn read_scribble_json(source: &Path, relative: &str) -> Result<serde_json::Value> {
+    let path = source.join(relative);
+    let body = fs::read_to_string(&path).map_err(|source| Lux3dError::ModelAssetIo {
+        path: path.clone(),
+        source,
+    })?;
+    serde_json::from_str(&body).map_err(|source| Lux3dError::CanonicalWeightsValidation {
+        message: format!("failed to parse `{}`: {source}", path.display()),
+    })
+}
+
+fn read_scribble_text(source: &Path, relative: &str) -> Result<String> {
+    let path = source.join(relative);
+    fs::read_to_string(&path).map_err(|source| Lux3dError::ModelAssetIo { path, source })
 }
 
 /// Quantize an auxiliary package (for example `rmbg`) whose family is not a
@@ -266,6 +472,35 @@ fn quantize_checkpoint_with_family(
         (None, resolve_architecture(None, family))
     };
 
+    write_quantized_package(
+        output,
+        family,
+        &architecture,
+        &options,
+        &tensors,
+        quantized,
+        fallback,
+        skipped,
+        source_bytes,
+        embedded_resolved_config,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_quantized_package(
+    output: &Path,
+    family: &str,
+    architecture: &str,
+    options: &QuantizeOptions,
+    tensors: &[(String, QTensor)],
+    quantized: usize,
+    fallback_tensors: usize,
+    skipped_tensors: usize,
+    source_bytes: u64,
+    embedded_resolved_config: Option<String>,
+    extra_metadata: &[(&str, String)],
+) -> Result<QuantizeReport> {
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent).map_err(|source| Lux3dError::ModelAssetIo {
             path: parent.to_path_buf(),
@@ -279,7 +514,7 @@ fn quantize_checkpoint_with_family(
     let mut metadata = vec![
         (
             "general.architecture",
-            gguf_file::Value::String(architecture),
+            gguf_file::Value::String(architecture.to_string()),
         ),
         (
             GGUF_FAMILY_KEY,
@@ -303,6 +538,9 @@ fn quantize_checkpoint_with_family(
             GGUF_RESOLVED_CONFIG_KEY,
             gguf_file::Value::String(config.clone()),
         ));
+    }
+    for (key, value) in extra_metadata {
+        metadata.push((*key, gguf_file::Value::String(value.clone())));
     }
     let metadata_refs: Vec<(&str, &gguf_file::Value)> = metadata
         .iter()
@@ -331,8 +569,8 @@ fn quantize_checkpoint_with_family(
         fallback: options.fallback,
         tensors: tensors.len(),
         quantized,
-        fallback_tensors: fallback,
-        skipped_tensors: skipped,
+        fallback_tensors,
+        skipped_tensors,
         source_bytes,
         output_bytes,
         embedded_resolved_config: embedded_resolved_config.is_some(),
@@ -421,7 +659,8 @@ pub fn dtype_from_name(name: &str) -> Option<GgmlDType> {
 mod tests {
     use super::{
         dtype_from_name, dtype_name, quantize_auxiliary_checkpoint, quantize_checkpoint,
-        resolve_architecture, resolve_scribble_dit_source, should_quantize, QuantizeOptions,
+        quantize_scribble_standalone, resolve_architecture, resolve_scribble_dit_source,
+        should_quantize, QuantizeOptions,
     };
     use crate::contracts::ModelFamily;
     use candle_core::quantized::{gguf_file, GgmlDType};
@@ -512,6 +751,82 @@ mod tests {
         let source = dir.join("model.safetensors");
         candle_core::safetensors::save(&tensors, &source).unwrap();
         source
+    }
+
+    fn tiny_scribble_checkpoint(dir: &std::path::Path) -> PathBuf {
+        let cpu = Device::Cpu;
+        let mut transformer = HashMap::new();
+        transformer.insert(
+            "blocks.0.attn.to_q.weight".to_string(),
+            Tensor::rand(-0.05f32, 0.05f32, (64, 64), &cpu).unwrap(),
+        );
+        transformer.insert(
+            "blocks.0.norm.weight".to_string(),
+            Tensor::rand(0.5f32, 1.5f32, (64,), &cpu).unwrap(),
+        );
+        transformer.insert(
+            "blocks.0.num_batches_tracked".to_string(),
+            Tensor::zeros((), candle_core::DType::F32, &cpu).unwrap(),
+        );
+        let mut vae = HashMap::new();
+        vae.insert(
+            "decoder.conv.weight".to_string(),
+            Tensor::rand(-0.05f32, 0.05f32, (64, 64), &cpu).unwrap(),
+        );
+        let mut image_encoder = HashMap::new();
+        image_encoder.insert(
+            "embeddings.patch_embeddings.projection.weight".to_string(),
+            Tensor::rand(-0.05f32, 0.05f32, (64, 64), &cpu).unwrap(),
+        );
+        let mut text_encoder = HashMap::new();
+        text_encoder.insert(
+            "text_model.encoder.layers.0.self_attn.q_proj.weight".to_string(),
+            Tensor::rand(-0.05f32, 0.05f32, (64, 64), &cpu).unwrap(),
+        );
+
+        for (relative, tensors) in [
+            (
+                "transformer/diffusion_pytorch_model.safetensors",
+                &transformer,
+            ),
+            ("vae/diffusion_pytorch_model.safetensors", &vae),
+            ("image_encoder_dinov2/model.safetensors", &image_encoder),
+            ("text_encoder/model.safetensors", &text_encoder),
+        ] {
+            let path = dir.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            candle_core::safetensors::save(tensors, &path).unwrap();
+        }
+        for (relative, body) in [
+            ("model_index.json", "{}"),
+            ("feature_extractor_dinov2/preprocessor_config.json", "{}"),
+            (
+                "image_encoder_dinov2/config.json",
+                r#"{"hidden_size":1024,"num_hidden_layers":24}"#,
+            ),
+            (
+                "transformer/config.json",
+                r#"{"use_cross_attention_2":true}"#,
+            ),
+            ("vae/config.json", "{}"),
+            ("text_encoder/config.json", "{}"),
+            ("scheduler/scheduler_config.json", "{}"),
+            (
+                "tokenizer/tokenizer_config.json",
+                r#"{"model_max_length":77}"#,
+            ),
+            ("tokenizer/special_tokens_map.json", "{}"),
+            (
+                "tokenizer/vocab.json",
+                r#"{"<|startoftext|>":49406,"<|endoftext|>":49407}"#,
+            ),
+            ("tokenizer/merges.txt", "#version: 0.2\n<|startoftext|> a\n"),
+        ] {
+            let path = dir.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        dir.to_path_buf()
     }
 
     fn read_gguf(path: &std::path::Path) -> gguf_file::Content {
@@ -638,6 +953,91 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    fn standalone_scribble_merges_components_and_embeds_tokenizer() {
+        let dir = scratch_dir("scribble-standalone");
+        let source = tiny_scribble_checkpoint(&dir);
+        let output = dir.join("triposg-scribble-q8_0.gguf");
+        let report =
+            quantize_scribble_standalone(&source, &output, QuantizeOptions::default()).unwrap();
+        assert!(report.embedded_resolved_config);
+        assert_eq!(report.tensors, 5);
+        assert_eq!(report.quantized, 1);
+        assert_eq!(report.fallback_tensors, 4);
+        assert_eq!(report.skipped_tensors, 1);
+
+        let content = read_gguf(&output);
+        assert_eq!(gguf_architecture(&content), "triposg");
+        assert_eq!(content.tensor_infos.len(), 5);
+        for prefix in ["transformer.", "vae.", "image_encoder.", "text_encoder."] {
+            assert!(
+                content
+                    .tensor_infos
+                    .keys()
+                    .any(|name| name.starts_with(prefix)),
+                "standalone GGUF must contain `{prefix}` tensors"
+            );
+        }
+        match content.metadata.get("lux3d.variant") {
+            Some(gguf_file::Value::String(value)) => assert_eq!(value, "triposg-scribble"),
+            other => panic!("missing lux3d.variant metadata: {other:?}"),
+        }
+        match content.metadata.get("lux3d.components") {
+            Some(gguf_file::Value::String(value)) => {
+                assert_eq!(value, "image_encoder,transformer,vae,text_encoder")
+            }
+            other => panic!("missing lux3d.components metadata: {other:?}"),
+        }
+
+        // Only the transformer linear is quantized; the other components keep
+        // the fallback dtype even though their tensors are rank-2 `.weight`.
+        assert_eq!(
+            content.tensor_infos["transformer.blocks.0.attn.to_q.weight"].ggml_dtype,
+            GgmlDType::Q8_0
+        );
+        for name in [
+            "transformer.blocks.0.norm.weight",
+            "vae.decoder.conv.weight",
+            "image_encoder.embeddings.patch_embeddings.projection.weight",
+            "text_encoder.text_model.encoder.layers.0.self_attn.q_proj.weight",
+        ] {
+            assert_eq!(
+                content.tensor_infos[name].ggml_dtype,
+                GgmlDType::F16,
+                "`{name}` must stay in the fallback dtype"
+            );
+        }
+
+        let embedded = match content.metadata.get("lux3d.resolved_config") {
+            Some(gguf_file::Value::String(value)) => value,
+            other => panic!("missing embedded resolved config: {other:?}"),
+        };
+        let config: serde_json::Value = serde_json::from_str(embedded).unwrap();
+        assert_eq!(config["variant"], "triposg-scribble");
+        assert_eq!(config["transformer"]["use_cross_attention_2"], true);
+        assert_eq!(config["image_encoder"]["hidden_size"], 1024);
+        assert_eq!(config["pipeline_defaults"]["num_inference_steps"], 16);
+        assert_eq!(
+            config["tokenizer"]["vocab_json"],
+            r#"{"<|startoftext|>":49406,"<|endoftext|>":49407}"#
+        );
+        assert!(
+            config["tokenizer"]["merges_txt"]
+                .as_str()
+                .unwrap()
+                .contains("<|startoftext|> a")
+        );
+
+        let options = QuantizeOptions {
+            dtype: GgmlDType::Q8K,
+            ..QuantizeOptions::default()
+        };
+        let error =
+            quantize_scribble_standalone(&source, &dir.join("bad.gguf"), options).unwrap_err();
+        assert!(error.to_string().contains("activation-side"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

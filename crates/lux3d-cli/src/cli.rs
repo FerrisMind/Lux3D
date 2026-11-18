@@ -22,8 +22,8 @@ use lux3d_core::runtime::{
 };
 use lux3d_core::{
     dtype_from_name, ensure_canonical_weights, quantize_auxiliary_checkpoint, quantize_checkpoint,
-    resolve_scribble_dit_source, ModelAssetOptions, ModelFamily, QuantizeOptions,
-    Trellis2PipelineType, WeightLocator,
+    quantize_scribble_standalone, resolve_scribble_dit_source, ModelAssetOptions, ModelFamily,
+    QuantizeOptions, Trellis2PipelineType, WeightLocator,
 };
 
 #[derive(Debug, Parser, PartialEq)]
@@ -324,9 +324,16 @@ pub struct QuantizeArgs {
 
     #[arg(
         long,
-        help = "Quantize the TripoSG-scribble DiT only. `--source` may be the raw `VAST-AI/TripoSG-scribble` checkpoint directory (the transformer/diffusion_pytorch_model.safetensors shard is resolved) or the shard itself; FAMILY must be `triposg`. Write the output to `<checkpoint>/transformer/model.gguf` for automatic pickup, or pass the `.gguf` file as `--model-path`."
+        help = "Quantize the TripoSG-scribble DiT. `--source` may be the raw `VAST-AI/TripoSG-scribble` checkpoint directory (the transformer/diffusion_pytorch_model.safetensors shard is resolved) or the shard itself; FAMILY must be `triposg`. Without `--standalone` this writes a DiT-only override (place it at `<checkpoint>/transformer/model.gguf` or pass it as `--model-path`). With `--standalone` it writes one self-contained package."
     )]
     pub scribble: bool,
+
+    #[arg(
+        long,
+        requires = "scribble",
+        help = "Build one standalone TripoSG-scribble GGUF containing the DINOv2 image encoder, DiT, VAE decoder, CLIP text encoder and tokenizer. `--source` must be the raw `VAST-AI/TripoSG-scribble` checkpoint directory. Only transformer linear weights are quantized; the other components stay in the fallback dtype."
+    )]
+    pub standalone: bool,
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -708,7 +715,7 @@ pub struct RunArgs {
 
     #[arg(
         long,
-        help = "Path to a canonical package directory, a directory containing `model.gguf`, or a standalone `.gguf` file. For `triposg --mode scribble` this is the raw `VAST-AI/TripoSG-scribble` checkpoint directory, or a standalone quantized DiT `.gguf` (remaining weights resolve from LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR / models/TripoSG-scribble)."
+        help = "Path to a canonical package directory, a directory containing `model.gguf`, or a standalone `.gguf` file. For `triposg --mode scribble` this is a standalone scribble package (`.gguf` file or a directory containing only `model.gguf`), the raw `VAST-AI/TripoSG-scribble` checkpoint directory, or a legacy DiT-only `.gguf` (remaining weights resolve from LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR / models/TripoSG-scribble)."
     )]
     pub model_path: Option<PathBuf>,
 
@@ -1376,8 +1383,12 @@ pub fn quantize_weights(args: QuantizeArgs) -> anyhow::Result<String> {
                 "`--scribble` quantizes the TripoSG-scribble DiT; pass `triposg` as FAMILY"
             );
         }
-        let source = resolve_scribble_dit_source(&args.source)?;
-        quantize_checkpoint(&source, &args.output, ModelFamily::TripoSg, options)?
+        if args.standalone {
+            quantize_scribble_standalone(&args.source, &args.output, options)?
+        } else {
+            let source = resolve_scribble_dit_source(&args.source)?;
+            quantize_checkpoint(&source, &args.output, ModelFamily::TripoSg, options)?
+        }
     } else if let Some(aux_family) = args.aux_family.as_deref() {
         quantize_auxiliary_checkpoint(&args.source, &args.output, aux_family, options)?
     } else {
@@ -7579,6 +7590,54 @@ mod tests {
             "triposr",
         ]);
         assert_eq!("triposr", cli.command.family_name());
+    }
+
+    #[test]
+    fn parses_scribble_standalone_quantize_flags() {
+        let cli = Cli::parse_from([
+            "lux3d",
+            "weights",
+            "quantize",
+            "triposg",
+            "--source",
+            "raw-TripoSG-scribble",
+            "--output",
+            "triposg-scribble-q8_0.gguf",
+            "--dtype",
+            "q8_0",
+            "--fallback-dtype",
+            "f16",
+            "--scribble",
+            "--standalone",
+        ]);
+        let Command::Weights(args) = cli.command else {
+            panic!("expected weights command");
+        };
+        let super::WeightsCommand::Quantize(args) = args.command else {
+            panic!("expected weights quantize command");
+        };
+        assert!(args.scribble, "--scribble must be set");
+        assert!(args.standalone, "--standalone must be set");
+    }
+
+    #[test]
+    fn standalone_quantize_requires_scribble() {
+        let error = Cli::try_parse_from([
+            "lux3d",
+            "weights",
+            "quantize",
+            "triposg",
+            "--source",
+            "raw-TripoSG-scribble",
+            "--output",
+            "triposg-scribble-q8_0.gguf",
+            "--standalone",
+        ])
+        .expect_err("--standalone without --scribble must be rejected");
+        assert!(
+            error.to_string().contains("--scribble"),
+            "unexpected clap error: {error}"
+        );
     }
 
     #[test]

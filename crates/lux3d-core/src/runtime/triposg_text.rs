@@ -118,23 +118,38 @@ impl ClipBpeTokenizer {
                 vocab_path.display()
             ))
         })?;
-        let encoder: HashMap<String, u32> = serde_json::from_str(&vocab_body).map_err(|error| {
-            candle_core::Error::Msg(format!(
-                "failed to parse CLIP vocab `{}`: {error}",
-                vocab_path.display()
-            ))
-        })?;
-        let decoder = encoder
-            .iter()
-            .map(|(token, id)| (*id, token.clone()))
-            .collect::<HashMap<_, _>>();
-
         let merges_body = fs::read_to_string(merges_path).map_err(|error| {
             candle_core::Error::Msg(format!(
                 "failed to read CLIP merges `{}`: {error}",
                 merges_path.display()
             ))
         })?;
+        Self::from_json(&vocab_body, &merges_body, tokenizer_config, None)
+    }
+
+    /// Build from tokenizer documents embedded in a standalone GGUF. The
+    /// optional `special_tokens_map.json` document is merged exactly like
+    /// [`Self::from_dir`].
+    pub fn from_json(
+        vocab_body: &str,
+        merges_body: &str,
+        tokenizer_config: &serde_json::Value,
+        special_tokens_map: Option<&serde_json::Value>,
+    ) -> CandleResult<Self> {
+        let mut tokenizer_config = tokenizer_config.clone();
+        if let Some(special) = special_tokens_map {
+            merge_special_tokens(&mut tokenizer_config, special);
+        }
+        let tokenizer_config = &tokenizer_config;
+
+        let encoder: HashMap<String, u32> = serde_json::from_str(vocab_body).map_err(|error| {
+            candle_core::Error::Msg(format!("failed to parse CLIP vocab: {error}"))
+        })?;
+        let decoder = encoder
+            .iter()
+            .map(|(token, id)| (*id, token.clone()))
+            .collect::<HashMap<_, _>>();
+
         let mut bpe_ranks = HashMap::new();
         for (rank, line) in merges_body.lines().enumerate() {
             let line = line.trim_end_matches('\r');
@@ -145,8 +160,7 @@ impl ClipBpeTokenizer {
             let (Some(first), Some(second), None) = (parts.next(), parts.next(), parts.next())
             else {
                 return Err(candle_core::Error::Msg(format!(
-                    "invalid CLIP merge line `{line}` in `{}`",
-                    merges_path.display()
+                    "invalid CLIP merge line `{line}`"
                 )));
             };
             bpe_ranks.insert((first.to_string(), second.to_string()), rank as u32);

@@ -6,7 +6,7 @@ pub use auxiliary::{
 pub(crate) use candle_nn::VarBuilder;
 pub use quantize::{
     QuantizeOptions, QuantizeReport, dtype_from_name, dtype_name, quantize_auxiliary_checkpoint,
-    quantize_checkpoint, resolve_scribble_dit_source,
+    quantize_checkpoint, quantize_scribble_standalone, resolve_scribble_dit_source,
 };
 
 use std::{
@@ -25,7 +25,9 @@ use crate::{Result, contracts::ModelFamily, error::Lux3dError};
 pub(crate) const CANONICAL_FILENAME: &str = "model.safetensors";
 pub(crate) const GGUF_FILENAME: &str = "model.gguf";
 pub(crate) const GGUF_FAMILY_KEY: &str = "lux3d.family";
+pub(crate) const GGUF_VARIANT_KEY: &str = "lux3d.variant";
 pub(crate) const GGUF_RESOLVED_CONFIG_KEY: &str = "lux3d.resolved_config";
+pub(crate) const TRIPOSG_SCRIBBLE_VARIANT: &str = "triposg-scribble";
 pub(crate) const RESOLVED_CONFIG_FILENAME: &str = "resolved_config.json";
 pub(crate) const MANIFEST_FILENAME: &str = "manifest.json";
 pub(crate) const CHECKSUMS_FILENAME: &str = "checksums.json";

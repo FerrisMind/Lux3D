@@ -39,7 +39,7 @@ use std::{
     sync::Arc,
 };
 
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device, Tensor, quantized::gguf_file};
 
 use super::{
     triposg_dino::TripoSgDinoEncoder,
@@ -59,7 +59,7 @@ use crate::{
     load_auxiliary_canonical_weights, load_canonical_weights,
     neural::TripoSgNeuralStage,
     preprocess::TripoSgPreprocessStage,
-    weights::VarBuilder,
+    weights::{VarBuilder, GGUF_VARIANT_KEY, TRIPOSG_SCRIBBLE_VARIANT, is_gguf_path},
     AuxiliaryWeightSetPaths, CanonicalWeightSetPaths, ModelAssetOptions, ModelFamily, Result,
 };
 
@@ -335,6 +335,54 @@ fn scribble_model_dir_candidate(explicit: Option<&Path>) -> PathBuf {
 fn scribble_sibling_dit_gguf(dir: &Path) -> Option<PathBuf> {
     let sibling = dir.join(TRIPOSG_SCRIBBLE_DIT_GGUF);
     sibling.is_file().then_some(sibling)
+}
+
+/// Root name of a standalone scribble package (one GGUF with every
+/// component), as opposed to the raw checkpoint's `transformer/model.gguf`.
+const TRIPOSG_SCRIBBLE_STANDALONE_GGUF: &str = "model.gguf";
+const TRIPOSG_SCRIBBLE_COMPONENT_PREFIXES: [&str; 4] =
+    ["image_encoder.", "transformer.", "vae.", "text_encoder."];
+
+/// Return the standalone GGUF for a `.gguf` file or a package directory.
+///
+/// A directory that still has `transformer/config.json` is treated as the raw
+/// diffusers checkpoint even if it also contains a root `model.gguf`, so the
+/// existing DiT-override layout keeps its meaning.
+fn scribble_standalone_gguf(path: &Path) -> Option<PathBuf> {
+    if path.is_file() {
+        return (is_gguf_path(path) && scribble_gguf_is_standalone(path))
+            .then(|| path.to_path_buf());
+    }
+    if path.is_dir() {
+        let candidate = path.join(TRIPOSG_SCRIBBLE_STANDALONE_GGUF);
+        if candidate.is_file()
+            && !path.join("transformer/config.json").is_file()
+            && scribble_gguf_is_standalone(&candidate)
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn scribble_gguf_is_standalone(path: &Path) -> bool {
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let Ok(content) = gguf_file::Content::read(&mut file) else {
+        return false;
+    };
+    if let Some(gguf_file::Value::String(variant)) = content.metadata.get(GGUF_VARIANT_KEY) {
+        if variant.as_str() == TRIPOSG_SCRIBBLE_VARIANT {
+            return true;
+        }
+    }
+    TRIPOSG_SCRIBBLE_COMPONENT_PREFIXES.iter().all(|prefix| {
+        content
+            .tensor_infos
+            .keys()
+            .any(|name| name.starts_with(prefix))
+    })
 }
 
 /// Validate a resolved scribble checkpoint directory. `require_dit_safetensors`
@@ -885,6 +933,205 @@ impl TripoSgScribbleModelBundle {
             })?,
         })
     }
+
+    /// Load every component from one standalone GGUF written by
+    /// `weights quantize triposg --scribble --standalone`.
+    fn load_standalone(gguf: &Path, device: &Device, dtype: DType) -> Result<Self> {
+        let standalone = crate::weights::read_standalone_gguf(gguf, "triposg")?;
+        let config = &standalone.resolved_config;
+        if config.get("variant").and_then(serde_json::Value::as_str)
+            != Some(TRIPOSG_SCRIBBLE_VARIANT)
+        {
+            return Err(Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "GGUF `{}` is not a standalone TripoSG-scribble package; rebuild it \
+                     with `weights quantize triposg --scribble --standalone`",
+                    gguf.display()
+                ),
+            });
+        }
+        let transformer_config =
+            config
+                .get("transformer")
+                .ok_or_else(|| Lux3dError::CanonicalWeightsValidation {
+                    message: format!(
+                        "standalone TripoSG-scribble GGUF `{}` has no transformer config",
+                        gguf.display()
+                    ),
+                })?;
+        let vae_config =
+            config
+                .get("vae")
+                .ok_or_else(|| Lux3dError::CanonicalWeightsValidation {
+                    message: format!(
+                        "standalone TripoSG-scribble GGUF `{}` has no VAE config",
+                        gguf.display()
+                    ),
+                })?;
+        let dino_config =
+            config
+                .get("image_encoder")
+                .ok_or_else(|| Lux3dError::CanonicalWeightsValidation {
+                    message: format!(
+                        "standalone TripoSG-scribble GGUF `{}` has no image-encoder config",
+                        gguf.display()
+                    ),
+                })?;
+        let text_config =
+            config
+                .get("text_encoder")
+                .ok_or_else(|| Lux3dError::CanonicalWeightsValidation {
+                    message: format!(
+                        "standalone TripoSG-scribble GGUF `{}` has no text-encoder config",
+                        gguf.display()
+                    ),
+                })?;
+
+        let transformer_cfg = TripoSgTransformerConfig::from_resolved_config(transformer_config)
+            .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "failed to parse standalone TripoSG-scribble transformer config: {source}"
+                ),
+            })?;
+        if !transformer_cfg.use_cross_attention_2 {
+            return Err(Lux3dError::CanonicalWeightsValidation {
+                message: "standalone TripoSG-scribble transformer config does not enable \
+                          use_cross_attention_2"
+                    .to_string(),
+            });
+        }
+        let vae_cfg = TripoSgVaeConfig::from_resolved_config(vae_config).map_err(|source| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "failed to parse standalone TripoSG-scribble VAE config: {source}"
+                ),
+            }
+        })?;
+        let dino_hidden = dino_config
+            .get("hidden_size")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize)
+            .unwrap_or(1024);
+        let dino_layers = dino_config
+            .get("num_hidden_layers")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize)
+            .unwrap_or(24);
+        if dino_hidden != 1024 || dino_layers != 24 {
+            return Err(Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "standalone TripoSG-scribble image encoder must be DINOv2-large (hidden \
+                     1024, 24 layers), got hidden {dino_hidden}, {dino_layers} layers"
+                ),
+            });
+        }
+        if transformer_cfg.cross_attention_2_dim != Some(dino_hidden) {
+            return Err(Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "standalone TripoSG-scribble transformer cross_attention_2_dim {:?} does \
+                     not match the image encoder hidden size {dino_hidden}",
+                    transformer_cfg.cross_attention_2_dim
+                ),
+            });
+        }
+
+        let vb = VarBuilder::from_gguf(gguf, dtype, device).map_err(|source| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "failed to open standalone TripoSG-scribble GGUF `{}`: {source}",
+                    gguf.display()
+                ),
+            }
+        })?;
+        let text_encoder = TripoSgClipTextEncoder::load(vb.pp("text_encoder"), text_config, dtype)
+            .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "failed to construct standalone TripoSG-scribble CLIP text encoder: {source}"
+                ),
+            })?;
+        if text_encoder.config().embed_dim != transformer_cfg.cross_attention_dim {
+            return Err(Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "standalone TripoSG-scribble text encoder hidden size {} does not match \
+                     the transformer cross_attention_dim {}",
+                    text_encoder.config().embed_dim,
+                    transformer_cfg.cross_attention_dim
+                ),
+            });
+        }
+
+        Ok(Self {
+            dino: TripoSgDinoEncoder::load(vb.pp("image_encoder")).map_err(|source| {
+                Lux3dError::CanonicalWeightsValidation {
+                    message: format!(
+                        "failed to construct standalone TripoSG-scribble image encoder: {source}"
+                    ),
+                }
+            })?,
+            dit: TripoSgDiT::load(vb.pp("transformer"), &transformer_cfg).map_err(|source| {
+                Lux3dError::CanonicalWeightsValidation {
+                    message: format!(
+                        "failed to construct standalone TripoSG-scribble DiT: {source}"
+                    ),
+                }
+            })?,
+            vae: TripoSgVaeDecoder::load(vb.pp("vae"), &vae_cfg).map_err(|source| {
+                Lux3dError::CanonicalWeightsValidation {
+                    message: format!(
+                        "failed to construct standalone TripoSG-scribble VAE decoder: {source}"
+                    ),
+                }
+            })?,
+            text_encoder,
+            tokenizer: scribble_embedded_tokenizer(config, gguf)?,
+        })
+    }
+}
+
+fn scribble_embedded_tokenizer(
+    config: &serde_json::Value,
+    gguf: &Path,
+) -> Result<ClipBpeTokenizer> {
+    let tokenizer =
+        config
+            .get("tokenizer")
+            .ok_or_else(|| Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "standalone TripoSG-scribble GGUF `{}` has no embedded tokenizer",
+                    gguf.display()
+                ),
+            })?;
+    let vocab = tokenizer
+        .get("vocab_json")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Lux3dError::CanonicalWeightsValidation {
+            message: format!(
+                "standalone TripoSG-scribble GGUF `{}` has no embedded vocab.json",
+                gguf.display()
+            ),
+        })?;
+    let merges = tokenizer
+        .get("merges_txt")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Lux3dError::CanonicalWeightsValidation {
+            message: format!(
+                "standalone TripoSG-scribble GGUF `{}` has no embedded merges.txt",
+                gguf.display()
+            ),
+        })?;
+    let tokenizer_config = tokenizer
+        .get("config")
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    let special_tokens_map = tokenizer.get("special_tokens_map");
+    ClipBpeTokenizer::from_json(vocab, merges, &tokenizer_config, special_tokens_map).map_err(
+        |source| Lux3dError::CanonicalWeightsValidation {
+            message: format!(
+                "failed to load the embedded TripoSG-scribble CLIP tokenizer from `{}`: {source}",
+                gguf.display()
+            ),
+        },
+    )
 }
 
 fn read_triposg_scribble_json(dir: &Path, relative: &str) -> Result<serde_json::Value> {
@@ -961,11 +1208,15 @@ pub fn resolve_triposg_scribble_model_source(
     explicit: Option<&Path>,
 ) -> Result<(PathBuf, Option<PathBuf>)> {
     if let Some(path) = explicit {
+        if let Some(standalone) = scribble_standalone_gguf(path) {
+            return Ok((standalone, None));
+        }
         if path.is_file() {
             if !crate::weights::is_gguf_path(path) {
                 return Err(Lux3dError::InvalidInput(
-                    "TripoSG scribble `--model-path` file must be a `.gguf` DiT package; \
-                     pass the raw checkpoint directory or a quantized DiT `.gguf`",
+                    "TripoSG scribble `--model-path` file must be a standalone `.gguf` \
+                     package or a quantized DiT `.gguf`; pass the raw checkpoint directory \
+                     for the float checkpoint",
                 ));
             }
             let fallback = scribble_model_dir_candidate(None);
@@ -977,6 +1228,10 @@ pub fn resolve_triposg_scribble_model_source(
                 Some(path.to_path_buf()),
             ));
         }
+    }
+    let fallback = scribble_model_dir_candidate(explicit);
+    if let Some(standalone) = scribble_standalone_gguf(&fallback) {
+        return Ok((standalone, None));
     }
     Ok((resolve_triposg_scribble_model_dir(explicit)?, None))
 }
@@ -992,6 +1247,9 @@ pub struct TripoSgScribblePipeline {
     /// `transformer/model.gguf` is preferred over the safetensors shard
     /// (same precedence as the canonical image pipeline).
     pub dit_gguf: Option<PathBuf>,
+    /// Standalone GGUF containing all four components. When set, the raw
+    /// checkpoint directory is not read at all.
+    pub standalone_gguf: Option<PathBuf>,
     pub preprocess: TripoSgPreprocessStage,
     pub geometry: TripoSgGeometryStage,
     pub export: TripoSgExportStage,
@@ -1021,6 +1279,12 @@ impl TripoSgScribblePipeline {
             if !path.is_file() {
                 return Err(Lux3dError::MissingCanonicalArtifact { path: path.clone() });
             }
+            if scribble_standalone_gguf(path).is_some() {
+                return Ok(Self::from_standalone(path.clone(), dtype));
+            }
+        }
+        if let Some(standalone) = scribble_standalone_gguf(&model_dir) {
+            return Ok(Self::from_standalone(standalone, dtype));
         }
         if !model_dir.is_dir() {
             return Err(scribble_model_dir_missing_error());
@@ -1033,6 +1297,7 @@ impl TripoSgScribblePipeline {
         Ok(Self {
             model_dir: resolved,
             dit_gguf,
+            standalone_gguf: None,
             preprocess: TripoSgPreprocessStage::default(),
             geometry: TripoSgGeometryStage,
             export: TripoSgExportStage,
@@ -1041,14 +1306,32 @@ impl TripoSgScribblePipeline {
         })
     }
 
+    fn from_standalone(gguf: PathBuf, dtype: DType) -> Self {
+        let model_dir = gguf.parent().map(Path::to_path_buf).unwrap_or_default();
+        Self {
+            model_dir,
+            dit_gguf: None,
+            standalone_gguf: Some(gguf),
+            preprocess: TripoSgPreprocessStage::default(),
+            geometry: TripoSgGeometryStage,
+            export: TripoSgExportStage,
+            dtype,
+            bundle_cache: Arc::default(),
+        }
+    }
+
     fn bundle_for(&self, device: &Device) -> Result<Arc<TripoSgScribbleModelBundle>> {
         self.bundle_cache.get_or_try_init(device, || {
-            TripoSgScribbleModelBundle::load(
-                &self.model_dir,
-                self.dit_gguf.as_deref(),
-                device,
-                self.dtype,
-            )
+            if let Some(gguf) = self.standalone_gguf.as_deref() {
+                TripoSgScribbleModelBundle::load_standalone(gguf, device, self.dtype)
+            } else {
+                TripoSgScribbleModelBundle::load(
+                    &self.model_dir,
+                    self.dit_gguf.as_deref(),
+                    device,
+                    self.dtype,
+                )
+            }
         })
     }
 
@@ -2336,6 +2619,90 @@ mod scribble_dit_loader_tests {
         };
         assert!(err.to_string().contains("missing.gguf"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn tiny_standalone_scribble_gguf(dir: &Path) -> PathBuf {
+        let path = dir.join("model.gguf");
+        let mut file = fs::File::create(&path).unwrap();
+        let metadata = [
+            (
+                "general.architecture",
+                gguf_file::Value::String("triposg".to_string()),
+            ),
+            (
+                "lux3d.variant",
+                gguf_file::Value::String(TRIPOSG_SCRIBBLE_VARIANT.to_string()),
+            ),
+        ];
+        let metadata_refs: Vec<(&str, &gguf_file::Value)> = metadata
+            .iter()
+            .map(|(name, value)| (*name, value))
+            .collect();
+        let tensors: Vec<(&str, &candle_core::quantized::QTensor)> = Vec::new();
+        gguf_file::write(&mut file, &metadata_refs, &tensors).unwrap();
+        path
+    }
+
+    #[test]
+    fn standalone_detection_accepts_variant_metadata_file_and_package_dir() {
+        let dir = scratch_dir("standalone-detect");
+        let gguf = tiny_standalone_scribble_gguf(&dir);
+        assert_eq!(scribble_standalone_gguf(&gguf), Some(gguf.clone()));
+
+        let package = dir.join("package");
+        fs::create_dir_all(&package).unwrap();
+        fs::copy(&gguf, package.join("model.gguf")).unwrap();
+        assert_eq!(
+            scribble_standalone_gguf(&package),
+            Some(package.join("model.gguf"))
+        );
+
+        let (resolved, dit) = resolve_triposg_scribble_model_source(Some(&gguf)).unwrap();
+        assert_eq!(resolved, gguf);
+        assert!(dit.is_none());
+
+        // A raw checkpoint keeps its DiT-override meaning even when a root
+        // `model.gguf` exists.
+        fs::create_dir_all(package.join("transformer")).unwrap();
+        fs::write(package.join("transformer").join("config.json"), b"{}").unwrap();
+        assert_eq!(scribble_standalone_gguf(&package), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn standalone_package_loads_all_components_when_available() {
+        let path = std::env::var_os("LUX3D_TRIPOSG_SCRIBBLE_STANDALONE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                crate::test_support::runtime_root()
+                    .join("candle-3d")
+                    .join("out")
+                    .join("scribble-standalone")
+                    .join("triposg-scribble-q8_0.gguf")
+            });
+        if !path.is_file() {
+            eprintln!(
+                "skipping standalone scribble load: no package at {}",
+                path.display()
+            );
+            return;
+        }
+
+        let pipeline = TripoSgScribblePipeline::load_with_dtype(path.clone(), DType::F32)
+            .expect("standalone scribble pipeline load");
+        assert_eq!(pipeline.standalone_gguf.as_deref(), Some(path.as_path()));
+        assert!(pipeline.dit_gguf.is_none());
+
+        // Force the lazy bundle load: this constructs DINOv2, the DiT, the VAE
+        // and the CLIP text encoder from the single GGUF and parses the
+        // embedded tokenizer. It would fail on any missing component prefix.
+        let bundle = pipeline
+            .bundle_for(&Device::Cpu)
+            .expect("load all standalone components");
+        let ids = bundle.tokenizer.encode("a photo of a cat");
+        assert_eq!(ids.len(), 77);
+        assert_eq!(ids[0], 49406);
+        assert_eq!(ids[6], 49407);
     }
 
     /// Create every required scribble file except the float DiT shard.
