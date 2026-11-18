@@ -715,7 +715,7 @@ pub struct RunArgs {
 
     #[arg(
         long,
-        help = "Path to a canonical package directory, a directory containing `model.gguf`, or a standalone `.gguf` file. For `triposg --mode scribble` this is a standalone scribble package (`.gguf` file or a directory containing only `model.gguf`), the raw `VAST-AI/TripoSG-scribble` checkpoint directory, or a legacy DiT-only `.gguf` (remaining weights resolve from LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR / models/TripoSG-scribble)."
+        help = "Path to a canonical package directory, a directory containing `model.gguf`, or a standalone `.gguf` file. For `triposg --mode scribble` this is a canonical `triposg-scribble` package, a standalone scribble package (`.gguf` file or a directory containing only `model.gguf`), the raw `VAST-AI/TripoSG-scribble` checkpoint directory, or a legacy DiT-only `.gguf` (remaining weights resolve from LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR / models/TripoSG-scribble)."
     )]
     pub model_path: Option<PathBuf>,
 
@@ -2132,8 +2132,8 @@ fn reject_scribble_mode_conflicts(args: &RunArgs) -> anyhow::Result<()> {
     if args.cache_dir.is_some() {
         anyhow::bail!(
             "`--cache-dir` is not supported for `triposg --mode scribble`: the scribble \
-             checkpoint has no canonical package/HF auto-download; pass --model-path or \
-             set LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR"
+             checkpoint has no HF auto-download; pass --model-path (canonical package, \
+             standalone GGUF or raw checkpoint) or set LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR"
         );
     }
     Ok(())

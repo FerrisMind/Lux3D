@@ -88,6 +88,10 @@ pub struct CanonicalChecksums {
 #[serde(deny_unknown_fields)]
 pub struct CanonicalWeightsManifest {
     pub family: ModelFamily,
+    /// Optional model variant inside a family (for example
+    /// `triposg-scribble`). Absent for the original checkpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
     pub normalizer_version: u32,
     pub raw_files: Box<[String]>,
     pub canonical_file: String,
@@ -248,7 +252,19 @@ impl WeightLocator {
     /// TripoSG ships as a diffusers-style repo with three safetensors shards
     /// that share filenames across sibling directories. The raw file order
     /// below is the canonical merge order consumed by the Python normalizer.
+    ///
+    /// TripoSG-scribble adds a CLIP text encoder and tokenizer on top of the
+    /// same layout, so a raw tree carrying `text_encoder/model.safetensors`
+    /// selects the scribble plan automatically.
     fn locate_triposg(&self) -> Result<CanonicalizationPlan> {
+        if self
+            .raw_model_dir
+            .join("text_encoder")
+            .join("model.safetensors")
+            .is_file()
+        {
+            return self.locate_triposg_scribble();
+        }
         let transformer = self.ensure_exists(
             self.raw_model_dir
                 .join("transformer")
@@ -304,6 +320,45 @@ impl WeightLocator {
             future_loader: FutureWeightLoader::CandleMmapSafetensors,
             license_note:
                 "TripoSG code and weights are MIT; canonical safetensors stay outside vendor tree."
+                    .to_string(),
+        })
+    }
+
+    /// TripoSG-scribble raw layout: the regular TripoSG components plus a
+    /// CLIP text encoder and its tokenizer. The order must stay in lockstep
+    /// with `TRIPOSG_SCRIBBLE_RAW_FILES` in the Python normalizer.
+    fn locate_triposg_scribble(&self) -> Result<CanonicalizationPlan> {
+        let relative_files = [
+            "transformer/diffusion_pytorch_model.safetensors",
+            "vae/diffusion_pytorch_model.safetensors",
+            "image_encoder_dinov2/model.safetensors",
+            "text_encoder/model.safetensors",
+            "model_index.json",
+            "feature_extractor_dinov2/preprocessor_config.json",
+            "image_encoder_dinov2/config.json",
+            "scheduler/scheduler_config.json",
+            "transformer/config.json",
+            "vae/config.json",
+            "text_encoder/config.json",
+            "tokenizer/vocab.json",
+            "tokenizer/merges.txt",
+            "tokenizer/tokenizer_config.json",
+            "tokenizer/special_tokens_map.json",
+        ];
+        let raw_files = relative_files
+            .into_iter()
+            .map(|relative| self.ensure_exists(self.raw_model_dir.join(relative)))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(CanonicalizationPlan {
+            family: ModelFamily::TripoSg,
+            raw_format: RawWeightFormat::SafetensorsDirect,
+            raw_files: raw_files.into_boxed_slice(),
+            canonical_root: self.canonical_root.clone(),
+            canonical_filename: CANONICAL_FILENAME.to_string(),
+            future_loader: FutureWeightLoader::CandleMmapSafetensors,
+            license_note:
+                "TripoSG-scribble code and weights are MIT; canonical safetensors stay outside vendor tree."
                     .to_string(),
         })
     }
@@ -569,6 +624,7 @@ fn load_standalone_gguf(
     let standalone = read_standalone_gguf(&gguf_file, family.as_str())?;
     let manifest = CanonicalWeightsManifest {
         family,
+        variant: None,
         normalizer_version: 0,
         raw_files: Box::default(),
         canonical_file: GGUF_FILENAME.to_string(),

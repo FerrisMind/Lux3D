@@ -1995,6 +1995,7 @@ mod tests {
             weights: CanonicalWeightSetPaths {
                 manifest: CanonicalWeightsManifest {
                     family: ModelFamily::Vggt,
+                    variant: None,
                     normalizer_version: 0,
                     raw_files: Box::new([]),
                     canonical_file: String::new(),

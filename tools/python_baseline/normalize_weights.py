@@ -87,6 +87,7 @@ def write_outputs(
     raw_files: list[Path],
     resolved_config: dict,
     tensors: dict[str, torch.Tensor],
+    variant: str | None = None,
 ) -> None:
     target_root = ensure_dir(output_dir)
     canonical_file = target_root / "model.safetensors"
@@ -104,6 +105,7 @@ def write_outputs(
             )
             if (
                 existing_manifest.get("family") == family
+                and existing_manifest.get("variant") == variant
                 and existing_manifest.get("normalizer_version") == NORMALIZER_VERSION
                 and existing_manifest.get("raw_files") == keys
                 and existing_manifest.get("source_checksums") == source_checksums
@@ -127,6 +129,8 @@ def write_outputs(
         "dtype_histogram": histogram(ordered),
         "source_checksums": source_checksums,
     }
+    if variant is not None:
+        manifest["variant"] = variant
     write_json(manifest_file, manifest)
     checksums = build_checksums(
         repo_root=target_root,
@@ -389,7 +393,38 @@ TRIPOSG_RAW_FILES = [
 ]
 
 
+TRIPOSG_SCRIBBLE_VARIANT = "triposg-scribble"
+
+# Raw file order consumed by the TripoSG-scribble normalizer and mirrored by
+# `WeightLocator::locate_triposg_scribble`.
+TRIPOSG_SCRIBBLE_RAW_FILES = [
+    "transformer/diffusion_pytorch_model.safetensors",
+    "vae/diffusion_pytorch_model.safetensors",
+    "image_encoder_dinov2/model.safetensors",
+    "text_encoder/model.safetensors",
+    "model_index.json",
+    "feature_extractor_dinov2/preprocessor_config.json",
+    "image_encoder_dinov2/config.json",
+    "scheduler/scheduler_config.json",
+    "transformer/config.json",
+    "vae/config.json",
+    "text_encoder/config.json",
+    "tokenizer/vocab.json",
+    "tokenizer/merges.txt",
+    "tokenizer/tokenizer_config.json",
+    "tokenizer/special_tokens_map.json",
+]
+
+
 def normalize_triposg(raw_model_dir: Path, output_dir: Path) -> None:
+    # TripoSG-scribble is a superset of the image checkpoint: the same
+    # transformer/vae/image-encoder layout plus a CLIP text encoder and
+    # tokenizer. Detect it from the extra shard so the existing
+    # `weights normalize ... triposg` command canonicalizes either variant.
+    if (raw_model_dir / "text_encoder" / "model.safetensors").is_file():
+        normalize_triposg_scribble(raw_model_dir, output_dir)
+        return
+
     model_root = raw_model_dir
     raw_files = [model_root / relative for relative in TRIPOSG_RAW_FILES]
 
@@ -436,6 +471,69 @@ def normalize_triposg(raw_model_dir: Path, output_dir: Path) -> None:
         raw_files=raw_files,
         resolved_config=resolved_config,
         tensors=tensors,
+    )
+
+
+def normalize_triposg_scribble(raw_model_dir: Path, output_dir: Path) -> None:
+    model_root = raw_model_dir
+    raw_files = [model_root / relative for relative in TRIPOSG_SCRIBBLE_RAW_FILES]
+
+    prefixes = {
+        "transformer/diffusion_pytorch_model.safetensors": "transformer",
+        "vae/diffusion_pytorch_model.safetensors": "vae",
+        "image_encoder_dinov2/model.safetensors": "image_encoder",
+        "text_encoder/model.safetensors": "text_encoder",
+    }
+    tensors: dict[str, torch.Tensor] = {}
+    for relative, prefix in prefixes.items():
+        shard = load_file(str(model_root / relative))
+        if not shard:
+            raise RuntimeError(f"TripoSG-scribble shard {relative} did not contain any tensors")
+        for key, value in shard.items():
+            tensors[f"{prefix}.{key}"] = value
+
+    def read_json(relative: str) -> dict:
+        return json.loads((model_root / relative).read_text(encoding="utf-8"))
+
+    def read_text(relative: str) -> str:
+        return (model_root / relative).read_text(encoding="utf-8")
+
+    resolved_config = {
+        "family": "triposg",
+        "variant": TRIPOSG_SCRIBBLE_VARIANT,
+        "model_index": read_json("model_index.json"),
+        "preprocessor": read_json("feature_extractor_dinov2/preprocessor_config.json"),
+        "image_encoder": read_json("image_encoder_dinov2/config.json"),
+        "transformer": read_json("transformer/config.json"),
+        "vae": read_json("vae/config.json"),
+        "text_encoder": read_json("text_encoder/config.json"),
+        "scheduler_config": read_json("scheduler/scheduler_config.json"),
+        "pipeline_defaults": {
+            "num_tokens": 512,
+            "num_inference_steps": 16,
+            "guidance_scale": 0.0,
+            "scribble_confidence": 0.4,
+            "prompt_confidence": 1.0,
+            "bounds": [-1.005, -1.005, -1.005, 1.005, 1.005, 1.005],
+            "dense_octree_depth": 8,
+            "hierarchical_octree_depth": 8,
+            "sdf_level": 0.0,
+        },
+        "tokenizer": {
+            "vocab_json": read_text("tokenizer/vocab.json"),
+            "merges_txt": read_text("tokenizer/merges.txt"),
+            "config": read_json("tokenizer/tokenizer_config.json"),
+            "special_tokens_map": read_json("tokenizer/special_tokens_map.json"),
+        },
+    }
+
+    write_outputs(
+        family="triposg",
+        output_dir=output_dir,
+        raw_files=raw_files,
+        resolved_config=resolved_config,
+        tensors=tensors,
+        variant=TRIPOSG_SCRIBBLE_VARIANT,
     )
 
 

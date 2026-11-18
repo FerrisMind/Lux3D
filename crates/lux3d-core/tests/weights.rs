@@ -301,6 +301,54 @@ fn triposg_locator_finds_raw_shards_in_exact_order() {
     cleanup_dir(&root);
 }
 
+fn triposg_scribble_raw_relative_files() -> [&'static str; 15] {
+    [
+        "transformer/diffusion_pytorch_model.safetensors",
+        "vae/diffusion_pytorch_model.safetensors",
+        "image_encoder_dinov2/model.safetensors",
+        "text_encoder/model.safetensors",
+        "model_index.json",
+        "feature_extractor_dinov2/preprocessor_config.json",
+        "image_encoder_dinov2/config.json",
+        "scheduler/scheduler_config.json",
+        "transformer/config.json",
+        "vae/config.json",
+        "text_encoder/config.json",
+        "tokenizer/vocab.json",
+        "tokenizer/merges.txt",
+        "tokenizer/tokenizer_config.json",
+        "tokenizer/special_tokens_map.json",
+    ]
+}
+
+#[test]
+fn triposg_locator_detects_scribble_layout() {
+    let root = temp_fixture_root("triposg-scribble");
+    let raw_model_dir = root.join("raw");
+    let canonical_dir = root.join("canonical").join("triposg-scribble");
+    for relative in triposg_scribble_raw_relative_files() {
+        let path = raw_model_dir.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("scribble fixture parent dir");
+        }
+        fs::write(&path, b"fixture").expect("scribble fixture file");
+    }
+
+    let locator = WeightLocator::new(raw_model_dir.clone(), canonical_dir.clone());
+    let weights = locator
+        .locate(ModelFamily::TripoSg)
+        .expect("triposg-scribble weights");
+    let expected = triposg_scribble_raw_relative_files()
+        .into_iter()
+        .map(|relative| raw_model_dir.join(relative))
+        .collect::<Vec<_>>();
+
+    assert_eq!(ModelFamily::TripoSg, weights.family);
+    assert_eq!(expected, weights.raw_files.to_vec());
+    assert_eq!(canonical_dir, weights.canonical_root);
+    cleanup_dir(&root);
+}
+
 #[test]
 fn triposg_locator_finds_the_local_raw_checkpoint_dir() {
     let raw_model_dir = workspace_root().join("models").join("TripoSG");
