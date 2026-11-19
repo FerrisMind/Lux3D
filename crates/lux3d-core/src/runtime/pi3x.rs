@@ -409,11 +409,15 @@ impl Pi3xPipeline {
                         message: format!("Pi3X ray xy slice failed: {source}"),
                     }
                 })?;
-                let z = ray_inputs.i((.., .., .., .., 2..3)).map_err(|source| {
-                    Lux3dError::CanonicalWeightsValidation {
+                let z = ray_inputs
+                    .i((.., .., .., .., 2..3))
+                    .and_then(|tensor| tensor.affine(1.0, 1e-6))
+                    .map_err(|source| Lux3dError::CanonicalWeightsValidation {
                         message: format!("Pi3X ray z slice failed: {source}"),
-                    }
-                })?;
+                    })?;
+                // The reference divides `xy` by `z + 1e-6`, so a
+                // normalized ray that underflowed to all zeros feeds a finite
+                // zero instead of 0/0 = NaN into the next VO chunk.
                 ray_inputs = xy.broadcast_div(&z).map_err(|source| {
                     Lux3dError::CanonicalWeightsValidation {
                         message: format!("Pi3X ray xy/z failed: {source}"),

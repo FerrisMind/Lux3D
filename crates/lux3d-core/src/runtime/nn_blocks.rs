@@ -52,6 +52,7 @@ enum LinearInner {
         weight: QMatMul,
         bias: Option<Tensor>,
         in_dim: usize,
+        out_dim: usize,
     },
 }
 
@@ -80,12 +81,29 @@ impl Linear {
     pub(crate) fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
         match &self.inner {
             LinearInner::Dense(l) => l.forward(xs),
-            LinearInner::Quant { weight, bias, .. } => {
+            LinearInner::Quant {
+                weight,
+                bias,
+                out_dim,
+                ..
+            } => {
                 // The quantized matmul kernels across cuda/vulkan/wgpu require a
                 // contiguous activation; chunked GeGLU halves and reshaped
                 // attention states arrive strided.
                 let xs = xs.contiguous()?;
-                let ys = weight.forward(&xs)?;
+                // QMatMul only accepts 2D/3D activations, while dense
+                // `candle_nn::Linear` broadcasts over any leading dims. Collapse
+                // `[..., in]` to `[rows, in]` and restore the leading dims.
+                let dims = xs.dims().to_vec();
+                let ys = if dims.len() > 3 {
+                    let rows = dims[..dims.len() - 1].iter().product::<usize>();
+                    let flat = xs.reshape((rows, dims[dims.len() - 1]))?;
+                    let mut out_dims = dims[..dims.len() - 1].to_vec();
+                    out_dims.push(*out_dim);
+                    weight.forward(&flat)?.reshape(out_dims)?
+                } else {
+                    weight.forward(&xs)?
+                };
                 match bias {
                     Some(bias) => ys.broadcast_add(bias),
                     None => Ok(ys),
@@ -162,6 +180,7 @@ fn quantized_linear(
             weight: QMatMul::from_qtensor(qt)?,
             bias,
             in_dim,
+            out_dim,
         },
     }))
 }
