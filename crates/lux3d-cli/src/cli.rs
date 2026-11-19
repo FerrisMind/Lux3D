@@ -4323,13 +4323,25 @@ mod tests {
     use super::{inspect_model, normalize_weights, run_model, Cli, Command, RunArgs};
     use lux3d_core::{
         test_support::{
-            canonical_package_dir, resolve_raw_model_dir_for_tests, runtime_root, GpuTestLock,
+            canonical_package_dir, resolve_raw_model_dir_for_tests, runtime_root, workspace_root,
+            GpuTestLock,
         },
         ModelFamily,
     };
 
     fn repo_root() -> PathBuf {
         runtime_root()
+    }
+
+    /// Standalone GGUF package used by the local smoke tests. The canonical
+    /// Pi3/Pi3X/TripoSR packages are optional on a development machine, while
+    /// `3d/standalone/<family>-q8_0` is the published local form.
+    fn smoke_model_dir(name: &str) -> PathBuf {
+        repo_root().join("3d").join("standalone").join(name)
+    }
+
+    fn test_asset(relative: &str) -> PathBuf {
+        workspace_root().join("test-assets").join(relative)
     }
 
     fn temp_output_dir(family: ModelFamily) -> PathBuf {
@@ -7920,12 +7932,7 @@ mod tests {
         let args = RunArgs {
             family: super::Family::Pi3,
             device: super::DeviceBackend::Cuda,
-            source: vec![repo_root()
-                .join("tp")
-                .join("3d")
-                .join("Pi3")
-                .join("examples")
-                .join("house")],
+            source: vec![test_asset("pi3-frames")],
             surface_input: None,
             mode: super::TriposgMode::Image,
             prompt: None,
@@ -7953,7 +7960,7 @@ mod tests {
             dtype: None,
             bounds: None,
             timesteps: None,
-            model_path: Some(canonical_package_dir(ModelFamily::Pi3)),
+            model_path: Some(smoke_model_dir("pi3-q8_0")),
             rmbg_model_path: None,
             cache_dir: None,
             output: output.clone(),
@@ -8009,12 +8016,7 @@ mod tests {
         let args = RunArgs {
             family: super::Family::Triposr,
             device: super::DeviceBackend::Cuda,
-            source: vec![repo_root()
-                .join("tp")
-                .join("3d")
-                .join("TripoSR")
-                .join("examples")
-                .join("horse.png")],
+            source: vec![test_asset("mesh-input.png")],
             surface_input: None,
             mode: super::TriposgMode::Image,
             prompt: None,
@@ -8027,7 +8029,7 @@ mod tests {
             overlap: None,
             conf_threshold: None,
             inject_condition: Vec::new(),
-            mc_resolution: Some(256),
+            mc_resolution: Some(128),
             mc_threshold: Some(25.0),
             steps: None,
             guidance_scale: None,
@@ -8042,7 +8044,7 @@ mod tests {
             dtype: None,
             bounds: None,
             timesteps: None,
-            model_path: Some(canonical_package_dir(ModelFamily::TripoSr)),
+            model_path: Some(smoke_model_dir("triposr-q8_0")),
             rmbg_model_path: None,
             cache_dir: None,
             output: output.clone(),
@@ -8100,12 +8102,7 @@ mod tests {
         let args = RunArgs {
             family: super::Family::Triposr,
             device: super::DeviceBackend::Cuda,
-            source: vec![repo_root()
-                .join("tp")
-                .join("3d")
-                .join("TripoSR")
-                .join("examples")
-                .join("horse.png")],
+            source: vec![test_asset("mesh-input.png")],
             surface_input: None,
             mode: super::TriposgMode::Image,
             prompt: None,
@@ -8187,28 +8184,14 @@ mod tests {
         let args = RunArgs {
             family: super::Family::Pi3x,
             device: super::DeviceBackend::Cuda,
-            source: vec![repo_root()
-                .join("tp")
-                .join("3d")
-                .join("Pi3")
-                .join("examples")
-                .join("room")
-                .join("rgb")],
+            source: vec![test_asset("pi3-frames")],
             surface_input: None,
             mode: super::TriposgMode::Image,
             prompt: None,
             scribble_conf: None,
             prompt_conf: None,
-            interval: Some(2),
-            conditions: Some(
-                repo_root()
-                    .join("tp")
-                    .join("3d")
-                    .join("Pi3")
-                    .join("examples")
-                    .join("room")
-                    .join("condition.npz"),
-            ),
+            interval: None,
+            conditions: None,
             vo: false,
             chunk_size: None,
             overlap: None,
@@ -8229,7 +8212,7 @@ mod tests {
             dtype: None,
             bounds: None,
             timesteps: None,
-            model_path: Some(canonical_package_dir(ModelFamily::Pi3x)),
+            model_path: Some(smoke_model_dir("pi3x-q8_0")),
             rmbg_model_path: None,
             cache_dir: None,
             output: output.clone(),
@@ -8285,12 +8268,7 @@ mod tests {
         let args = RunArgs {
             family: super::Family::Pi3x,
             device: super::DeviceBackend::Cuda,
-            source: vec![repo_root()
-                .join("tp")
-                .join("3d")
-                .join("Pi3")
-                .join("examples")
-                .join("skating.mp4")],
+            source: vec![test_asset("pi3-frames")],
             surface_input: None,
             mode: super::TriposgMode::Image,
             prompt: None,
@@ -8299,8 +8277,8 @@ mod tests {
             interval: None,
             conditions: None,
             vo: true,
-            chunk_size: Some(8),
-            overlap: Some(4),
+            chunk_size: Some(2),
+            overlap: Some(1),
             conf_threshold: Some(0.05),
             inject_condition: vec![
                 super::InjectCondition::Pose,
@@ -8322,7 +8300,7 @@ mod tests {
             dtype: None,
             bounds: None,
             timesteps: None,
-            model_path: Some(canonical_package_dir(ModelFamily::Pi3x)),
+            model_path: Some(smoke_model_dir("pi3x-q8_0")),
             rmbg_model_path: None,
             cache_dir: None,
             output: output.clone(),
