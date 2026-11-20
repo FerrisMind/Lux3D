@@ -770,8 +770,17 @@ fn proj_from_in_proj(
     row: usize,
     embed_dim: usize,
 ) -> CandleResult<DenseLinear> {
-    let w = weight.narrow(0, row * embed_dim, embed_dim)?.contiguous()?;
-    let b = bias.narrow(0, row * embed_dim, embed_dim)?.contiguous()?;
+    // `narrow` yields a contiguous 1D *view* with the original (3E) storage
+    // count for row 0. Candle's Vulkan fused Linear checks the bias view shape
+    // but the kernel checks the underlying storage count, so materialize an
+    // exactly-sized buffer for every row. CUDA/WGPU take the unfused path and
+    // are unaffected.
+    let w = weight
+        .narrow(0, row * embed_dim, embed_dim)?
+        .force_contiguous()?;
+    let b = bias
+        .narrow(0, row * embed_dim, embed_dim)?
+        .force_contiguous()?;
     Ok(DenseLinear::new(w, Some(b)))
 }
 
