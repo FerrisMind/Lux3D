@@ -132,10 +132,13 @@ limitation of the current narrow-band BVH path, not a missing scenario.
 
 `--texture-mesh` needs the shape encoder
 (`shape_enc_next_dc_f16c32_fp16.safetensors`). Standalone TRELLIS.2 GGUF
-packages now embed it as `shape_enc.*` tensors via
+packages now embed it as 284 `shape_enc.*` tensors via
 `weights quantize --merge-source ... --merge-prefix shape_enc`, so the suite
-textures the cube mesh from the same `trellis2-q4_k` standalone package as the
-image-to-3D tests (passed on CUDA, Vulkan and WGPU). The raw
+textures the cube mesh from the same standalone package as the image-to-3D
+tests (passed on CUDA, Vulkan and WGPU with `trellis2-q4_k`; the regenerated
+`q8_0` package was validated separately on CUDA in 568.11 s, producing the
+same 122 KiB textured GLB with two PBR textures). All five variants (`f16`,
+`q8_0`, `q6_k`, `q5_k`, `q4_k`) now carry the encoder. The raw
 `candle-3d/models/TRELLIS.2-4B` tree and the
 `external/shape_enc/model.safetensors` sidecar layout remain supported.
 

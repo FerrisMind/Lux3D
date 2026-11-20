@@ -316,11 +316,11 @@ TripoSR 1 изображение при `--mc-resolution 256`):
 | TripoSR | q5_k | 0.27 GiB | 235 |
 | TripoSR | q4_k | 0.23 GiB | 235 |
 | TRELLIS.2-4B | canonical (смесь BF16/F16/F32) | 15.07 GiB | — |
-| TRELLIS.2-4B | f16 | 14.50 GiB | все тензоры |
-| TRELLIS.2-4B | q8_0 | 8.87 GiB | 1074 линейных слоёв DiT |
-| TRELLIS.2-4B | q6_k | 7.41 GiB | 1070 |
-| TRELLIS.2-4B | q5_k | 6.61 GiB | 1070 |
-| TRELLIS.2-4B | q4_k | 5.86 GiB | 1070 |
+| TRELLIS.2-4B | f16 | 15.16 GiB | все тензоры + 284 shape_enc |
+| TRELLIS.2-4B | q8_0 | 9.53 GiB | 1074 линейных слоёв DiT + 284 shape_enc |
+| TRELLIS.2-4B | q6_k | 8.07 GiB | 1070 + 284 shape_enc |
+| TRELLIS.2-4B | q5_k | 7.27 GiB | 1070 + 284 shape_enc |
+| TRELLIS.2-4B | q4_k | 6.52 GiB | 1070 + 284 shape_enc |
 | TripoSG-scribble | сырой чекпойнт F16 | 4.38 GiB | — |
 | TripoSG-scribble | canonical F16 | 4.38 GiB | — |
 | TripoSG-scribble | q8_0 standalone | 2.92 GiB | 308 матриц |
