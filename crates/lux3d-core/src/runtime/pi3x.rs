@@ -858,7 +858,27 @@ impl Pi3xPipeline {
                         prev_local_depth_overlap.as_ref(),
                         prev_local_conf_overlap.as_ref(),
                     ) {
-                        let prev_depths = prev_depth.clone();
+                        // The overlap slices are `narrow` views whose storage
+                        // offset is generally not aligned to WGPU's minimum
+                        // storage-buffer binding alignment (32 bytes). WGPU
+                        // custom kernels bind the underlying buffer directly
+                        // and reject such views, while CUDA/Vulkan accept the
+                        // byte offset. Materialize the overlap (one or a few
+                        // frames) once before `where_cond`.
+                        let prev_depths = prev_depth.force_contiguous().map_err(|source| {
+                            Lux3dError::CanonicalWeightsValidation {
+                                message: format!(
+                                    "Pi3X VO prior depth materialization failed: {source}"
+                                ),
+                            }
+                        })?;
+                        let prev_conf = prev_conf.force_contiguous().map_err(|source| {
+                            Lux3dError::CanonicalWeightsValidation {
+                                message: format!(
+                                    "Pi3X VO prior confidence materialization failed: {source}"
+                                ),
+                            }
+                        })?;
                         let valid_prev = prev_conf.ge(conf_threshold).map_err(|source| {
                             Lux3dError::CanonicalWeightsValidation {
                                 message: format!(
