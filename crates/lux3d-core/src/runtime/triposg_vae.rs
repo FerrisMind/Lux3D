@@ -38,6 +38,17 @@ use candle_nn::{LayerNorm, Module, layer_norm};
 
 use super::attention_math::exact_query_chunked_sdpa;
 
+/// Stage tracer for backend bring-up (`LUX3D_WGPU_DEBUG_STAGES=1`).
+fn debug_stage(label: &str, xs: &Tensor) {
+    if std::env::var_os("LUX3D_WGPU_DEBUG_STAGES").is_none() {
+        return;
+    }
+    eprintln!("[vae-stage] {label}");
+    if let Err(err) = xs.device().synchronize() {
+        eprintln!("[vae-stage] {label} sync failed: {err}");
+    }
+}
+
 /// Self-attention query chunk (`LUX3D_TRIPOSG_ATTN_CHUNK`, default 1024) —
 /// the same knob the DiT uses.
 fn attn_chunk_size() -> usize {
@@ -199,6 +210,12 @@ pub struct TripoSgVaeDecoder {
 }
 
 impl TripoSgVaeDecoder {
+    /// Storage dtype of the decoder weights. `kv_cache` normalizes incoming
+    /// latents to this dtype, so callers may pass pipeline-dtype tensors.
+    pub fn dtype(&self) -> DType {
+        self.post_quant.dtype()
+    }
+
     /// Load from a VarBuilder rooted at the canonical `vae.` prefix (i.e.
     /// pass `vb.pp("vae")` from the canonical weight set). Only
     /// `post_quant.*` and `decoder.*` keys are touched.
@@ -246,11 +263,25 @@ impl TripoSgVaeDecoder {
                 self.cfg.latent_channels
             );
         }
-        let mut hidden = self.post_quant.forward(latents)?;
-        for block in &self.self_blocks {
+        // The decoder may be loaded in a different dtype than the pipeline
+        // (WGPU keeps the VAE in F32 while the memory-heavy DiT runs F16).
+        if std::env::var_os("LUX3D_WGPU_DEBUG_STAGES").is_some() {
+            eprintln!(
+                "[vae-stage] kv dtype vae={:?} latents={:?} dims={:?}",
+                self.dtype(),
+                latents.dtype(),
+                latents.dims()
+            );
+        }
+        let latents = latents.to_dtype(self.dtype())?;
+        debug_stage("kv-latents-cast", &latents);
+        let mut hidden = self.post_quant.forward(&latents)?;
+        debug_stage("kv-post-quant", &hidden);
+        for (index, block) in self.self_blocks.iter().enumerate() {
             let attn_out = block
                 .attn1
                 .forward(&block.norm1.forward(&hidden)?, self.attn_chunk)?;
+            debug_stage("kv-self-attn", &attn_out);
             hidden = (hidden + attn_out)?;
             let ff = block.ff_out.forward(
                 &block
@@ -258,7 +289,11 @@ impl TripoSgVaeDecoder {
                     .forward(&block.norm3.forward(&hidden)?)?
                     .gelu_erf()?,
             )?;
+            debug_stage("kv-self-ff", &ff);
             hidden = (hidden + ff)?;
+            if std::env::var_os("LUX3D_WGPU_DEBUG_STAGES").is_some() {
+                eprintln!("[vae-stage] kv-block {index}/{}", self.self_blocks.len());
+            }
         }
         Ok(hidden)
     }
@@ -302,10 +337,12 @@ impl TripoSgVaeDecoder {
         // (numerically identical to the reference, which re-projects per
         // chunk from the same cache).
         let (k_heads, v_heads) = self.cross_block.attn2.prepare_kv(kv_cache)?;
+        debug_stage("decode-kv", &k_heads);
 
         // The query points arrive as F32 host-side coordinates; the decoder
         // may be loaded in F16. Keep the whole query path in the cache dtype.
         let points = points.to_dtype(kv_cache.dtype())?;
+        debug_stage("decode-points-cast", &points);
         let num_points = points.dim(0)?;
         let step = chunk.max(1);
         let mut chunks = Vec::new();
@@ -313,7 +350,9 @@ impl TripoSgVaeDecoder {
         while start < num_points {
             let len = (num_points - start).min(step);
             let query_points = points.narrow(0, start, len)?.contiguous()?;
+            debug_stage("decode-narrow", &query_points);
             let embedded = self.embed_points(&query_points)?; // [len, 51]
+            debug_stage("decode-embed", &embedded);
 
             // Block 16 (cross-attention only): x += attn2(norm2(x), kv);
             // x += ff(norm3(x)). The reference treats the query chunk as a
@@ -324,12 +363,14 @@ impl TripoSgVaeDecoder {
                     .proj_query
                     .forward(&embedded)?
                     .reshape((1, len, self.cfg.dim))?;
+            debug_stage("decode-proj-query", &hidden);
             let attn_out = self.cross_block.attn2.forward(
                 &self.cross_block.norm2.forward(&hidden)?,
                 &k_heads,
                 &v_heads,
                 self.attn_chunk,
             )?;
+            debug_stage("decode-attn2", &attn_out);
             hidden = (hidden + attn_out)?;
             let ff = self.cross_block.ff_out.forward(
                 &self
@@ -338,15 +379,20 @@ impl TripoSgVaeDecoder {
                     .forward(&self.cross_block.norm3.forward(&hidden)?)?
                     .gelu_erf()?,
             )?;
+            debug_stage("decode-ff", &ff);
             hidden = (hidden + ff)?;
 
             // norm_out -> proj_out ([len, 1]) -> NEGATE -> [len].
             let logits = self.proj_out.forward(&self.norm_out.forward(&hidden)?)?;
+            debug_stage("decode-logits", &logits);
             chunks.push(logits.flatten_all()?.affine(-1.0, 0.0)?);
+            debug_stage("decode-chunk-negate", chunks.last().unwrap());
             start += len;
         }
         // SDF values feed host-side marching cubes; keep the public output F32.
-        Tensor::cat(&chunks, 0)?.to_dtype(DType::F32)
+        let out = Tensor::cat(&chunks, 0)?.to_dtype(DType::F32)?;
+        debug_stage("decode-cat", &out);
+        Ok(out)
     }
 
     /// One-shot decode: `kv_cache(latents)` then `decode_points`.
@@ -509,8 +555,13 @@ impl TripoSgVaeEncoder {
     /// point: callers that already have sampling indices can reproduce the
     /// reference selection exactly.
     pub fn encode_sampled(&self, x: &Tensor, sampled_x: &Tensor) -> CandleResult<Tensor> {
-        let q = self.embed_features(sampled_x)?;
-        let kv = self.embed_features(x)?;
+        // The encoder may be loaded in a different dtype than the pipeline
+        // (WGPU keeps the VAE in F32 while the DiT runs F16).
+        let dtype = self.proj_in.dtype();
+        let x = x.to_dtype(dtype)?;
+        let sampled_x = sampled_x.to_dtype(dtype)?;
+        let q = self.embed_features(&sampled_x)?;
+        let kv = self.embed_features(&x)?;
         self.encode_embedded(&q, &kv)
     }
 
@@ -556,7 +607,8 @@ impl TripoSgVaeEncoder {
                 f
             });
         }
-        let freqs = Tensor::from_vec(freqs, (1, 1, num_freqs), positions.device())?;
+        let freqs = Tensor::from_vec(freqs, (1, 1, num_freqs), positions.device())?
+            .to_dtype(positions.dtype())?;
         let products = positions
             .reshape((rows, cols, 1))?
             .broadcast_mul(&freqs)?
@@ -974,9 +1026,13 @@ impl VaeSelfAttention {
     fn forward(&self, xs: &Tensor, attn_chunk: usize) -> CandleResult<Tensor> {
         let (batch, seq, _) = xs.dims3()?;
         let scale = (1.0 / (self.head_dim as f64).sqrt()) as f32;
+        debug_stage("self-norm1-in", xs);
         let q = self.to_q.forward(xs)?;
+        debug_stage("self-q", &q);
         let k = self.to_k.forward(xs)?;
+        debug_stage("self-k", &k);
         let v = self.to_v.forward(xs)?;
+        debug_stage("self-v", &v);
         // TripoSGAttnProcessor2_0 re-split: head h takes columns
         // [3*head_dim*h : 3*head_dim*h + head_dim) of each of q/k/v.
         let qkv = Tensor::cat(&[&q, &k, &v], D::Minus1)?.reshape((
@@ -985,15 +1041,23 @@ impl VaeSelfAttention {
             self.heads,
             3 * self.head_dim,
         ))?;
+        debug_stage("self-qkv", &qkv);
         let parts = qkv.chunk(3, D::Minus1)?;
         let q = parts[0].transpose(1, 2)?.contiguous()?;
+        debug_stage("self-q-heads", &q);
         let k = parts[1].transpose(1, 2)?.contiguous()?;
+        debug_stage("self-k-heads", &k);
         let v = parts[2].transpose(1, 2)?.contiguous()?;
+        debug_stage("self-v-heads", &v);
         let out = exact_query_chunked_sdpa(&q, &k, &v, scale, attn_chunk)?;
+        debug_stage("self-sdpa", &out);
         let out = out
             .transpose(1, 2)?
             .reshape((batch, seq, self.heads * self.head_dim))?;
-        self.to_out.forward(&out)
+        debug_stage("self-out-reshape", &out);
+        let out = self.to_out.forward(&out)?;
+        debug_stage("self-out", &out);
+        Ok(out)
     }
 }
 

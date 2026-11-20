@@ -128,13 +128,42 @@ fn push_value(args: &mut Vec<OsString>, flag: &str, value: impl AsRef<OsStr>) {
 }
 
 fn run_cli(name: &str, args: Vec<OsString>) -> std::process::Output {
-    run_cli_with_env(name, args, &[])
+    run_cli_with_os_env(name, args, &[])
 }
 
 fn run_cli_with_env(
     name: &str,
     args: Vec<OsString>,
     envs: &[(&str, &Path)],
+) -> std::process::Output {
+    let envs = envs
+        .iter()
+        .map(|(key, value)| (*key, value.as_os_str()))
+        .collect::<Vec<_>>();
+    run_cli_with_os_env(name, args, &envs)
+}
+
+/// TripoSG q8 weights hold ~2 GiB packed. On WGPU the default dense path
+/// expands them to ~8 GiB of F32 and OOMs on a 12 GiB card (the whole
+/// DiT/encoder bundle stays resident, unlike TRELLIS.2's sequential stages),
+/// while dense F16 (`=f16`) corrupts batched DiT denoise: candle's WGPU F16
+/// GEMM mishandles batch > 1, producing one noisy and one empty mesh for a
+/// two-shape batch. Keep packed Q8 QMatMul (`=0`), which is memory-safe and
+/// batch-correct. The VAE decode still runs dense F32 (the TripoSG VAE loader
+/// forces F32 on WGPU; this also avoids the 1 MiB hot-ring alias at 512 latent
+/// tokens).
+fn run_cli_for_triposg(name: &str, args: Vec<OsString>) -> std::process::Output {
+    let mut envs: Vec<(&str, &OsStr)> = Vec::new();
+    if device() == "wgpu" {
+        envs.push(("LUX3D_WGPU_DEQUANT_WEIGHTS", OsStr::new("0")));
+    }
+    run_cli_with_os_env(name, args, &envs)
+}
+
+fn run_cli_with_os_env(
+    name: &str,
+    args: Vec<OsString>,
+    envs: &[(&str, &OsStr)],
 ) -> std::process::Output {
     let rendered = args
         .iter()
@@ -461,7 +490,7 @@ fn triposg_image_to_mesh() {
     push_value(&mut args, "--steps", "4");
     push_value(&mut args, "--num-tokens", "1024");
     push_value(&mut args, "--seed", "42");
-    run_cli(NAME, args);
+    run_cli_for_triposg(NAME, args);
     assert_glb_mesh(&output);
 }
 
@@ -499,7 +528,7 @@ fn triposg_batch_to_meshes() {
     push_value(&mut args, "--flash-decoder", "false");
     push_value(&mut args, "--dense-octree-depth", "8");
     push_value(&mut args, "--hierarchical-octree-depth", "9");
-    run_cli(NAME, args);
+    run_cli_for_triposg(NAME, args);
     for index in 0..4 {
         assert_glb_mesh(&out_dir.join(format!("batch_{index}.glb")));
     }
@@ -526,7 +555,7 @@ fn triposg_surface_to_mesh() {
     push_value(&mut args, "--flash-decoder", "false");
     push_value(&mut args, "--dense-octree-depth", "7");
     push_value(&mut args, "--hierarchical-octree-depth", "8");
-    run_cli(NAME, args);
+    run_cli_for_triposg(NAME, args);
     assert_glb_mesh(&output);
 }
 
@@ -562,7 +591,7 @@ fn triposg_scribble_to_mesh() {
     push_value(&mut args, "--prompt", "a small test object");
     push_value(&mut args, "--steps", "4");
     push_value(&mut args, "--seed", "42");
-    run_cli(NAME, args);
+    run_cli_for_triposg(NAME, args);
     assert_glb_mesh(&output);
 }
 
@@ -787,12 +816,13 @@ fn rmbg2_model() -> PathBuf {
         })
 }
 
-/// The standalone GGUF package has no `shape_enc` stage; the mesh-texturing
-/// pipeline needs the raw TRELLIS.2 checkpoint tree.
+/// The standalone GGUF package embeds the `shape_enc` stage, so mesh
+/// texturing uses the same package as image-to-3D. The override still accepts
+/// the raw `TRELLIS.2-4B` checkpoint tree for comparison runs.
 fn trellis2_texture_model() -> PathBuf {
     env::var_os("LUX3D_E2E_TRELLIS2_TEXTURE_MODEL")
         .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_root().join("models").join("TRELLIS.2-4B"))
+        .unwrap_or_else(trellis2_model)
 }
 
 fn trellis2_base(source: &Path, model: &Path, output: &Path, rmbg2: &Path) -> Vec<OsString> {

@@ -1,4 +1,4 @@
-use candle_core::{D, DType, IndexOp, Result as CandleResult, Tensor};
+use candle_core::{D, DType, Device, IndexOp, Result as CandleResult, Tensor};
 use candle_nn::Module;
 
 #[derive(Debug, Clone, Copy)]
@@ -186,14 +186,23 @@ pub(crate) fn position_getter(
 /// single-shot scores tensor (heads × 8244² × f32) is ~4 GiB; allocating it
 /// fragments the CUDA memory pool (+4 GiB reserved step) and OOMs wgpu on
 /// 12 GiB cards. Override with LUX3D_MAX_SDPA_SCORES_BYTES.
-fn max_sdpa_scores_bytes() -> usize {
-    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *BUDGET.get_or_init(|| {
+///
+/// WGPU defaults to a smaller budget than CUDA/Vulkan: the dense dequantized
+/// weight path (`LUX3D_WGPU_DEQUANT_WEIGHTS=f16`) already holds several GiB of
+/// weights, and the TripoSG surface encoder's cross-attention against a
+/// 204800-point cloud otherwise asks for a ~760 MiB scores chunk plus softmax
+/// temporaries, which OOMs a 12 GiB card during VAE encode.
+fn max_sdpa_scores_bytes(device: &Device) -> usize {
+    static BUDGET: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    match *BUDGET.get_or_init(|| {
         std::env::var("LUX3D_MAX_SDPA_SCORES_BYTES")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(768 * 1024 * 1024)
-    })
+    }) {
+        Some(bytes) => bytes,
+        None if device.is_wgpu() => 128 * 1024 * 1024,
+        None => 768 * 1024 * 1024,
+    }
 }
 
 pub(crate) fn exact_query_chunked_sdpa(
@@ -218,7 +227,7 @@ pub(crate) fn exact_query_chunked_sdpa(
     let kv_len = k_t.dim(D::Minus1)?;
     let scores_elem_bytes = if q.dtype() == DType::F32 { 4 } else { 2 };
     let scores_bytes_per_row = q.dim(0)? * q.dim(1)? * kv_len * scores_elem_bytes;
-    let budget_chunk = (max_sdpa_scores_bytes() / scores_bytes_per_row.max(1)).max(1);
+    let budget_chunk = (max_sdpa_scores_bytes(q.device()) / scores_bytes_per_row.max(1)).max(1);
     let effective_chunk = chunk_size.min(budget_chunk).min(q_seq).max(1);
     if effective_chunk >= q_seq {
         let scores = q.matmul(&k_t)?;

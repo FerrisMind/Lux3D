@@ -42,12 +42,25 @@
 
 use std::sync::OnceLock;
 
-use super::nn_blocks::{linear_dense as linear, linear_no_bias_dense as linear_no_bias, Linear};
+use super::nn_blocks::{Linear, linear_dense as linear, linear_no_bias_dense as linear_no_bias};
 use crate::weights::VarBuilder;
-use candle_core::{DType, Device, Result as CandleResult, Tensor, D};
-use candle_nn::{layer_norm, LayerNorm, Module};
+use candle_core::{D, DType, Device, Result as CandleResult, Tensor};
+use candle_nn::{LayerNorm, Module, layer_norm};
 
 use super::attention_math::{exact_query_chunked_sdpa, exact_sdpa_heads};
+
+/// Stage tracer for backend bring-up: `LUX3D_WGPU_DEBUG_STAGES=1` prints the
+/// last completed block stage and synchronizes, so a deferred wgpu validation
+/// error is attributed to the op that produced it.
+fn debug_stage(label: &str, xs: &Tensor) {
+    if std::env::var_os("LUX3D_WGPU_DEBUG_STAGES").is_none() {
+        return;
+    }
+    eprintln!("[dit-stage] {label}");
+    if let Err(err) = xs.device().synchronize() {
+        eprintln!("[dit-stage] {label} sync failed: {err}");
+    }
+}
 
 /// Self-attention query chunk (`LUX3D_TRIPOSG_ATTN_CHUNK`, default 1024).
 fn attn_chunk_size() -> usize {
@@ -379,9 +392,13 @@ impl TripoSgDiT {
 
         // Final: LayerNorm over ALL tokens, slice the LAST num_tokens, proj_out.
         let normalized = self.norm_out.forward(&hidden)?;
+        debug_stage("norm-out", &normalized);
         let seq = normalized.dim(1)?;
         let tail = normalized.narrow(1, seq - num_tokens, num_tokens)?;
-        self.proj_out.forward(&tail)
+        debug_stage("tail-slice", &tail);
+        let out = self.proj_out.forward(&tail)?;
+        debug_stage("proj-out", &out);
+        Ok(out)
     }
 
     /// diffusers `Timesteps(width, flip_sin_to_cos=False, shift=0)` ->
@@ -500,6 +517,7 @@ impl DiTBlock {
             .attn1
             .forward(&self.norm1.forward(&hidden)?, None, attn_chunk)?;
         hidden = (hidden + attn_out)?;
+        debug_stage("self-attn", &hidden);
 
         // Cross-attention on the image embeds, reference scale 1.0.
         let cross_residual = hidden.clone();
@@ -514,6 +532,7 @@ impl DiTBlock {
             cross_out.affine(f64::from(cross_attention_scale), 0.0)?
         };
         hidden = (&cross_residual + cross_out)?;
+        debug_stage("cross-attn-1", &hidden);
         if let (Some(norm2_2), Some(attn2_2), Some(cond2)) =
             (self.norm2_2.as_ref(), self.attn2_2.as_ref(), cond2)
         {
@@ -528,6 +547,7 @@ impl DiTBlock {
                 cross_out_2.affine(f64::from(cross_attention_2_scale), 0.0)?
             };
             hidden = (hidden + cross_out_2)?;
+            debug_stage("cross-attn-2", &hidden);
         }
 
         // FFN: exact GELU between the two projections.
@@ -537,7 +557,9 @@ impl DiTBlock {
                 .forward(&self.norm3.forward(&hidden)?)?
                 .gelu_erf()?,
         )?;
-        hidden + ff
+        let out = (hidden + ff)?;
+        debug_stage("ffn", &out);
+        Ok(out)
     }
 }
 
@@ -600,6 +622,7 @@ impl DiTAttention {
                     self.heads,
                     3 * self.head_dim,
                 ))?;
+                debug_stage("self-qkv-cat", &qkv);
                 let parts = qkv.chunk(3, D::Minus1)?;
                 let q = parts[0]
                     .transpose(1, 2)?
@@ -610,7 +633,9 @@ impl DiTAttention {
                     .contiguous()?
                     .rms_norm_heads(&self.norm_k_weight)?;
                 let v = parts[2].transpose(1, 2)?.contiguous()?;
+                debug_stage("self-qkv-split", &v);
                 let out = exact_query_chunked_sdpa(&q, &k, &v, scale, attn_chunk)?;
+                debug_stage("self-sdpa", &out);
                 let out = out
                     .transpose(1, 2)?
                     .reshape((batch, seq, self.heads * self.head_dim))?;
@@ -648,13 +673,16 @@ impl DiTAttention {
                     self.heads,
                     2 * self.head_dim,
                 ))?;
+                debug_stage("cross-kv-cat", &kv);
                 let kv_parts = kv.chunk(2, D::Minus1)?;
                 let k = kv_parts[0]
                     .transpose(1, 2)?
                     .contiguous()?
                     .rms_norm_heads(&self.norm_k_weight)?;
                 let v = kv_parts[1].transpose(1, 2)?.contiguous()?;
+                debug_stage("cross-kv-split", &v);
                 let out = exact_sdpa_heads(&q, &k, &v, scale)?;
+                debug_stage("cross-sdpa", &out);
                 let out = out
                     .transpose(1, 2)?
                     .reshape((batch, seq, self.heads * self.head_dim))?;
@@ -915,9 +943,11 @@ pub fn denoise_dual_with_schedule(
         } else {
             velocity
         };
+        debug_stage("velocity", &velocity);
         latents = scheduler
             .step(index, &velocity, &latents)?
             .to_dtype(dtype)?;
+        debug_stage("euler-step", &latents);
     }
     latents.to_dtype(DType::F32)
 }
@@ -1277,13 +1307,14 @@ mod dual_cross_attention_tests {
             .forward_with_conditioning(&latents, 500.0, &text, Some(&image), 0.4, 1.0)
             .expect("dual forward");
         assert_eq!(dual.dims(), [1, 5, cfg.in_channels]);
-        assert!(dual
-            .flatten_all()
-            .expect("flatten")
-            .to_vec1::<f32>()
-            .expect("vec")
-            .iter()
-            .all(|value| value.is_finite()));
+        assert!(
+            dual.flatten_all()
+                .expect("flatten")
+                .to_vec1::<f32>()
+                .expect("vec")
+                .iter()
+                .all(|value| value.is_finite())
+        );
 
         let missing_second = dit.forward(&latents, 500.0, &text).unwrap_err();
         assert!(

@@ -131,9 +131,8 @@ pub use trellis2::{
     TRELLIS2_TEX_SLAT_STD, TRELLIS2_VOXEL_MARGIN, Trellis2CascadeShape,
     Trellis2MeshPostprocessOptions, Trellis2Pipeline, Trellis2PipelineConfig, Trellis2Rng,
     Trellis2RunOptions, Trellis2SamplerOverrides, Trellis2Stages, Trellis2TextureExportOptions,
-    Trellis2TexturedMesh, build_trellis2_textured_mesh,
-    build_trellis2_textured_mesh_snapped, quantize_hr_coords, quantize_hr_coords_with_stop,
-    resolve_stage_params,
+    Trellis2TexturedMesh, build_trellis2_textured_mesh, build_trellis2_textured_mesh_snapped,
+    quantize_hr_coords, quantize_hr_coords_with_stop, resolve_stage_params,
 };
 pub use trellis2_blocks::{
     Trellis2AdaLn, Trellis2CrossAttention, Trellis2DenseBlock, Trellis2FeedForward,
@@ -176,13 +175,12 @@ pub use trellis2_vae::{
 };
 pub(crate) use triposg::TRIPOSG_LATENT_CHANNELS;
 pub use triposg::{
-    TRIPOSG_SCRIBBLE_CONFIDENCE, TRIPOSG_SCRIBBLE_DEFAULT_DIR,
-    TRIPOSG_SCRIBBLE_DENSE_OCTREE_DEPTH, TRIPOSG_SCRIBBLE_HIERARCHICAL_OCTREE_DEPTH,
-    TRIPOSG_SCRIBBLE_MODEL_DIR_ENV, TRIPOSG_SCRIBBLE_NUM_TOKENS,
-    TRIPOSG_SCRIBBLE_PROMPT_CONFIDENCE, TRIPOSG_SCRIBBLE_STEPS, TripoSgInferenceOutput,
-    TripoSgMeshBuffers, TripoSgPipeline, TripoSgPreparedInputs, TripoSgRunOptions,
-    TripoSgScribbleInferenceOutput, TripoSgScribblePipeline, TripoSgScribbleRunOptions,
-    repeat_interleave_batch, resolve_triposg_scribble_model_dir,
+    TRIPOSG_SCRIBBLE_CONFIDENCE, TRIPOSG_SCRIBBLE_DEFAULT_DIR, TRIPOSG_SCRIBBLE_DENSE_OCTREE_DEPTH,
+    TRIPOSG_SCRIBBLE_HIERARCHICAL_OCTREE_DEPTH, TRIPOSG_SCRIBBLE_MODEL_DIR_ENV,
+    TRIPOSG_SCRIBBLE_NUM_TOKENS, TRIPOSG_SCRIBBLE_PROMPT_CONFIDENCE, TRIPOSG_SCRIBBLE_STEPS,
+    TripoSgInferenceOutput, TripoSgMeshBuffers, TripoSgPipeline, TripoSgPreparedInputs,
+    TripoSgRunOptions, TripoSgScribbleInferenceOutput, TripoSgScribblePipeline,
+    TripoSgScribbleRunOptions, repeat_interleave_batch, resolve_triposg_scribble_model_dir,
     resolve_triposg_scribble_model_source,
 };
 pub use triposg_dino::TripoSgDinoEncoder;
@@ -207,7 +205,7 @@ pub use vggt::{
     VggtRunOptions, merge_vggt_inference_outputs,
 };
 pub use vggt_auto_query::{
-    VggtAutoQueryOptions, VggtAutoTrackResult, DEFAULT_MAX_QUERY_PTS, DEFAULT_QUERY_FRAME_NUM,
+    DEFAULT_MAX_QUERY_PTS, DEFAULT_QUERY_FRAME_NUM, VggtAutoQueryOptions, VggtAutoTrackResult,
 };
 pub use vggt_keypoints::{
     ALIKED_WEIGHTS_ENV, KEYPOINT_WEIGHTS_DIR, SUPERPOINT_WEIGHTS_ENV, VggtKeypointDetectors,
@@ -243,6 +241,16 @@ impl<T> Default for DeviceLocalCache<T> {
 }
 
 impl<T> DeviceLocalCache<T> {
+    /// Drop every cached bundle. Callers that need to free a whole-model
+    /// stage (for example before a decode path that only needs the VAE) must
+    /// also ensure no `Arc` clone is still alive.
+    pub(super) fn clear(&self) {
+        self.bundles
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clear();
+    }
+
     pub(super) fn get_or_try_init<E, F>(
         &self,
         device: &Device,

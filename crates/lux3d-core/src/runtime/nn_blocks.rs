@@ -4,6 +4,35 @@ use candle_nn::Module;
 
 use crate::weights::VarBuilder;
 
+thread_local! {
+    /// When set, [`quantized_linear`] dequantizes every weight to dense F32
+    /// even if the WGPU F16 override (`LUX3D_WGPU_DEQUANT_WEIGHTS=f16`) is
+    /// active. Used by the TripoSG VAE loader: its 512-token decoder produces
+    /// tensors of exactly 1 MiB, a size class the candle WGPU hot-ring recycles
+    /// while still bound as a copy source, which trips
+    /// `Source and destination cannot be the same buffer`. F32 moves those
+    /// tensors out of the 1 MiB class and also matches the reference decoder
+    /// precision. Scoped per thread and restored on unwind.
+    static FORCE_DENSE_F32: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with dense-F32 dequantization forced for [`Linear`] construction.
+pub(crate) fn with_force_dense_f32<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FORCE_DENSE_F32.with(|cell| cell.set(false));
+        }
+    }
+    FORCE_DENSE_F32.with(|cell| cell.set(true));
+    let _reset = Reset;
+    f()
+}
+
+fn force_dense_f32() -> bool {
+    FORCE_DENSE_F32.with(std::cell::Cell::get)
+}
+
 /// Fetch a tensor of the expected shape from a safetensors or GGUF backend.
 ///
 /// Safetensors packages store every tensor at its original rank. Candle's
@@ -48,6 +77,11 @@ pub(crate) struct Linear {
 #[derive(Debug, Clone)]
 enum LinearInner {
     Dense(candle_nn::Linear),
+    /// WGPU memory-saving dense path: packed GGUF weights are dequantized
+    /// once to F16 instead of F32, halving weight VRAM. Activations are cast
+    /// to F16 for the matmul and the result is cast back to the caller's
+    /// dtype, so the rest of the pipeline keeps its original precision.
+    DenseF16(candle_nn::Linear),
     Quant {
         weight: QMatMul,
         bias: Option<Tensor>,
@@ -59,14 +93,25 @@ enum LinearInner {
 impl Linear {
     pub(crate) fn in_dim(&self) -> usize {
         match &self.inner {
-            LinearInner::Dense(l) => l.weight().dim(1).unwrap_or(0),
+            LinearInner::Dense(l) | LinearInner::DenseF16(l) => l.weight().dim(1).unwrap_or(0),
             LinearInner::Quant { in_dim, .. } => *in_dim,
+        }
+    }
+
+    /// Storage dtype of the layer's parameters. Packed QMatMul layers report
+    /// F32 because their kernels consume and return F32 activations.
+    pub(crate) fn dtype(&self) -> DType {
+        match &self.inner {
+            LinearInner::Dense(l) | LinearInner::DenseF16(l) => l.weight().dtype(),
+            LinearInner::Quant { bias, .. } => {
+                bias.as_ref().map_or(DType::F32, |bias| bias.dtype())
+            }
         }
     }
 
     pub(crate) fn bias(&self) -> Option<&Tensor> {
         match &self.inner {
-            LinearInner::Dense(l) => l.bias(),
+            LinearInner::Dense(l) | LinearInner::DenseF16(l) => l.bias(),
             LinearInner::Quant { bias, .. } => bias.as_ref(),
         }
     }
@@ -74,13 +119,28 @@ impl Linear {
     fn dense_weight(&self) -> Option<&Tensor> {
         match &self.inner {
             LinearInner::Dense(l) => Some(l.weight()),
-            LinearInner::Quant { .. } => None,
+            LinearInner::DenseF16(_) | LinearInner::Quant { .. } => None,
         }
     }
 
     pub(crate) fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
         match &self.inner {
             LinearInner::Dense(l) => l.forward(xs),
+            LinearInner::DenseF16(l) => {
+                let out_dtype = xs.dtype();
+                let xs = xs.contiguous()?;
+                let xs = if out_dtype == DType::F16 {
+                    xs
+                } else {
+                    xs.to_dtype(DType::F16)?
+                };
+                let ys = l.forward(&xs)?;
+                if out_dtype == DType::F16 {
+                    Ok(ys)
+                } else {
+                    ys.to_dtype(out_dtype)
+                }
+            }
             LinearInner::Quant {
                 weight,
                 bias,
@@ -88,9 +148,17 @@ impl Linear {
                 ..
             } => {
                 // The quantized matmul kernels across cuda/vulkan/wgpu require a
-                // contiguous activation; chunked GeGLU halves and reshaped
-                // attention states arrive strided.
+                // contiguous F32 activation; chunked GeGLU halves and reshaped
+                // attention states arrive strided, and an `--dtype f16` pipeline
+                // feeds F16 states. Packed weights stay compressed: only the
+                // activations are widened, then the result is narrowed back.
+                let out_dtype = xs.dtype();
                 let xs = xs.contiguous()?;
+                let xs = if out_dtype == DType::F32 {
+                    xs
+                } else {
+                    xs.to_dtype(DType::F32)?
+                };
                 // QMatMul only accepts 2D/3D activations, while dense
                 // `candle_nn::Linear` broadcasts over any leading dims. Collapse
                 // `[..., in]` to `[rows, in]` and restore the leading dims.
@@ -104,9 +172,14 @@ impl Linear {
                 } else {
                     weight.forward(&xs)?
                 };
-                match bias {
-                    Some(bias) => ys.broadcast_add(bias),
-                    None => Ok(ys),
+                let ys = match bias {
+                    Some(bias) => ys.broadcast_add(bias)?,
+                    None => ys,
+                };
+                if out_dtype == DType::F32 {
+                    Ok(ys)
+                } else {
+                    ys.to_dtype(out_dtype)
                 }
             }
         }
@@ -148,7 +221,12 @@ fn load_linear(vb: VarBuilder, in_dim: usize, out_dim: usize, bias: bool) -> Can
 /// packed QTensor) trades ~4x weight VRAM for ~10x GEMM throughput; stages
 /// are loaded and dropped sequentially, so the peak stays inside 12 GiB.
 /// `LUX3D_WGPU_DEQUANT_WEIGHTS=0` restores packed weights (including the
-/// K-quant path with its Q8K dispatch limit).
+/// K-quant path with its Q8K dispatch limit). `=f16` dequantizes packed
+/// weights to dense F16 instead, which halves the weight footprint — but
+/// candle's WGPU F16 GEMM mishandles batch > 1 (a whole-model TripoSG
+/// `--num-shapes 2` run yields one noisy and one empty mesh), so whole-model
+/// packages that need a real batch should stay packed (`=0`), which is also
+/// the leanest layout; activations stay F32 and the VAE decode is dense F32.
 fn quantized_linear(
     qt: QTensor,
     vb: &VarBuilder,
@@ -162,19 +240,49 @@ fn quantized_linear(
             qt.shape()
         );
     }
-    let wgpu_dense = vb.device().is_wgpu()
-        && std::env::var("LUX3D_WGPU_DEQUANT_WEIGHTS").map_or(true, |v| v != "0");
-    if wgpu_dense
-        || matches!(
-            qt.dtype(),
-            GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
-        )
-    {
-        let weight = qt.dequantize(vb.device())?.to_dtype(DType::F32)?;
+    let wgpu_mode = std::env::var("LUX3D_WGPU_DEQUANT_WEIGHTS").unwrap_or_default();
+    let force_f32 = force_dense_f32();
+    let packed = !matches!(
+        qt.dtype(),
+        GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
+    );
+    let wgpu_dense = vb.device().is_wgpu() && wgpu_mode != "0" && !force_f32;
+    // A pipeline loaded with `--dtype f16` requests F16 activations, so every
+    // dequantized weight must stay F16; returning a dense F32 layer here
+    // produces `dtype mismatch in matmul, lhs: F16, rhs: F32` inside the
+    // DINOv2/CLIP/VAE stages whose GGUF entries are plain F16 rather than
+    // packed quantized tensors. The explicit WGPU env override selects the
+    // same layout for a whole-model q8 package even when the pipeline itself
+    // still runs F32.
+    let dense_f16 = !force_f32
+        && (vb.dtype() == DType::F16
+            || (vb.device().is_wgpu() && wgpu_mode.eq_ignore_ascii_case("f16")));
+    if dense_f16 && (wgpu_dense || !packed) {
+        // F16 dense weights halve the dequantized footprint. This is the
+        // memory-safe fast path for whole-model GGUF packages (TripoSG q8:
+        // ~8 GiB of F32 weights does not fit a 12 GiB card; ~4 GiB of F16
+        // does). Activations are cast per layer and the output is restored to
+        // the caller's dtype, so pipeline tensors keep their F32 contract.
+        let weight = qt.dequantize(vb.device())?.to_dtype(DType::F16)?;
+        let bias = bias.map(|bias| bias.to_dtype(DType::F16)).transpose()?;
+        return Ok(Some(Linear {
+            inner: LinearInner::DenseF16(candle_nn::Linear::new(weight, bias)),
+        }));
+    }
+    if wgpu_dense || force_f32 || !packed {
+        let target = if force_f32 { DType::F32 } else { vb.dtype() };
+        let weight = qt.dequantize(vb.device())?.to_dtype(target)?;
+        let bias = match bias {
+            Some(bias) if bias.dtype() != target => Some(bias.to_dtype(target)?),
+            bias => bias,
+        };
         return Ok(Some(Linear {
             inner: LinearInner::Dense(candle_nn::Linear::new(weight, bias)),
         }));
     }
+    // Packed QMatMul returns F32; keep the bias in the same dtype so the
+    // narrowing cast in `forward` is the only conversion.
+    let bias = bias.map(|bias| bias.to_dtype(DType::F32)).transpose()?;
     Ok(Some(Linear {
         inner: LinearInner::Quant {
             weight: QMatMul::from_qtensor(qt)?,

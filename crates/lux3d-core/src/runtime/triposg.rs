@@ -42,6 +42,7 @@ use std::{
 use candle_core::{DType, Device, Tensor, quantized::gguf_file};
 
 use super::{
+    DeviceLocalCache, RmbgConfig, RmbgModel,
     triposg_dino::TripoSgDinoEncoder,
     triposg_dit::TripoSgDiT,
     triposg_field::hierarchical_sdf_grid,
@@ -50,22 +51,21 @@ use super::{
     triposg_vae::{
         TripoSgLatentDistribution, TripoSgVaeConfig, TripoSgVaeDecoder, TripoSgVaeEncoder,
     },
-    DeviceLocalCache, RmbgConfig, RmbgModel,
 };
 use crate::{
+    AuxiliaryWeightSetPaths, CanonicalWeightSetPaths, ModelAssetOptions, ModelFamily, Result,
     error::Lux3dError,
     export::{MeshFormat, TripoSgExportStage},
-    geometry::{merge_close_vertices, simplify_mesh, TripoSgGeometryStage, TripoSgMeshCpu},
+    geometry::{TripoSgGeometryStage, TripoSgMeshCpu, merge_close_vertices, simplify_mesh},
     load_auxiliary_canonical_weights, load_canonical_weights,
     neural::TripoSgNeuralStage,
     preprocess::TripoSgPreprocessStage,
-    weights::{VarBuilder, GGUF_VARIANT_KEY, TRIPOSG_SCRIBBLE_VARIANT, is_gguf_path},
-    AuxiliaryWeightSetPaths, CanonicalWeightSetPaths, ModelAssetOptions, ModelFamily, Result,
+    weights::{GGUF_VARIANT_KEY, TRIPOSG_SCRIBBLE_VARIANT, VarBuilder, is_gguf_path},
 };
 
 use super::triposg_dit::{
-    denoise_dual_with_schedule, denoise_with_schedule, RectifiedFlowSchedule,
-    TripoSgTransformerConfig, SCHEDULER_SHIFT,
+    RectifiedFlowSchedule, SCHEDULER_SHIFT, TripoSgTransformerConfig, denoise_dual_with_schedule,
+    denoise_with_schedule,
 };
 
 /// TripoSG latent channel count (`transformer.in_channels` ==
@@ -141,6 +141,22 @@ pub const TRIPOSG_SCRIBBLE_DIT_SHARD: &str = "transformer/diffusion_pytorch_mode
 /// Sibling quantized DiT package preferred over the float shard by the loader
 /// (`weights quantize --scribble` default output).
 pub const TRIPOSG_SCRIBBLE_DIT_GGUF: &str = "transformer/model.gguf";
+
+/// Dtype used to load the TripoSG VAE encoder/decoder.
+///
+/// The pipeline may run F16 (`--dtype f16`) while the VAE stays F32: candle's
+/// WGPU F16 path allocates exactly-1 MiB scratch tensors at 512 latent tokens,
+/// a hot-ring size class that can hand the same buffer to both sides of a copy
+/// (`Source and destination cannot be the same buffer`). F32 keeps the SDF
+/// decode on the proven layout and matches the reference decoder precision;
+/// the memory-heavy DINOv2/DiT/CLIP stages still run F16.
+fn triposg_vae_dtype(device: &Device, dtype: DType) -> DType {
+    if device.is_wgpu() && dtype == DType::F16 {
+        DType::F32
+    } else {
+        dtype
+    }
+}
 
 /// Per-run options for the TripoSG-scribble pipeline. Defaults replicate the
 /// shipped `run_triposg_scribble` call
@@ -793,6 +809,21 @@ impl TripoSgModelBundle {
                 }
             })?
         };
+        let vae_dtype = triposg_vae_dtype(device, dtype);
+        let vae_vb = if vae_dtype == dtype {
+            vb.clone()
+        } else {
+            // SAFETY: same read-only canonical file and lifetime contract.
+            unsafe {
+                weights.var_builder(vae_dtype, device).map_err(|source| {
+                    Lux3dError::CanonicalWeightsValidation {
+                        message: format!(
+                            "failed to open TripoSG canonical weights for the F32 VAE: {source}"
+                        ),
+                    }
+                })?
+            }
+        };
         let resolved = weights.read_resolved_config_json()?;
         let transformer_cfg =
             TripoSgTransformerConfig::from_resolved_config(&resolved).map_err(|source| {
@@ -805,27 +836,35 @@ impl TripoSgModelBundle {
                 message: format!("failed to parse TripoSG VAE config: {source}"),
             }
         })?;
-        Ok(Self {
-            dino: TripoSgDinoEncoder::load(vb.pp("image_encoder")).map_err(|source| {
-                Lux3dError::CanonicalWeightsValidation {
-                    message: format!("failed to construct TripoSG image encoder: {source}"),
-                }
-            })?,
-            dit: TripoSgDiT::load(vb.pp("transformer"), &transformer_cfg).map_err(|source| {
-                Lux3dError::CanonicalWeightsValidation {
-                    message: format!("failed to construct TripoSG DiT: {source}"),
-                }
-            })?,
-            vae: TripoSgVaeDecoder::load(vb.pp("vae"), &vae_cfg).map_err(|source| {
-                Lux3dError::CanonicalWeightsValidation {
-                    message: format!("failed to construct TripoSG VAE decoder: {source}"),
-                }
-            })?,
-            vae_encoder: TripoSgVaeEncoder::load(vb.pp("vae"), &vae_cfg).map_err(|source| {
+        let dino = TripoSgDinoEncoder::load(vb.pp("image_encoder")).map_err(|source| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!("failed to construct TripoSG image encoder: {source}"),
+            }
+        })?;
+        super::log_wgpu_alloc(device, "triposg-dino");
+        let dit = TripoSgDiT::load(vb.pp("transformer"), &transformer_cfg).map_err(|source| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!("failed to construct TripoSG DiT: {source}"),
+            }
+        })?;
+        super::log_wgpu_alloc(device, "triposg-dit");
+        let vae = TripoSgVaeDecoder::load(vae_vb.pp("vae"), &vae_cfg).map_err(|source| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!("failed to construct TripoSG VAE decoder: {source}"),
+            }
+        })?;
+        let vae_encoder =
+            TripoSgVaeEncoder::load(vae_vb.pp("vae"), &vae_cfg).map_err(|source| {
                 Lux3dError::CanonicalWeightsValidation {
                     message: format!("failed to construct TripoSG VAE encoder: {source}"),
                 }
-            })?,
+            })?;
+        super::log_wgpu_alloc(device, "triposg-vae");
+        Ok(Self {
+            dino,
+            dit,
+            vae,
+            vae_encoder,
         })
     }
 }
@@ -934,7 +973,7 @@ impl TripoSgScribbleModelBundle {
                 raw_safetensors_var_builder(
                     dir,
                     "vae/diffusion_pytorch_model.safetensors",
-                    dtype,
+                    triposg_vae_dtype(device, dtype),
                     device,
                 )?,
                 &vae_cfg,
@@ -967,10 +1006,25 @@ impl TripoSgScribbleModelBundle {
                 ),
             }
         })?;
+        let vae_dtype = triposg_vae_dtype(device, dtype);
+        let vae_vb = if vae_dtype == dtype {
+            vb.clone()
+        } else {
+            VarBuilder::from_gguf(gguf, vae_dtype, device).map_err(|source| {
+                Lux3dError::CanonicalWeightsValidation {
+                    message: format!(
+                        "failed to open standalone TripoSG-scribble GGUF `{}` for the F32 VAE: \
+                         {source}",
+                        gguf.display()
+                    ),
+                }
+            })?
+        };
         let tokenizer = scribble_resolved_tokenizer(config, gguf)?;
         Self::load_from_vb(
             config,
             vb,
+            vae_vb,
             tokenizer,
             dtype,
             &format!("standalone GGUF `{}`", gguf.display()),
@@ -1006,10 +1060,26 @@ impl TripoSgScribbleModelBundle {
                 ),
             }
         })?;
+        let vae_dtype = triposg_vae_dtype(device, dtype);
+        let vae_vb = if vae_dtype == dtype {
+            vb.clone()
+        } else {
+            // SAFETY: same read-only package and lifetime contract.
+            unsafe { paths.var_builder(vae_dtype, device) }.map_err(|source| {
+                Lux3dError::CanonicalWeightsValidation {
+                    message: format!(
+                        "failed to open canonical TripoSG-scribble weights in `{}` for the F32 \
+                         VAE: {source}",
+                        dir.display()
+                    ),
+                }
+            })?
+        };
         let tokenizer = scribble_resolved_tokenizer(&config, dir)?;
         Self::load_from_vb(
             &config,
             vb,
+            vae_vb,
             tokenizer,
             dtype,
             &format!("canonical package `{}`", dir.display()),
@@ -1019,6 +1089,7 @@ impl TripoSgScribbleModelBundle {
     fn load_from_vb(
         config: &serde_json::Value,
         vb: VarBuilder<'static>,
+        vae_vb: VarBuilder<'static>,
         tokenizer: ClipBpeTokenizer,
         dtype: DType,
         source: &str,
@@ -1036,11 +1107,12 @@ impl TripoSgScribbleModelBundle {
                 .ok_or_else(|| Lux3dError::CanonicalWeightsValidation {
                     message: format!("{source} has no transformer config"),
                 })?;
-        let vae_config = config
-            .get("vae")
-            .ok_or_else(|| Lux3dError::CanonicalWeightsValidation {
-                message: format!("{source} has no VAE config"),
-            })?;
+        let vae_config =
+            config
+                .get("vae")
+                .ok_or_else(|| Lux3dError::CanonicalWeightsValidation {
+                    message: format!("{source} has no VAE config"),
+                })?;
         let dino_config =
             config
                 .get("image_encoder")
@@ -1100,7 +1172,9 @@ impl TripoSgScribbleModelBundle {
 
         let text_encoder = TripoSgClipTextEncoder::load(vb.pp("text_encoder"), text_config, dtype)
             .map_err(|source| Lux3dError::CanonicalWeightsValidation {
-                message: format!("failed to construct TripoSG-scribble CLIP text encoder: {source}"),
+                message: format!(
+                    "failed to construct TripoSG-scribble CLIP text encoder: {source}"
+                ),
             })?;
         if text_encoder.config().embed_dim != transformer_cfg.cross_attention_dim {
             return Err(Lux3dError::CanonicalWeightsValidation {
@@ -1113,22 +1187,29 @@ impl TripoSgScribbleModelBundle {
             });
         }
 
+        super::log_wgpu_alloc(vb.device(), "triposg-scribble-text");
+        let dino = TripoSgDinoEncoder::load(vb.pp("image_encoder")).map_err(|source| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!("failed to construct TripoSG-scribble image encoder: {source}"),
+            }
+        })?;
+        super::log_wgpu_alloc(vb.device(), "triposg-scribble-dino");
+        let dit = TripoSgDiT::load(vb.pp("transformer"), &transformer_cfg).map_err(|source| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!("failed to construct TripoSG-scribble DiT: {source}"),
+            }
+        })?;
+        super::log_wgpu_alloc(vb.device(), "triposg-scribble-dit");
+        let vae = TripoSgVaeDecoder::load(vae_vb.pp("vae"), &vae_cfg).map_err(|source| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!("failed to construct TripoSG-scribble VAE decoder: {source}"),
+            }
+        })?;
+        super::log_wgpu_alloc(vb.device(), "triposg-scribble-vae");
         Ok(Self {
-            dino: TripoSgDinoEncoder::load(vb.pp("image_encoder")).map_err(|source| {
-                Lux3dError::CanonicalWeightsValidation {
-                    message: format!("failed to construct TripoSG-scribble image encoder: {source}"),
-                }
-            })?,
-            dit: TripoSgDiT::load(vb.pp("transformer"), &transformer_cfg).map_err(|source| {
-                Lux3dError::CanonicalWeightsValidation {
-                    message: format!("failed to construct TripoSG-scribble DiT: {source}"),
-                }
-            })?,
-            vae: TripoSgVaeDecoder::load(vb.pp("vae"), &vae_cfg).map_err(|source| {
-                Lux3dError::CanonicalWeightsValidation {
-                    message: format!("failed to construct TripoSG-scribble VAE decoder: {source}"),
-                }
-            })?,
+            dino,
+            dit,
+            vae,
             text_encoder,
             tokenizer,
         })
@@ -1307,6 +1388,9 @@ pub struct TripoSgScribblePipeline {
     pub export: TripoSgExportStage,
     dtype: DType,
     bundle_cache: Arc<DeviceLocalCache<TripoSgScribbleModelBundle>>,
+    /// Decode-only VAE cache for the WGPU low-memory path (the full
+    /// DINOv2/DiT/CLIP bundle is dropped after denoising).
+    vae_cache: Arc<DeviceLocalCache<TripoSgVaeDecoder>>,
 }
 
 impl TripoSgScribblePipeline {
@@ -1366,6 +1450,7 @@ impl TripoSgScribblePipeline {
             export: TripoSgExportStage,
             dtype,
             bundle_cache: Arc::default(),
+            vae_cache: Arc::default(),
         })
     }
 
@@ -1381,6 +1466,7 @@ impl TripoSgScribblePipeline {
             export: TripoSgExportStage,
             dtype,
             bundle_cache: Arc::default(),
+            vae_cache: Arc::default(),
         }
     }
 
@@ -1395,6 +1481,7 @@ impl TripoSgScribblePipeline {
             export: TripoSgExportStage,
             dtype,
             bundle_cache: Arc::default(),
+            vae_cache: Arc::default(),
         }
     }
 
@@ -1411,6 +1498,109 @@ impl TripoSgScribblePipeline {
                     device,
                     self.dtype,
                 )
+            }
+        })
+    }
+
+    /// Load only the VAE decoder for the WGPU decode path. The standalone
+    /// GGUF/canonical package is reopened; the full bundle is dropped first
+    /// by [`Self::extract_mesh`].
+    fn vae_for(&self, device: &Device) -> Result<Arc<TripoSgVaeDecoder>> {
+        self.vae_cache.get_or_try_init(device, || {
+            let load = || -> Result<TripoSgVaeDecoder> {
+                let dtype = triposg_vae_dtype(device, self.dtype);
+                let load_vae = |vb: VarBuilder<'static>,
+                                config: &serde_json::Value|
+                 -> Result<TripoSgVaeDecoder> {
+                    let vae_config = config.get("vae").ok_or_else(|| {
+                        Lux3dError::CanonicalWeightsValidation {
+                            message: "TripoSG-scribble package has no VAE config".to_string(),
+                        }
+                    })?;
+                    let cfg =
+                        TripoSgVaeConfig::from_resolved_config(vae_config).map_err(|source| {
+                            Lux3dError::CanonicalWeightsValidation {
+                                message: format!(
+                                    "failed to parse TripoSG-scribble VAE config: {source}"
+                                ),
+                            }
+                        })?;
+                    TripoSgVaeDecoder::load(vb.pp("vae"), &cfg).map_err(|source| {
+                        Lux3dError::CanonicalWeightsValidation {
+                            message: format!(
+                                "failed to construct TripoSG-scribble decode-only VAE: {source}"
+                            ),
+                        }
+                    })
+                };
+                if let Some(dir) = self.canonical_dir.as_deref() {
+                    let paths = load_canonical_weights(
+                        ModelFamily::TripoSg,
+                        ModelAssetOptions {
+                            canonical_dir: Some(dir.to_path_buf()),
+                            ..Default::default()
+                        },
+                    )?;
+                    let config = paths.read_resolved_config_json()?;
+                    // SAFETY: same read-only package and lifetime contract as the
+                    // full bundle.
+                    let vb = unsafe { paths.var_builder(dtype, device) }.map_err(|source| {
+                        Lux3dError::CanonicalWeightsValidation {
+                            message: format!(
+                                "failed to open canonical TripoSG-scribble weights in `{}` for the \
+                             decode-only VAE: {source}",
+                                dir.display()
+                            ),
+                        }
+                    })?;
+                    load_vae(vb, &config)
+                } else if let Some(gguf) = self.standalone_gguf.as_deref() {
+                    let standalone = crate::weights::read_standalone_gguf(gguf, "triposg")?;
+                    let vb = VarBuilder::from_gguf(gguf, dtype, device).map_err(|source| {
+                        Lux3dError::CanonicalWeightsValidation {
+                            message: format!(
+                                "failed to open standalone TripoSG-scribble GGUF `{}` for the \
+                             decode-only VAE: {source}",
+                                gguf.display()
+                            ),
+                        }
+                    })?;
+                    load_vae(vb, &standalone.resolved_config)
+                } else {
+                    let config = read_triposg_scribble_json(&self.model_dir, "vae/config.json")?;
+                    let cfg =
+                        TripoSgVaeConfig::from_resolved_config(&config).map_err(|source| {
+                            Lux3dError::CanonicalWeightsValidation {
+                                message: format!(
+                                    "failed to parse TripoSG-scribble VAE config: {source}"
+                                ),
+                            }
+                        })?;
+                    let vb = raw_safetensors_var_builder(
+                        &self.model_dir,
+                        "vae/diffusion_pytorch_model.safetensors",
+                        dtype,
+                        device,
+                    )?;
+                    TripoSgVaeDecoder::load(vb, &cfg).map_err(|source| {
+                        Lux3dError::CanonicalWeightsValidation {
+                            message: format!(
+                                "failed to construct TripoSG-scribble decode-only VAE: {source}"
+                            ),
+                        }
+                    })
+                }
+            };
+            // The WGPU VAE runs F32: at 512 latent tokens the F16 decoder hits
+            // exactly 1 MiB scratch tensors, a candle WGPU hot-ring size class
+            // that aliases a buffer still bound as a copy source (`Source and
+            // destination cannot be the same buffer`). F32 also matches the
+            // reference decoder precision; the full DiT bundle is dropped before
+            // this cache is populated, so the larger weights still fit 12 GiB.
+            if device.is_wgpu() {
+                super::nn_blocks::with_force_dense_f32(load)
+            } else {
+                load()
             }
         })
     }
@@ -1524,7 +1714,7 @@ impl TripoSgScribblePipeline {
             Some(timesteps) => RectifiedFlowSchedule::from_timesteps(timesteps, SCHEDULER_SHIFT),
             None => RectifiedFlowSchedule::new(options.steps, SCHEDULER_SHIFT),
         };
-        denoise_dual_with_schedule(
+        let latents = denoise_dual_with_schedule(
             &bundle.dit,
             latents_init,
             text_embeds,
@@ -1537,7 +1727,18 @@ impl TripoSgScribblePipeline {
         )
         .map_err(|source| Lux3dError::CanonicalWeightsValidation {
             message: format!("TripoSG-scribble denoise failed: {source}"),
-        })
+        })?;
+        if latents.device().is_wgpu() {
+            // Surface deferred WGPU validation errors at the denoise stage
+            // instead of the first SDF-decode sync, which otherwise reports
+            // them under the wrong stage.
+            latents.device().synchronize().map_err(|source| {
+                Lux3dError::CanonicalWeightsValidation {
+                    message: format!("TripoSG-scribble denoise sync failed: {source}"),
+                }
+            })?;
+        }
+        Ok(latents)
     }
 
     /// Decode the SDF field and assemble the marching-cubes mesh, always via
@@ -1550,18 +1751,35 @@ impl TripoSgScribblePipeline {
     ) -> Result<TripoSgMeshBuffers> {
         options.validate()?;
         TripoSgPipeline::validate_latents(latents, options.num_tokens)?;
-        let bundle = self.bundle_for(latents.device())?;
-        let latents = latents.to_dtype(self.dtype).map_err(|source| {
+        let device = latents.device();
+        if device.is_wgpu() {
+            // Drop DINOv2/DiT/CLIP before allocating the VAE decoder.
+            self.bundle_cache.clear();
+            let vae = self.vae_for(device)?;
+            self.decode_with_vae(&vae, latents, options)
+        } else {
+            let bundle = self.bundle_for(device)?;
+            self.decode_with_vae(&bundle.vae, latents, options)
+        }
+    }
+
+    fn decode_with_vae(
+        &self,
+        vae: &TripoSgVaeDecoder,
+        latents: &Tensor,
+        options: &TripoSgScribbleRunOptions,
+    ) -> Result<TripoSgMeshBuffers> {
+        let vae_dtype = vae.dtype();
+        let latents = latents.to_dtype(vae_dtype).map_err(|source| {
             Lux3dError::CanonicalWeightsValidation {
                 message: format!(
-                    "failed to convert TripoSG-scribble latents to {dtype:?}: {source}",
-                    dtype = self.dtype
+                    "failed to convert TripoSG-scribble latents to {vae_dtype:?}: {source}"
                 ),
             }
         })?;
         let bounds = options.effective_bounds();
         let grid = hierarchical_sdf_grid(
-            &bundle.vae,
+            vae,
             &latents,
             bounds,
             options.dense_octree_depth,
@@ -1611,6 +1829,9 @@ pub struct TripoSgPipeline {
     /// are converted back to F32; `F16` is an inference-time mode.
     dtype: DType,
     bundle_cache: Arc<DeviceLocalCache<TripoSgModelBundle>>,
+    /// Decode-only VAE cache used by the WGPU low-memory path: the full
+    /// bundle is dropped after denoising and only the VAE is reloaded.
+    vae_cache: Arc<DeviceLocalCache<TripoSgVaeDecoder>>,
     rmbg_cache: Arc<DeviceLocalCache<RmbgModel>>,
 }
 
@@ -1658,6 +1879,7 @@ impl TripoSgPipeline {
             export: TripoSgExportStage,
             dtype,
             bundle_cache: Arc::default(),
+            vae_cache: Arc::default(),
             rmbg_cache: Arc::default(),
         })
     }
@@ -1665,6 +1887,44 @@ impl TripoSgPipeline {
     fn bundle_for(&self, device: &Device) -> Result<Arc<TripoSgModelBundle>> {
         self.bundle_cache.get_or_try_init(device, || {
             TripoSgModelBundle::load(&self.weights, device, self.dtype)
+        })
+    }
+
+    /// Load only the VAE decoder (no DINOv2, DiT or VAE encoder). Used by the
+    /// WGPU decode path so the whole-model conditioning weights can be freed
+    /// before the SDF grid is built.
+    fn vae_for(&self, device: &Device) -> Result<Arc<TripoSgVaeDecoder>> {
+        self.vae_cache.get_or_try_init(device, || {
+            let load = || -> Result<TripoSgVaeDecoder> {
+                let resolved = self.weights.read_resolved_config_json()?;
+                let vae_cfg =
+                    TripoSgVaeConfig::from_resolved_config(&resolved).map_err(|source| {
+                        Lux3dError::CanonicalWeightsValidation {
+                            message: format!("failed to parse TripoSG VAE config: {source}"),
+                        }
+                    })?;
+                let dtype = triposg_vae_dtype(device, self.dtype);
+                // SAFETY: same read-only canonical file and lifetime contract as
+                // the full bundle.
+                let vb = unsafe { self.weights.var_builder(dtype, device) }.map_err(|source| {
+                    Lux3dError::CanonicalWeightsValidation {
+                        message: format!("failed to open TripoSG VAE weights: {source}"),
+                    }
+                })?;
+                TripoSgVaeDecoder::load(vb.pp("vae"), &vae_cfg).map_err(|source| {
+                    Lux3dError::CanonicalWeightsValidation {
+                        message: format!("failed to construct TripoSG decode-only VAE: {source}"),
+                    }
+                })
+            };
+            // Same WGPU hot-ring workaround as the scribble decoder: F32 keeps
+            // the 512-token decoder scratch tensors out of the aliased 1 MiB
+            // size class (see `TripoSgScribblePipeline::vae_for`).
+            if device.is_wgpu() {
+                super::nn_blocks::with_force_dense_f32(load)
+            } else {
+                load()
+            }
         })
     }
 
@@ -2129,13 +2389,31 @@ impl TripoSgPipeline {
     /// validated/converted by the callers below): flash or hierarchical SDF
     /// grid -> mesh -> `--faces` postprocess.
     fn decode_mesh(&self, latents: &Tensor, options: &TripoSgRunOptions) -> Result<TripoSgMeshCpu> {
-        let bundle = self.bundle_for(latents.device())?;
-        let latents = latents.to_dtype(self.dtype).map_err(|source| {
+        let device = latents.device();
+        if device.is_wgpu() {
+            // WGPU keeps the whole DiT/DINOv2/encoder bundle resident through
+            // denoising. Drop it before the VAE decode (which only needs the
+            // decoder) so a whole-model q8 package fits a 12 GiB card; the
+            // next run reloads the conditioning stages.
+            self.bundle_cache.clear();
+            let vae = self.vae_for(device)?;
+            self.decode_with_vae(&vae, latents, options)
+        } else {
+            let bundle = self.bundle_for(device)?;
+            self.decode_with_vae(&bundle.vae, latents, options)
+        }
+    }
+
+    fn decode_with_vae(
+        &self,
+        vae: &TripoSgVaeDecoder,
+        latents: &Tensor,
+        options: &TripoSgRunOptions,
+    ) -> Result<TripoSgMeshCpu> {
+        let vae_dtype = vae.dtype();
+        let latents = latents.to_dtype(vae_dtype).map_err(|source| {
             Lux3dError::CanonicalWeightsValidation {
-                message: format!(
-                    "failed to convert TripoSG latents to {dtype:?}: {source}",
-                    dtype = self.dtype
-                ),
+                message: format!("failed to convert TripoSG latents to {vae_dtype:?}: {source}"),
             }
         })?;
         let bounds = options.effective_bounds();
@@ -2143,7 +2421,7 @@ impl TripoSgPipeline {
             // Reference default (`use_flash_decoder=True`): hierarchical
             // flash SDF query schedule + clean-room DiffDMC.
             let grid = flash_sdf_grid(
-                &bundle.vae,
+                vae,
                 &latents,
                 bounds,
                 options.flash_octree_depth,
@@ -2170,7 +2448,7 @@ impl TripoSgPipeline {
             }
         } else {
             let grid = hierarchical_sdf_grid(
-                &bundle.vae,
+                vae,
                 &latents,
                 bounds,
                 options.dense_octree_depth,
@@ -2584,9 +2862,11 @@ mod batch_tests {
     #[test]
     fn batched_latents_reject_empty_batch() {
         let error = TripoSgPipeline::sample_latents_batched(42, 0, 8, 4, &Device::Cpu).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("latent batch must be at least 1"));
+        assert!(
+            error
+                .to_string()
+                .contains("latent batch must be at least 1")
+        );
     }
 
     #[test]
