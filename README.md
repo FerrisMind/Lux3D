@@ -71,7 +71,7 @@ Supported model families:
 - `lux3d-server-core` exposes an OpenAI-style async HTTP API for Pi3, Pi3X, TripoSR, VGGT, TripoSG, and TRELLIS.2 generation, plus TRELLIS.2 mesh texturing (`POST /v1/meshes/texturings`).
 - Python baseline tooling lives in [`tools/python_baseline/README.md`](https://github.com/oxide-lab/Lux3d/blob/main/tools/python_baseline/README.md).
 - Model-family-specific licensing can be inspected through the CLI before redistribution.
-- **Experimental:** Vulkan and WGPU inference via `--device vulkan` / `--device wgpu` (build with `--features vulkan` / `--features wgpu`). CUDA is the primary backend; the Pi3/Pi3X/TripoSR and VGGT paths have Vulkan correctness checks, and TripoSG has Vulkan/WGPU smoke coverage (see [Performance](#performance)). WGPU remains experimental — may be unstable, produce wrong results, or not work at all depending on hardware and drivers.
+- **Experimental:** Vulkan and WGPU inference via `--device vulkan` / `--device wgpu` (build with `--features vulkan` / `--features wgpu`). CUDA is the primary backend; the full real-weight e2e suite (18 scenarios, including TripoSG image/batch/surface/scribble) passes on Vulkan and WGPU (see [`E2E-RESULTS.md`](E2E-RESULTS.md)). WGPU remains experimental — may be unstable, produce wrong results, or not work at all depending on hardware and drivers.
 
 ## Demo
 
@@ -128,9 +128,11 @@ TRELLIS.2 normalization packs the flat `microsoft/TRELLIS.2-4B` layout (seven
 structure decoder, and the DINOv3 config/model files) into the canonical package
 layout that `Trellis2Pipeline::load` and the server expect. The texturing-only shape encoder is not packed into
 the merged canonical weight file. `--texture-mesh` loads it from the raw
-`ckpts/shape_enc_next_dc_f16c32_fp16.safetensors`, or from
-`external/shape_enc/model.safetensors` beside a canonical `model.gguf`
-(see the TRELLIS.2 notes under Run Inference).
+`ckpts/shape_enc_next_dc_f16c32_fp16.safetensors`, from
+`external/shape_enc/model.safetensors` beside a canonical `model.gguf`, or
+from `shape_enc.*` tensors embedded in a standalone GGUF with
+`weights quantize --merge-source` (see the TRELLIS.2 notes under Run
+Inference).
 
 ### Quantize Weights to GGUF
 
@@ -182,11 +184,16 @@ cargo run -p lux3d-cli -- weights quantize triposr `
 # TRELLIS.2: quantize only the flow-DiT linear weights (`QMatMul` path);
 # DINOv3/VAE/decoder tensors, 3D conv kernels, norms and biases stay F16
 # (their loaders read dense tensors). The F16 build drops the prefixes.
+# The shape encoder lives outside the canonical package; `--merge-source`
+# embeds it in the standalone GGUF under `shape_enc.*` so `--texture-mesh`
+# works without the raw TRELLIS.2-4B checkpoint tree.
 cargo run -p lux3d-cli -- weights quantize trellis2 `
   --source <canonical-trellis2-dir>/model.safetensors `
   --output trellis2-q8_0.gguf --dtype q8_0 --fallback-dtype f16 `
   --prefix ss_flow. --prefix shape_dit_512. --prefix shape_dit_1024. `
-  --prefix tex_dit_512. --prefix tex_dit_1024.
+  --prefix tex_dit_512. --prefix tex_dit_1024. `
+  --merge-source <raw-TRELLIS.2-4B-dir>/ckpts/shape_enc_next_dc_f16c32_fp16.safetensors `
+  --merge-prefix shape_enc
 
 # TripoSG-scribble canonical package: the normalizer detects the extra
 # `text_encoder/model.safetensors` shard, merges transformer/vae/image_encoder/
@@ -335,10 +342,14 @@ TRELLIS.2-4B quantization is DiT-only by policy: the five flow transformers
 (`ss_flow`, `shape_dit_512/1024`, `tex_dit_512/1024`) load linears through the
 `QMatMul` path, while DINOv3 (`image_cond`), the sparse VAE decoders and the
 dense structure decoder read dense tensors (3D conv kernels, norms), so those
-stages stay F16 in every variant. Candle's GGUF container caps tensor rank at
-four, so the 3D convolution kernels are stored flattened and reshaped by the
-loader. The K-quants skip four `input_layer` matrices whose row length does
-not divide into 256-wide blocks; Q8_0 additionally skips one (row length 8).
+stages stay F16 in every variant. Standalone builds pass the raw
+`ckpts/shape_enc_next_dc_f16c32_fp16.safetensors` stage through
+`--merge-source ... --merge-prefix shape_enc`; it is stored F16 (its 3D
+convolution kernels flattened) and makes `--texture-mesh` self-contained.
+Candle's GGUF container caps tensor rank at four, so the 3D convolution
+kernels are stored flattened and reshaped by the loader. The K-quants skip
+four `input_layer` matrices whose row length does not divide into 256-wide
+blocks; Q8_0 additionally skips one (row length 8).
 
 TripoSR Q8_0 quantizes 244 matrices; the K-quants use 256-wide blocks, so nine
 matrices whose row length is not divisible by 256 stay in F16.
@@ -728,9 +739,12 @@ cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <canonical-t
 
 # TRELLIS.2 texturing of an existing mesh (upstream Trellis2TexturingPipeline):
 # --source is the condition image, --texture-mesh accepts .glb/.obj/.ply/.stl, output must be .glb.
-# The shape encoder comes from the raw `ckpts/shape_enc_next_dc_f16c32_fp16.safetensors`
-# or from `external/shape_enc/model.safetensors` in a canonical/GGUF package dir.
+# The shape encoder comes from the raw `ckpts/shape_enc_next_dc_f16c32_fp16.safetensors`,
+# from `external/shape_enc/model.safetensors` beside a canonical/GGUF package, or from
+# `shape_enc.*` tensors embedded in a standalone GGUF (`weights quantize --merge-source`).
 # `--texture-resolution` 512|1024|1536 (default 1024; 1536 shares the 1024 conditioning/DiT).
+# A standalone GGUF package with the embedded encoder is fully self-contained:
+cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <standalone-trellis2-gguf-dir> --rmbg-model-path <canonical-rmbg2-dir> --source <condition-image> --texture-mesh <input-mesh.glb> --texture-resolution 512 --output textured.glb
 cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <raw-TRELLIS.2-4B-dir> --rmbg-model-path <raw-RMBG-2.0-dir> --source <condition-image> --texture-mesh <input-mesh.glb> --texture-resolution 1536 --output textured.glb
 
 # Auto-download canonical packages from Hugging Face into the user cache
@@ -743,7 +757,7 @@ cargo run -p lux3d-cli --features cuda -- run pi3 --source <input-sequence> --ou
 
 > **TRELLIS.2 notes:** `--pipeline-type` accepts `512`, `1024`, `1024_cascade` (reference default), or `1536_cascade` (cascade targeting the 1536 grid with the hardcoded 1024 token-budget stop; the 1024 cascade always decodes at 1024). Variant dispatch and the 1536→…→1024 token-budget loop are covered by tests, but no real-weight end-to-end `1536_cascade` parity run is recorded in this tree. The `--steps` flag feeds all three samplers; per-stage overrides (`--ss-steps/--shape-steps/--tex-steps`, `--ss-guidance/--shape-guidance/--tex-guidance`, `--ss-rescale/--shape-rescale/--tex-rescale`, `--ss-interval/--shape-interval/--tex-interval` as `lo,hi`) replace the per-stage defaults when set (`resolve_stage_params`: a stage `steps` override wins over `--steps`). `--num-samples N` follows the upstream `run(num_samples)` draw structure (`trellis2_image_to_3d.py:208, 253`): ONE joint `[N, 8, R, R, R]` sparse-structure noise draw and ONE joint SLAT noise draw per stage over all samples' concatenated coords (both from `--seed`), one shared conditioning pass, and per-sample SLAT sampling/decode/export; outputs and latent files are suffixed `_0`, `_1`, ... (`N = 1` keeps the single-run path bit-identically). The Lux3D RNG is not bit-identical to `torch.randn`, so the draws are distribution-equivalent, not value-identical, to the reference; `--return-latent <path>` writes `shape_latent`/`tex_latent`/`coords`/`resolution`/`lr_shape_latent`/`meta` as `.npz` (upstream `return_latent` surface). The reference preprocessing is reproduced exactly: LANCZOS max-side downscale, alpha path when RGBA carries non-opaque alpha, otherwise RMBG-2.0/BiRefNet produces the mask (missing RMBG weights is an error — never an opaque fallback), then the alpha>0.8 bbox, Pillow-rounded square crop, premultiply and resize. Mesh post-processing runs by default and mirrors the shipped `to_glb` entry points (`example.py:43`, `app.py:503`): the shared hole fill (`--fill-hole-perimeter`, default 3e-2; 0 = off), then the narrow-band dual-contouring remesh on the canonical `[-0.5, 0.5]^3` frame with `scale = (resolution + 3 * band) / resolution` (`--remesh-band`, default 1 grid cell; `--remesh-project`, default 0 = off) and a single simplify pass toward `--decimation-target` (default 1000000; 0 = keep the remeshed topology). `--no-remesh` restores the previous cleanup chain (aggressive 3x simplify, duplicate-face/non-manifold repair, small-component removal via `--min-component-area`, default 1e-5; 0 = keep all, orientation unification, final simplify) byte-for-byte; `--no-postprocess` disables the whole pass. Remeshed textured GLBs set `doubleSided = false` (upstream `postprocess.py:303`), the non-remeshed/pass-through meshes keep `true`. The remesh branch is a direct port of the official CuMesh narrow-band dual-contouring algorithm (UDF−eps level set, base resolution halved to 32 then adaptive octree expansion, mean edge intersections without QEF, official adaptive diagonal and triangle topology; validated against official CuMesh golden meshes at resolutions 32/64), while hole fill/cleanup/decimation remain clean-room ports on the meshopt simplifier, so the post-remesh simplification can still differ from the reference cumesh pipeline. When `--texture` is on (the default), the textured-GLB export stage reproduces the upstream `to_glb` UV unwrap + PBR bake: `--texture-size <n>` sets the bake edge length (default 2048; the CLI accepts any value in 64..=8192 — the upstream reference only allows 1024..4096 in steps of 1024, and the core adds an nvdiffrast-parity multiple-of-8 rule) and the `.glb` output embeds the baked base-color + metallic-roughness PNGs with TEXCOORD UVs, area-weighted normals and the upstream glTF axis conversion `(x, y, z) -> (x, z, -y)`. `--no-texture-export` skips the whole stage and `--no-uv-unwrap` skips just the xatlas unwrap (both fall back to the vertex-color mesh; `.obj`/`.ply`/`.stl` outputs never embed textures). The xatlas unwrap + bake run on the CPU — measured ~42 s unwrap + ~9 s bake for an 80k-triangle sphere at 2048 (release build, this tree), scaling with `--texture-size` squared. Uncovered atlas texels are filled with a TELEA-approximation inpaint (iterative nearest-valid onion-peel), not the reference `cv2.inpaint`; the run prints `[bake]` stats (charts, atlases, atlas size, texture size, valid/inpainted texel counts). The mesh stays the O-Voxel dual-grid surface and the `<stem>.pbrvox.bin` + `<stem>.pbr.json` sidecar pair remains the lossless per-voxel PBR record. Weight stages load sequentially (~7.8 GiB measured peak on `1024_cascade` with the texture stages resident); CPU inference works but is slow. `--no-low-vram` maps to the upstream `low_vram=False` mode and keeps every stage the run loads resident on the device (one up-front load set, no per-stage drop); the outputs are identical to the default for the same seed, peak VRAM is higher, and a resident set that does not fit fails with an error naming the flag, the stage and the device memory limit instead of silently falling back. Auto-download from `oxide-lab/TRELLIS.2-4B` is reserved but not yet published, so pass an explicit `--model-path` (canonical package or raw checkpoint directory).
 
-> **TRELLIS.2 texturing mode:** `--texture-mesh <file>` textures an existing `.glb`/`.obj`/`.ply`/`.stl` mesh from the `--source` condition image (upstream `Trellis2TexturingPipeline`) instead of running image-to-3D. It preprocesses the mesh into `[-0.5, 0.5]^3` (center/scale to 0.99999 + y/z swap; `--no-preprocess-mesh` requires the input already in that frame), voxelizes to the flexible dual grid at `--texture-resolution` (512, 1024 or 1536, default 1024; 1536 voxelizes/encodes at the full 1536 grid but shares the 1024 conditioning and `tex_dit_1024`), encodes a raw shape SLAT with `shape_enc_next_dc_f16c32_fp16`, samples `tex_dit_512`/`tex_dit_1024` with the `--tex-*` overrides, decodes with synthesized occupancy guides, and bakes the UV atlas. The core `texture_mesh` API bakes directly on caller-supplied per-corner UVs (the reference `postprocess_mesh` UV-reuse branch, no xatlas run), and the CLI `--texture-mesh` path and the HTTP texturing job pass the imported mesh's per-corner UVs through, so an input that carries UVs keeps them (no xatlas) while a mesh without UVs still unwraps; cleanup/decimation/remeshing are not run (UV seams duplicate vertices and zero-area faces are dropped). `--texture-mesh` requires a `.glb` output, rejects `--pipeline-type`/`--max-num-tokens`/`--num-samples`/`--return-latent`/`--no-postprocess`/`--decimation-target`/`--no-texture-export`/`--no-uv-unwrap`/`--texture false`, and writes only the textured GLB (no PBR sidecar). Only `--tex-*`, `--seed`, `--texture-size`, `--texture-resolution` and `--no-preprocess-image`/`--no-preprocess-mesh` apply; `--steps`/`--ss-*`/`--shape-*` are not rejected but have no effect in this mode. The shape encoder is resolved from `<model-dir>/ckpts/shape_enc_next_dc_f16c32_fp16.safetensors` (raw checkpoint layout), `<model-dir>/external/shape_enc/model.safetensors` (sidecar next to a merged canonical/GGUF package), or `shape_enc.*` keys in a merged safetensors package; the raw `TRELLIS.2-4B` directory and a canonical `model.gguf` + external encoder/`external/dinov3` layout both work. Quantized q8\_0 texturing was smoke-tested on CUDA with `--texture-resolution 512 --texture-size 512` on the q8 512 shape output (507,540 vertices / 1,000,200 faces): 3,241 charts, 2 atlases, 110,789 valid texels, 30 MB PBR GLB with base-color + metallic-roughness PNGs. UV charting welds duplicate-position vertices first, so topology-repair vertex splits do not multiply chart count; chart count tracks connected surface components. `--no-preprocess-image` skips RMBG/crop and feeds the square source image directly (it no longer requires an RMBG model).
+> **TRELLIS.2 texturing mode:** `--texture-mesh <file>` textures an existing `.glb`/`.obj`/`.ply`/`.stl` mesh from the `--source` condition image (upstream `Trellis2TexturingPipeline`) instead of running image-to-3D. It preprocesses the mesh into `[-0.5, 0.5]^3` (center/scale to 0.99999 + y/z swap; `--no-preprocess-mesh` requires the input already in that frame), voxelizes to the flexible dual grid at `--texture-resolution` (512, 1024 or 1536, default 1024; 1536 voxelizes/encodes at the full 1536 grid but shares the 1024 conditioning and `tex_dit_1024`), encodes a raw shape SLAT with `shape_enc_next_dc_f16c32_fp16`, samples `tex_dit_512`/`tex_dit_1024` with the `--tex-*` overrides, decodes with synthesized occupancy guides, and bakes the UV atlas. The core `texture_mesh` API bakes directly on caller-supplied per-corner UVs (the reference `postprocess_mesh` UV-reuse branch, no xatlas run), and the CLI `--texture-mesh` path and the HTTP texturing job pass the imported mesh's per-corner UVs through, so an input that carries UVs keeps them (no xatlas) while a mesh without UVs still unwraps; cleanup/decimation/remeshing are not run (UV seams duplicate vertices and zero-area faces are dropped). `--texture-mesh` requires a `.glb` output, rejects `--pipeline-type`/`--max-num-tokens`/`--num-samples`/`--return-latent`/`--no-postprocess`/`--decimation-target`/`--no-texture-export`/`--no-uv-unwrap`/`--texture false`, and writes only the textured GLB (no PBR sidecar). Only `--tex-*`, `--seed`, `--texture-size`, `--texture-resolution` and `--no-preprocess-image`/`--no-preprocess-mesh` apply; `--steps`/`--ss-*`/`--shape-*` are not rejected but have no effect in this mode. The shape encoder is resolved from `<model-dir>/ckpts/shape_enc_next_dc_f16c32_fp16.safetensors` (raw checkpoint layout), `<model-dir>/external/shape_enc/model.safetensors` (sidecar next to a merged canonical/GGUF package), `shape_enc.*` keys in a merged safetensors package, or `shape_enc.*` tensors embedded in a standalone GGUF by `weights quantize --merge-source`; the raw `TRELLIS.2-4B` directory, a canonical `model.gguf` + external encoder/`external/dinov3` layout, and a self-contained standalone TRELLIS.2 GGUF all work. Quantized q8\_0 texturing was smoke-tested on CUDA with `--texture-resolution 512 --texture-size 512` on the q8 512 shape output (507,540 vertices / 1,000,200 faces): 3,241 charts, 2 atlases, 110,789 valid texels, 30 MB PBR GLB with base-color + metallic-roughness PNGs. UV charting welds duplicate-position vertices first, so topology-repair vertex splits do not multiply chart count; chart count tracks connected surface components. `--no-preprocess-image` skips RMBG/crop and feeds the square source image directly (it no longer requires an RMBG model).
 
 > **Experimental backends (Vulkan / WGPU):** select a non-CUDA device with `--device`:
 >
@@ -754,6 +768,8 @@ cargo run -p lux3d-cli --features cuda -- run pi3 --source <input-sequence> --ou
 > ```
 >
 > These paths are experimental and not verified in CI. Inference may be unstable, produce incorrect output, or fail entirely depending on your GPU, driver, and OS. Use CUDA for production workloads.
+>
+> Real-weight coverage: all 18 e2e scenarios pass on CUDA, Vulkan and WGPU (RTX 3060 12 GiB) — see [`E2E-RESULTS.md`](E2E-RESULTS.md). For whole-model TripoSG on WGPU keep packed Q8 weights (`LUX3D_WGPU_DEQUANT_WEIGHTS=0`): the default dense-F32 dequant OOMs a 12 GiB card, and dense F16 (`=f16`) mishandles batched DiT denoise (one noisy + one empty mesh for `--num-shapes 2`). The TripoSG VAE decode always runs dense F32 on WGPU, which also avoids a candle hot-ring alias at 512 latent tokens.
 
 ### O-Voxel Volume Commands
 
@@ -950,7 +966,7 @@ Known gaps: the remaining Vulkan/CUDA warm gap (1.16–1.20×) is the structural
 - Metal backend on macOS is build-checked in CI (`.github/workflows/metal.yml` builds and runs the lib/quant-probe checks); no model inference parity is validated in this repository.
 - Canonical model package directories supplied with `--model-path`, or downloadable from Hugging Face into the user cache
 - TripoSG needs roughly 8.3–8.7 GiB at the 1024-token preview (9.1 GiB at 2048 tokens) on all three backends; 16 GiB+ is recommended for the 50-step reference run.
-- TRELLIS.2 loads its stage checkpoints sequentially and peaks at ~7.8 GiB with the texture stages resident on the `1024_cascade` run (geometry-only runs are lighter); a 12 GiB GPU fits with ~4 GiB headroom, and CPU inference works but is slow. `--no-low-vram` keeps every stage resident instead and therefore needs more peak VRAM (it fails with an explicit memory-limit error rather than silently falling back). The server loads the canonical package only; the raw `microsoft/TRELLIS.2-4B` checkpoint directory is a CLI-only loader. `--texture-mesh` loads the shape encoder from the raw checkpoint or from `external/shape_enc/model.safetensors` beside a canonical/GGUF package, and runs the xatlas unwrap + PBR bake on the CPU (cost scales with face count, chart count and `texture_size²`; duplicate-position vertices are welded before charting so topology-repair splits do not turn every split sheet into its own chart).
+- TRELLIS.2 loads its stage checkpoints sequentially and peaks at ~7.8 GiB with the texture stages resident on the `1024_cascade` run (geometry-only runs are lighter); a 12 GiB GPU fits with ~4 GiB headroom, and CPU inference works but is slow. `--no-low-vram` keeps every stage resident instead and therefore needs more peak VRAM (it fails with an explicit memory-limit error rather than silently falling back). The server loads the canonical package only; the raw `microsoft/TRELLIS.2-4B` checkpoint directory is a CLI-only loader. `--texture-mesh` loads the shape encoder from the raw checkpoint, from `external/shape_enc/model.safetensors` beside a canonical/GGUF package, or from `shape_enc.*` tensors embedded in a standalone GGUF, and runs the xatlas unwrap + PBR bake on the CPU (cost scales with face count, chart count and `texture_size²`; duplicate-position vertices are welded before charting so topology-repair splits do not turn every split sheet into its own chart).
 
 ## License
 
