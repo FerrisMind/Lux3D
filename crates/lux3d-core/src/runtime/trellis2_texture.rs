@@ -93,13 +93,12 @@
 //!
 //! # Shape-encoder weights
 //!
-//! The canonical TRELLIS.2 package has no `shape_enc` stage yet, so the
-//! encoder loads from the standalone raw checkpoint
-//! `ckpts/shape_enc_next_dc_f16c32_fp16.safetensors` under the model dir
-//! ([`load_trellis2_shape_encoder_from_model_assets`],
-//! [`Trellis2Pipeline::load_shape_encoder`]). A future canonical package
-//! that carries `shape_enc.*` keys in its merged file is honored
-//! automatically.
+//! The encoder is resolved from, in order: the standalone raw checkpoint
+//! `ckpts/shape_enc_next_dc_f16c32_fp16.safetensors` under the model dir, an
+//! `external/shape_enc/model.safetensors` sidecar, `shape_enc.*` keys in a
+//! merged canonical safetensors package, or `shape_enc.*` tensors embedded in
+//! a standalone `model.gguf` ([`load_trellis2_shape_encoder_from_model_assets`],
+//! [`Trellis2Pipeline::load_shape_encoder`]).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -107,31 +106,31 @@ use std::path::Path;
 use candle_core::{DType, Device, Tensor};
 
 use super::trellis2::{
-    build_trellis2_textured_mesh, resolve_stage_params, Trellis2Pipeline, Trellis2SamplerOverrides,
-    Trellis2TextureExportOptions, Trellis2TexturedMesh,
+    Trellis2Pipeline, Trellis2SamplerOverrides, Trellis2TextureExportOptions, Trellis2TexturedMesh,
+    build_trellis2_textured_mesh, resolve_stage_params,
 };
 use super::trellis2_shape_enc::{
-    load_trellis2_shape_encoder_from_stage_file, Trellis2ShapeEncoder, Trellis2ShapeEncoderConfig,
+    Trellis2ShapeEncoder, Trellis2ShapeEncoderConfig, load_trellis2_shape_encoder_from_stage_file,
 };
-use super::trellis2_tex::{query_vertex_colors, Trellis2PbrLayout};
+use super::trellis2_tex::{Trellis2PbrLayout, query_vertex_colors};
 use super::trellis2_vae::Trellis2ShapeVaeConfig;
 use crate::contracts::{SpatialSize, TensorContract, Trellis2PreparedImage, Trellis2RawInput};
 use crate::error::Lux3dError;
 use crate::geometry::{
-    area_weighted_vertex_normals, bake_pbr_texture, mesh_to_flexible_dual_grid,
-    MeshToDualGridOptions, Trellis2MeshBuffers,
+    MeshToDualGridOptions, Trellis2MeshBuffers, area_weighted_vertex_normals, bake_pbr_texture,
+    mesh_to_flexible_dual_grid,
 };
-use crate::preprocess::{resize_lanczos_u8, Trellis2Preprocess};
-use crate::weights::{is_gguf_path, load_canonical_weights, ModelAssetOptions, VarBuilder};
+use crate::preprocess::{Trellis2Preprocess, resize_lanczos_u8};
+use crate::weights::{ModelAssetOptions, VarBuilder, is_gguf_path, load_canonical_weights};
 use crate::{ModelFamily, Result};
 
 /// Raw shape-SLAT encoder checkpoint path relative to the TRELLIS.2 model
-/// dir (the canonical package has no `shape_enc` stage yet).
+/// dir (the raw `TRELLIS.2-4B` checkpoint layout).
 pub const TRELLIS2_SHAPE_ENC_STAGE_REL: &str = "ckpts/shape_enc_next_dc_f16c32_fp16.safetensors";
 /// Shape-SLAT encoder stored beside a merged canonical weight file
-/// (`external/shape_enc/model.safetensors`). Quantized TRELLIS.2 GGUFs omit
-/// the encoder stage, so the canonical package carries the fp16 encoder as a
-/// separate external tensor file.
+/// (`external/shape_enc/model.safetensors`). Older canonical/GGUF packages
+/// carry the fp16 encoder as this external tensor file; newer standalone
+/// GGUFs embed `shape_enc.*` directly.
 pub const TRELLIS2_SHAPE_ENC_EXTERNAL_REL: &str = "external/shape_enc/model.safetensors";
 
 /// Options for [`Trellis2Pipeline::texture_mesh`] (the reference `run(...)`
@@ -204,11 +203,7 @@ impl Trellis2TexturingOptions {
     /// resolution == 512 else 1024)`); `1536` texturing uses the 1024
     /// conditioning configuration.
     pub fn cond_resolution(&self) -> u32 {
-        if self.resolution == 512 {
-            512
-        } else {
-            1024
-        }
+        if self.resolution == 512 { 512 } else { 1024 }
     }
 }
 
@@ -650,43 +645,73 @@ pub(super) fn shape_encoder_from_paths(
         );
     }
     if let Some(file) = canonical_file {
-        if file.is_file() && !is_gguf_path(file) {
-            let keys = safetensors_header_keys(file)?;
-            if keys.iter().any(|key| key.starts_with("shape_enc.")) {
-                // SAFETY: mmap-backed; the file outlives the builder's
-                // tensors and is not mutated.
-                let vb = unsafe {
-                    VarBuilder::from_mmaped_safetensors(
-                        std::slice::from_ref(&file),
-                        DType::F32,
-                        device,
-                    )
-                }
-                .map_err(|source| Lux3dError::CanonicalWeightsValidation {
-                    message: format!(
-                        "failed to open the canonical TRELLIS.2 weights for the shape \
-                         encoder: {source}"
-                    ),
+        if file.is_file() {
+            if is_gguf_path(file) {
+                // Standalone GGUFs written after the shape-encoder packaging
+                // change embed the stage under `shape_enc.`. Older GGUF
+                // packages do not, so probe for the root tensor first.
+                let vb = VarBuilder::from_gguf(file, DType::F32, device).map_err(|source| {
+                    Lux3dError::CanonicalWeightsValidation {
+                        message: format!(
+                            "failed to open the TRELLIS.2 GGUF weights for the shape \
+                             encoder: {source}"
+                        ),
+                    }
                 })?;
-                return Trellis2ShapeEncoder::load(
-                    vb.pp("shape_enc"),
-                    &Trellis2ShapeEncoderConfig::flexi_dual_shape(),
-                )
-                .map_err(|source| Lux3dError::CanonicalWeightsValidation {
-                    message: format!(
-                        "failed to load the TRELLIS.2 shape encoder from the canonical \
-                         package: {source}"
-                    ),
-                });
+                if vb.pp("shape_enc").contains_tensor("input_layer.weight") {
+                    return Trellis2ShapeEncoder::load(
+                        vb.pp("shape_enc"),
+                        &Trellis2ShapeEncoderConfig::flexi_dual_shape(),
+                    )
+                    .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                        message: format!(
+                            "failed to load the TRELLIS.2 shape encoder from the standalone \
+                             GGUF `{}`: {source}",
+                            file.display()
+                        ),
+                    });
+                }
+            } else {
+                let keys = safetensors_header_keys(file)?;
+                if keys.iter().any(|key| key.starts_with("shape_enc.")) {
+                    // SAFETY: mmap-backed; the file outlives the builder's
+                    // tensors and is not mutated.
+                    let vb = unsafe {
+                        VarBuilder::from_mmaped_safetensors(
+                            std::slice::from_ref(&file),
+                            DType::F32,
+                            device,
+                        )
+                    }
+                    .map_err(|source| {
+                        Lux3dError::CanonicalWeightsValidation {
+                            message: format!(
+                                "failed to open the canonical TRELLIS.2 weights for the shape \
+                             encoder: {source}"
+                            ),
+                        }
+                    })?;
+                    return Trellis2ShapeEncoder::load(
+                        vb.pp("shape_enc"),
+                        &Trellis2ShapeEncoderConfig::flexi_dual_shape(),
+                    )
+                    .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                        message: format!(
+                            "failed to load the TRELLIS.2 shape encoder from the canonical \
+                             package: {source}"
+                        ),
+                    });
+                }
             }
         }
     }
     Err(Lux3dError::ModelAssetResolution {
         message: format!(
             "the TRELLIS.2 shape encoder checkpoint `{TRELLIS2_SHAPE_ENC_STAGE_REL}` is \
-             unavailable: pass a model dir containing it (the canonical package has no \
-             `shape_enc` stage yet); searched a standalone stage file and the merged \
-             canonical package for `shape_enc.` keys"
+             unavailable: pass a model dir containing it or a standalone GGUF with \
+             `shape_enc.*` tensors; searched a standalone stage file, an external \
+             `external/shape_enc/model.safetensors` sidecar, the merged safetensors/GGUF \
+             canonical package, and the standalone GGUF for `shape_enc.` keys"
         ),
     })
 }
@@ -695,8 +720,8 @@ pub(super) fn shape_encoder_from_paths(
 /// standalone `ckpts/shape_enc_next_dc_f16c32_fp16.safetensors` under
 /// `options.canonical_dir` when present (the raw `TRELLIS.2-4B` model dir
 /// layout), else `shape_enc.*` keys in the resolved canonical package's
-/// merged weights file. Errors with a clear message when neither exists
-/// (the canonical package has no `shape_enc` stage today).
+/// merged safetensors file or embedded `shape_enc.*` tensors in a standalone
+/// GGUF. Errors with a clear message when none exists.
 pub fn load_trellis2_shape_encoder_from_model_assets(
     options: &ModelAssetOptions,
     device: &Device,
@@ -725,9 +750,10 @@ pub fn load_trellis2_shape_encoder_from_model_assets(
 
 impl Trellis2Pipeline {
     /// Load the shape SLAT encoder for THIS pipeline's weights: the raw
-    /// dir's standalone checkpoint, or `shape_enc.*` keys in the canonical
-    /// merged file. The raw-dir device must match `device` (the same
-    /// contract as the other stage loads).
+    /// dir's standalone checkpoint, an `external/shape_enc` sidecar, or
+    /// `shape_enc.*` keys in the canonical merged safetensors/GGUF file. The
+    /// raw-dir device must match `device` (the same contract as the other
+    /// stage loads).
     pub fn load_shape_encoder(&self, device: &Device) -> Result<Trellis2ShapeEncoder> {
         match (&self.raw_dir, &self.weights) {
             (Some((dir, raw_device)), _) => {

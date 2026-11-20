@@ -5,8 +5,9 @@ pub use auxiliary::{
 };
 pub(crate) use candle_nn::VarBuilder;
 pub use quantize::{
-    QuantizeOptions, QuantizeReport, dtype_from_name, dtype_name, quantize_auxiliary_checkpoint,
-    quantize_checkpoint, quantize_scribble_standalone, resolve_scribble_dit_source,
+    QuantizeMergeSource, QuantizeOptions, QuantizeReport, dtype_from_name, dtype_name,
+    quantize_auxiliary_checkpoint, quantize_checkpoint, quantize_checkpoint_with_merges,
+    quantize_scribble_standalone, resolve_scribble_dit_source,
 };
 
 use std::{

@@ -3,27 +3,28 @@ use std::process::Command as ProcessCommand;
 
 use clap::{Args, Parser, Subcommand};
 use lux3d_core::export::{
+    DEFAULT_CONF_THRESHOLD, DEFAULT_GLB_CONF_PERCENTILE, DEFAULT_MAX_POINTS,
+    DEFAULT_MAX_REPROJ_ERROR, DEFAULT_MIN_INLIER_PER_FRAME, DEFAULT_VIS_THRESHOLD, VggtColmapMode,
+    VggtColmapOptions, VggtGlbOptions, VggtGlbPredictions, VggtTrackColmapOptions,
     build_vggt_glb_scene, load_mesh, write_feedforward_colmap, write_track_colmap_from_auto,
-    write_vggt_glb, VggtColmapMode, VggtColmapOptions, VggtGlbOptions, VggtGlbPredictions,
-    VggtTrackColmapOptions, DEFAULT_CONF_THRESHOLD, DEFAULT_GLB_CONF_PERCENTILE,
-    DEFAULT_MAX_POINTS, DEFAULT_MAX_REPROJ_ERROR, DEFAULT_MIN_INLIER_PER_FRAME,
-    DEFAULT_VIS_THRESHOLD,
+    write_vggt_glb,
 };
 use lux3d_core::geometry::VggtPointCloudCpu;
 use lux3d_core::preprocess::VggtPreprocessMode;
 use lux3d_core::runtime::{
-    resolve_triposg_scribble_model_source, Pi3Pipeline, Pi3xInjectConditions, Pi3xPipeline,
-    Pi3xVoPipeline, Trellis2MeshPostprocessOptions, Trellis2Pipeline, Trellis2RunOptions,
-    Trellis2SamplerOverrides, Trellis2TextureExportOptions, Trellis2TexturingOptions,
-    TripoSgPipeline, TripoSgRunOptions, TripoSgScribblePipeline, TripoSgScribbleRunOptions,
-    TripoSrPipeline, VggtAutoQueryOptions, VggtInferenceOutput, VggtKeypointSource,
-    VggtPipeline, VggtRunOptions, VggtTrackQuery, VggtTrackResult, DEFAULT_MAX_QUERY_PTS,
-    DEFAULT_QUERY_FRAME_NUM,
+    DEFAULT_MAX_QUERY_PTS, DEFAULT_QUERY_FRAME_NUM, Pi3Pipeline, Pi3xInjectConditions,
+    Pi3xPipeline, Pi3xVoPipeline, Trellis2MeshPostprocessOptions, Trellis2Pipeline,
+    Trellis2RunOptions, Trellis2SamplerOverrides, Trellis2TextureExportOptions,
+    Trellis2TexturingOptions, TripoSgPipeline, TripoSgRunOptions, TripoSgScribblePipeline,
+    TripoSgScribbleRunOptions, TripoSrPipeline, VggtAutoQueryOptions, VggtInferenceOutput,
+    VggtKeypointSource, VggtPipeline, VggtRunOptions, VggtTrackQuery, VggtTrackResult,
+    resolve_triposg_scribble_model_source,
 };
 use lux3d_core::{
-    dtype_from_name, ensure_canonical_weights, quantize_auxiliary_checkpoint, quantize_checkpoint,
-    quantize_scribble_standalone, resolve_scribble_dit_source, ModelAssetOptions, ModelFamily,
-    QuantizeOptions, Trellis2PipelineType, WeightLocator,
+    ModelAssetOptions, ModelFamily, QuantizeMergeSource, QuantizeOptions, Trellis2PipelineType,
+    WeightLocator, dtype_from_name, ensure_canonical_weights, quantize_auxiliary_checkpoint,
+    quantize_checkpoint, quantize_checkpoint_with_merges, quantize_scribble_standalone,
+    resolve_scribble_dit_source,
 };
 
 #[derive(Debug, Parser, PartialEq)]
@@ -321,6 +322,22 @@ pub struct QuantizeArgs {
         help = "Only quantize tensors whose name starts with this prefix (repeatable)."
     )]
     pub prefix: Vec<String>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "merge_prefix",
+        help = "Additional safetensors file merged into the standalone GGUF, e.g. the TRELLIS.2 `shape_enc_next_dc_f16c32_fp16.safetensors` stage that is outside the canonical package."
+    )]
+    pub merge_source: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "PREFIX",
+        requires = "merge_source",
+        help = "Tensor-name prefix applied to `--merge-source` tensors (e.g. `shape_enc`)."
+    )]
+    pub merge_prefix: Option<String>,
 
     #[arg(
         long,
@@ -1390,12 +1407,27 @@ pub fn quantize_weights(args: QuantizeArgs) -> anyhow::Result<String> {
             quantize_checkpoint(&source, &args.output, ModelFamily::TripoSg, options)?
         }
     } else if let Some(aux_family) = args.aux_family.as_deref() {
+        if args.merge_source.is_some() {
+            anyhow::bail!("`--merge-source` is not supported with `--aux-family`");
+        }
         quantize_auxiliary_checkpoint(&args.source, &args.output, aux_family, options)?
     } else {
         let family = args
             .family
             .ok_or_else(|| anyhow::anyhow!("FAMILY is required unless `--aux-family` is used"))?;
-        quantize_checkpoint(&args.source, &args.output, family.model_family(), options)?
+        match (&args.merge_source, &args.merge_prefix) {
+            (Some(source), Some(prefix)) => quantize_checkpoint_with_merges(
+                &args.source,
+                &args.output,
+                family.model_family(),
+                options,
+                &[QuantizeMergeSource::new(source, prefix)],
+            )?,
+            (None, None) => {
+                quantize_checkpoint(&args.source, &args.output, family.model_family(), options)?
+            }
+            _ => unreachable!("clap enforces --merge-source/--merge-prefix pairing"),
+        }
     };
     Ok(report.render())
 }
@@ -1486,7 +1518,7 @@ fn resolve_mesh2ovox_grid_size(
 /// Run one `ovox` subcommand and return its JSON stats report.
 pub fn run_ovox(args: OvoxArgs) -> anyhow::Result<String> {
     use lux3d_core::export::{
-        mesh2ovox, ovox2glb, ovox2mesh, MeshToOvoxOptions, OvoxDecodeOptions, OvoxToGlbOptions,
+        MeshToOvoxOptions, OvoxDecodeOptions, OvoxToGlbOptions, mesh2ovox, ovox2glb, ovox2mesh,
     };
 
     match args.command {
@@ -4169,9 +4201,11 @@ fn run_trellis2(
     // pre-num_samples behavior); > 1 runs the sequential seed-offset
     // emulation and writes one output per sample with a `_i` suffix.
     let stages_list = if options.num_samples == 1 {
-        vec![pipeline
-            .run_from_path_with_stages(source, device, &options)
-            .map_err(anyhow::Error::from)?]
+        vec![
+            pipeline
+                .run_from_path_with_stages(source, device, &options)
+                .map_err(anyhow::Error::from)?,
+        ]
     } else {
         pipeline
             .run_many_from_path(source, device, &options)
@@ -4320,13 +4354,13 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{inspect_model, normalize_weights, run_model, Cli, Command, RunArgs};
+    use super::{Cli, Command, RunArgs, inspect_model, normalize_weights, run_model};
     use lux3d_core::{
-        test_support::{
-            canonical_package_dir, resolve_raw_model_dir_for_tests, runtime_root, workspace_root,
-            GpuTestLock,
-        },
         ModelFamily,
+        test_support::{
+            GpuTestLock, canonical_package_dir, resolve_raw_model_dir_for_tests, runtime_root,
+            workspace_root,
+        },
     };
 
     fn repo_root() -> PathBuf {
@@ -5529,7 +5563,9 @@ mod tests {
         assert_eq!(None, args.timesteps);
         let defaults = super::TripoSgRunOptions::default();
         assert_eq!(
-            (50usize, 7.0f32, 42u64, 2048usize, 8u32, 9u32, true, 9u32, 16384usize),
+            (
+                50usize, 7.0f32, 42u64, 2048usize, 8u32, 9u32, true, 9u32, 16384usize
+            ),
             (
                 defaults.steps,
                 defaults.guidance_scale,
@@ -8171,9 +8207,10 @@ mod tests {
         };
 
         let err = run_model(args).expect_err("invalid marching-cubes resolution must fail");
-        assert!(err
-            .to_string()
-            .contains("--mc-resolution must be at least 2"));
+        assert!(
+            err.to_string()
+                .contains("--mc-resolution must be at least 2")
+        );
     }
 
     #[test]

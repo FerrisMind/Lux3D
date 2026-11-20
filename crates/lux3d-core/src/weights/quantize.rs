@@ -11,21 +11,22 @@
 //! loaders reshape them back after dequantization
 //! ([`crate::runtime::nn_blocks::get_weight_shaped`]).
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use candle_core::quantized::{gguf_file, GgmlDType, QTensor};
+use candle_core::quantized::{GgmlDType, QTensor, gguf_file};
 use candle_core::safetensors::MmapedSafetensors;
 use candle_core::{Device, Tensor};
 
 use crate::{
+    Result,
     contracts::ModelFamily,
     error::Lux3dError,
     weights::{
         GGUF_FAMILY_KEY, GGUF_RESOLVED_CONFIG_KEY, GGUF_VARIANT_KEY, RESOLVED_CONFIG_FILENAME,
         TRIPOSG_SCRIBBLE_VARIANT,
     },
-    Result,
 };
 
 /// Quantization policy for [`quantize_checkpoint`].
@@ -52,6 +53,33 @@ impl Default for QuantizeOptions {
             fallback: GgmlDType::F16,
             all_2d: false,
             prefixes: Vec::new(),
+        }
+    }
+}
+
+/// An additional safetensors file merged into a standalone GGUF.
+///
+/// Used for stage checkpoints that live outside the canonical package, such
+/// as the TRELLIS.2 `shape_enc_next_dc_f16c32_fp16` encoder. Every tensor is
+/// written as `<prefix>.<original name>`; the merged tensors follow the
+/// canonical file's tensors in the output order, so the GGUF layout stays
+/// deterministic. The merge file must not reuse a name from the canonical
+/// package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuantizeMergeSource {
+    /// Safetensors file to merge.
+    pub path: PathBuf,
+    /// Tensor-name prefix (for example `shape_enc`), with surrounding dots
+    /// trimmed.
+    pub prefix: String,
+}
+
+impl QuantizeMergeSource {
+    pub fn new(path: impl AsRef<Path>, prefix: impl Into<String>) -> Self {
+        let prefix = prefix.into().trim_matches('.').to_string();
+        Self {
+            path: path.as_ref().to_path_buf(),
+            prefix,
         }
     }
 }
@@ -109,6 +137,25 @@ pub fn quantize_checkpoint(
     options: QuantizeOptions,
 ) -> Result<QuantizeReport> {
     quantize_checkpoint_with_family(source, output, family.as_str(), options)
+}
+
+/// Quantize a canonical `model.safetensors` and merge extra safetensors
+/// stages into the same standalone GGUF, prefixing each stage's tensor names
+/// (for example `shape_enc.input_layer.weight`).
+pub fn quantize_checkpoint_with_merges(
+    source: &Path,
+    output: &Path,
+    family: ModelFamily,
+    options: QuantizeOptions,
+    merge_sources: &[QuantizeMergeSource],
+) -> Result<QuantizeReport> {
+    quantize_checkpoint_with_family_and_merges(
+        source,
+        output,
+        family.as_str(),
+        options,
+        merge_sources,
+    )
 }
 
 /// Resolve the TripoSG-scribble DiT safetensors from a raw
@@ -360,6 +407,111 @@ fn quantize_checkpoint_with_family(
     family: &str,
     options: QuantizeOptions,
 ) -> Result<QuantizeReport> {
+    quantize_checkpoint_with_family_and_merges(source, output, family, options, &[])
+}
+
+/// Load one safetensors source, prefix its tensor names, and append the
+/// quantized tensors to the package. `source_bytes` accumulates the input
+/// sizes so the report covers the canonical file plus every merge source.
+#[allow(clippy::too_many_arguments)]
+fn append_source_tensors(
+    source: &Path,
+    prefix: &str,
+    options: &QuantizeOptions,
+    names: &mut HashSet<String>,
+    tensors: &mut Vec<(String, QTensor)>,
+    quantized: &mut usize,
+    fallback: &mut usize,
+    skipped: &mut usize,
+    source_bytes: &mut u64,
+) -> Result<()> {
+    if !source.is_file() {
+        return Err(Lux3dError::MissingCanonicalArtifact {
+            path: source.to_path_buf(),
+        });
+    }
+    *source_bytes += fs::metadata(source)
+        .map_err(|err| Lux3dError::ModelAssetIo {
+            path: source.to_path_buf(),
+            source: err,
+        })?
+        .len();
+    // SAFETY: the file is read-only for the duration of this function and the
+    // mapping is dropped before returning.
+    let mmap =
+        unsafe { MmapedSafetensors::multi(std::slice::from_ref(&source)) }.map_err(|err| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!("failed to open {}: {err}", source.display()),
+            }
+        })?;
+    tensors.reserve(mmap.tensors().len());
+    for (name, view) in mmap.tensors() {
+        let output_name = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}.{name}")
+        };
+        if !names.insert(output_name.clone()) {
+            return Err(Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "duplicate tensor `{output_name}` while merging `{}`",
+                    source.display()
+                ),
+            });
+        }
+        let tensor = mmap.load(&name, &Device::Cpu).map_err(|source| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!("failed to load tensor `{name}`: {source}"),
+            }
+        })?;
+        // GGML has no scalar dtype representation; training-only buffers such
+        // as BatchNorm `num_batches_tracked` are skipped.
+        if tensor.rank() == 0 {
+            *skipped += 1;
+            continue;
+        }
+        let use_quant = should_quantize(&output_name, &tensor, options);
+        // Candle's GGUF reader rejects tensors with more than four
+        // dimensions. The only rank>4 tensors in canonical packages are 3D
+        // convolution kernels; store them as flat vectors (never quantized:
+        // the rank check in `should_quantize` already saw the original rank)
+        // and let the runtime loaders reshape after dequantization.
+        let stored = if tensor.rank() > 4 {
+            tensor
+                .flatten_all()
+                .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+                    message: format!("failed to flatten tensor `{output_name}`: {source}"),
+                })?
+        } else {
+            tensor
+        };
+        let dtype = if use_quant {
+            *quantized += 1;
+            options.dtype
+        } else {
+            *fallback += 1;
+            options.fallback
+        };
+        let qtensor = QTensor::quantize(&stored, dtype).map_err(|source| {
+            Lux3dError::CanonicalWeightsValidation {
+                message: format!(
+                    "failed to quantize tensor `{output_name}` {:?} to {dtype:?}: {source}",
+                    view.shape()
+                ),
+            }
+        })?;
+        tensors.push((output_name, qtensor));
+    }
+    Ok(())
+}
+
+fn quantize_checkpoint_with_family_and_merges(
+    source: &Path,
+    output: &Path,
+    family: &str,
+    options: QuantizeOptions,
+    merge_sources: &[QuantizeMergeSource],
+) -> Result<QuantizeReport> {
     if !source.is_file() {
         return Err(Lux3dError::MissingCanonicalArtifact {
             path: source.to_path_buf(),
@@ -373,69 +525,43 @@ fn quantize_checkpoint_with_family(
             ),
         });
     }
-    let source_bytes = fs::metadata(source)
-        .map_err(|err| Lux3dError::ModelAssetIo {
-            path: source.to_path_buf(),
-            source: err,
-        })?
-        .len();
-
-    // SAFETY: the canonical file is read-only for the duration of this
-    // function and the mapping is dropped before returning.
-    let mmap =
-        unsafe { MmapedSafetensors::multi(std::slice::from_ref(&source)) }.map_err(|err| {
-            Lux3dError::CanonicalWeightsValidation {
-                message: format!("failed to open {}: {err}", source.display()),
-            }
-        })?;
-
-    let mut tensors = Vec::with_capacity(mmap.tensors().len());
+    let mut source_bytes = 0u64;
+    let mut tensors = Vec::new();
+    let mut names = HashSet::new();
     let mut quantized = 0usize;
     let mut fallback = 0usize;
     let mut skipped = 0usize;
-    for (name, view) in mmap.tensors() {
-        let tensor = mmap.load(&name, &Device::Cpu).map_err(|source| {
-            Lux3dError::CanonicalWeightsValidation {
-                message: format!("failed to load tensor `{name}`: {source}"),
-            }
-        })?;
-        // GGML has no scalar dtype representation; training-only buffers such
-        // as BatchNorm `num_batches_tracked` are skipped.
-        if tensor.rank() == 0 {
-            skipped += 1;
-            continue;
-        }
-        let use_quant = should_quantize(&name, &tensor, &options);
-        // Candle's GGUF reader rejects tensors with more than four
-        // dimensions. The only rank>4 tensors in canonical packages are 3D
-        // convolution kernels; store them as flat vectors (never quantized:
-        // the rank check in `should_quantize` already saw the original rank)
-        // and let the runtime loaders reshape after dequantization.
-        let stored = if tensor.rank() > 4 {
-            tensor
-                .flatten_all()
-                .map_err(|source| Lux3dError::CanonicalWeightsValidation {
-                    message: format!("failed to flatten tensor `{name}`: {source}"),
-                })?
-        } else {
-            tensor
-        };
-        let dtype = if use_quant {
-            quantized += 1;
-            options.dtype
-        } else {
-            fallback += 1;
-            options.fallback
-        };
-        let qtensor = QTensor::quantize(&stored, dtype).map_err(|source| {
-            Lux3dError::CanonicalWeightsValidation {
+    append_source_tensors(
+        source,
+        "",
+        &options,
+        &mut names,
+        &mut tensors,
+        &mut quantized,
+        &mut fallback,
+        &mut skipped,
+        &mut source_bytes,
+    )?;
+    for merge in merge_sources {
+        if merge.prefix.is_empty() {
+            return Err(Lux3dError::CanonicalWeightsValidation {
                 message: format!(
-                    "failed to quantize tensor `{name}` {:?} to {dtype:?}: {source}",
-                    view.shape()
+                    "merge source `{}` has an empty tensor prefix",
+                    merge.path.display()
                 ),
-            }
-        })?;
-        tensors.push((name, qtensor));
+            });
+        }
+        append_source_tensors(
+            &merge.path,
+            &merge.prefix,
+            &options,
+            &mut names,
+            &mut tensors,
+            &mut quantized,
+            &mut fallback,
+            &mut skipped,
+            &mut source_bytes,
+        )?;
     }
 
     // Embed the sibling resolved config so the GGUF can be used on its own,
@@ -658,12 +784,13 @@ pub fn dtype_from_name(name: &str) -> Option<GgmlDType> {
 #[cfg(test)]
 mod tests {
     use super::{
-        dtype_from_name, dtype_name, quantize_auxiliary_checkpoint, quantize_checkpoint,
+        QuantizeMergeSource, QuantizeOptions, dtype_from_name, dtype_name,
+        quantize_auxiliary_checkpoint, quantize_checkpoint, quantize_checkpoint_with_merges,
         quantize_scribble_standalone, resolve_architecture, resolve_scribble_dit_source,
-        should_quantize, QuantizeOptions,
+        should_quantize,
     };
     use crate::contracts::ModelFamily;
-    use candle_core::quantized::{gguf_file, GgmlDType};
+    use candle_core::quantized::{GgmlDType, gguf_file};
     use candle_core::{Device, Tensor};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -862,9 +989,11 @@ mod tests {
         let content = read_gguf(&output);
         assert_eq!(gguf_architecture(&content), "vggt");
         assert_eq!(content.tensor_infos.len(), 4);
-        assert!(!content
-            .tensor_infos
-            .contains_key("transformer.blocks.0.num_batches_tracked"));
+        assert!(
+            !content
+                .tensor_infos
+                .contains_key("transformer.blocks.0.num_batches_tracked")
+        );
         assert_eq!(
             content.tensor_infos["transformer.blocks.0.attn.to_q.weight"].ggml_dtype,
             GgmlDType::Q8_0
@@ -881,6 +1010,89 @@ mod tests {
             content.tensor_infos["transformer.blocks.0.table"].ggml_dtype,
             GgmlDType::F16
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quantize_merges_extra_stage_with_prefix() {
+        let dir = scratch_dir("merge");
+        let source = tiny_checkpoint(&dir, false);
+        let extra_dir = dir.join("shape_enc_stage");
+        std::fs::create_dir_all(&extra_dir).unwrap();
+        let cpu = Device::Cpu;
+        let mut extra = HashMap::new();
+        extra.insert(
+            "input_layer.weight".to_string(),
+            Tensor::rand(-0.05f32, 0.05f32, (64, 64), &cpu).unwrap(),
+        );
+        // Rank-5 sparse-convolution kernel: stored flattened and F16.
+        extra.insert(
+            "blocks.0.conv.weight".to_string(),
+            Tensor::rand(-0.05f32, 0.05f32, (64, 3, 3, 3, 64), &cpu).unwrap(),
+        );
+        let extra_path = extra_dir.join("shape_enc.safetensors");
+        candle_core::safetensors::save(&extra, &extra_path).unwrap();
+
+        let output = dir.join("model.gguf");
+        let report = quantize_checkpoint_with_merges(
+            &source,
+            &output,
+            ModelFamily::Trellis2,
+            QuantizeOptions::default(),
+            &[QuantizeMergeSource::new(&extra_path, ".shape_enc.")],
+        )
+        .unwrap();
+        assert_eq!(report.tensors, 6);
+        assert_eq!(report.quantized, 2);
+        assert_eq!(report.fallback_tensors, 4);
+
+        let content = read_gguf(&output);
+        assert_eq!(
+            content.tensor_infos["shape_enc.input_layer.weight"].ggml_dtype,
+            GgmlDType::Q8_0
+        );
+        let conv = &content.tensor_infos["shape_enc.blocks.0.conv.weight"];
+        assert_eq!(conv.ggml_dtype, GgmlDType::F16);
+        assert_eq!(conv.shape.dims(), &[64 * 27 * 64]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quantize_merge_rejects_duplicate_tensor_names() {
+        let dir = scratch_dir("merge-duplicate");
+        let source = tiny_checkpoint(&dir, false);
+        let extra_dir = dir.join("duplicate");
+        std::fs::create_dir_all(&extra_dir).unwrap();
+        let cpu = Device::Cpu;
+        let mut extra = HashMap::new();
+        extra.insert(
+            "to_q.weight".to_string(),
+            Tensor::rand(-0.05f32, 0.05f32, (64, 64), &cpu).unwrap(),
+        );
+        let extra_path = extra_dir.join("duplicate.safetensors");
+        candle_core::safetensors::save(&extra, &extra_path).unwrap();
+        let error = quantize_checkpoint_with_merges(
+            &source,
+            &dir.join("model.gguf"),
+            ModelFamily::Trellis2,
+            QuantizeOptions::default(),
+            &[QuantizeMergeSource::new(&extra_path, "")],
+        )
+        .expect_err("empty prefix rejected before opening the merge source");
+        assert!(error.to_string().contains("empty tensor prefix"));
+
+        let error = quantize_checkpoint_with_merges(
+            &source,
+            &dir.join("model.gguf"),
+            ModelFamily::Trellis2,
+            QuantizeOptions::default(),
+            &[QuantizeMergeSource::new(
+                &extra_path,
+                "transformer.blocks.0.attn",
+            )],
+        )
+        .expect_err("duplicate merged name rejected");
+        assert!(error.to_string().contains("duplicate tensor"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

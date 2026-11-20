@@ -1079,8 +1079,9 @@ As a user, I can texture an existing mesh from one condition image and write a t
   then validates the guided decode reconstructs the voxel set ✅
 - `runtime/trellis2_texture.rs:Trellis2Pipeline::load_shape_encoder()` /
   `load_trellis2_shape_encoder_from_model_assets()` — raw stage file,
-  `external/shape_enc/model.safetensors` beside a canonical/GGUF package, or
-  `shape_enc.*` keys in a merged canonical package ✅
+  `external/shape_enc/model.safetensors` beside a canonical package, or
+  `shape_enc.*` tensors in a merged canonical safetensors file or standalone
+  GGUF (`weights quantize --merge-source`) ✅
 - `runtime/trellis2.rs:build_trellis2_textured_mesh()` — xatlas unwrap + area-weighted
   normals + PBR bake into `Trellis2Stages::textured` ✅
 - `export/trellis2.rs:Trellis2ExportStage::write_textured_glb()` — embedded PNGs, UVs,
@@ -1148,11 +1149,12 @@ As a user, I know exactly which flags apply and what the output contains.
   2048 (release build, this tree); cost scales with `texture_size^2` ✅
 - Uncovered texels use a TELEA approximation (onion-peel, `1/d^2`), not `cv2.inpaint` ✅
 
-**Weight requirement:** the merged canonical/GGUF file has no `shape_enc` stage. The
-encoder loads `<model-dir>/ckpts/shape_enc_next_dc_f16c32_fp16.safetensors` (raw
-checkpoint layout) or `<model-dir>/external/shape_enc/model.safetensors` (sidecar next
-to a canonical `model.gguf`); `shape_enc.*` keys in a merged safetensors package are
-also honored. A q8\_0 GGUF + external fp16 encoder + `external/dinov3` package completed
+**Weight requirement:** the canonical package in this tree predates the shape-encoder
+merge. The encoder loads `<model-dir>/ckpts/shape_enc_next_dc_f16c32_fp16.safetensors`
+(raw checkpoint layout), `<model-dir>/external/shape_enc/model.safetensors` (sidecar next
+to a canonical `model.gguf`), or `shape_enc.*` tensors embedded in a merged safetensors
+file or standalone GGUF (`weights quantize --merge-source ... --merge-prefix shape_enc`).
+A q8\_0 GGUF + external fp16 encoder + `external/dinov3` package completed
 the CUDA texturing smoke (`--texture-resolution 512 --texture-size 512`) on the q8 512
 shape output (507,540 vertices / 1,000,200 faces): 3,241 charts, 2 atlases, 110,789 valid
 texels, 30 MB PBR GLB with base-color and metallic-roughness PNGs. A geometry-only q8 1024
@@ -1336,10 +1338,12 @@ Also touched: `crates/lux3d-core/tests/vggt_export.rs` (fixture gains empty `pos
 - **Metal:** CI builds `lux3d-core` with `--features metal` and runs the lib/quant-probe
   checks; no model inference parity is validated in this repository.
 - **Laya:** not used by this workspace.
-- **TRELLIS.2 texturing weights:** the merged canonical/GGUF weight file lacks
-  `shape_enc`; `--texture-mesh` needs the raw stage file or an
-  `external/shape_enc/model.safetensors` sidecar (plus `external/dinov3` for the
-  quantized canonical-GGUF layout). A package with neither fails with a clear error.
+- **TRELLIS.2 texturing weights:** the canonical `model.safetensors` in this tree lacks
+  `shape_enc`; `--texture-mesh` needs the raw stage file, an
+  `external/shape_enc/model.safetensors` sidecar (plus `external/dinov3` for older
+  quantized GGUF layouts), or a standalone GGUF built with
+  `weights quantize --merge-source ... --merge-prefix shape_enc`. A package with none
+  fails with a clear error.
 - **TRELLIS.2 `1536_cascade`:** variant dispatch and token-budget math are tested; no
   real-weight end-to-end run is recorded.
 - **TRELLIS.2 remesh branch:** the remesher is a direct port of the official CuMesh
@@ -1423,7 +1427,8 @@ Also touched: `crates/lux3d-core/tests/vggt_export.rs` (fixture gains empty `pos
   preprocess/batch/COLMAP/track/GLB flags, and `--return-latent`. `num_samples > 1`
   serves sample 0 through `/content`; the remaining samples stay in the workspace.
 - **Quantization:** TRELLIS.2 DiT-only GGUF policy is unchanged; the texturing-only
-  `shape_enc` checkpoint is outside the canonical package and is never quantized.
+  `shape_enc` checkpoint is outside the canonical package. Standalone builds embed it
+  with `--merge-source`, stored at the fallback dtype (F16), never block-quantized.
 
 ---
 

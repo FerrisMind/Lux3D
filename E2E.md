@@ -77,11 +77,13 @@ Official source: `candle-3d-refs/TRELLIS.2` (`example.py`, `app.py`,
 
 Both image-to-3D tests pass `--no-remesh` to avoid the CPU-only narrow-band
 remesh bottleneck (same reasoning as the matrix row above). The standalone
-`trellis2-q4_k` GGUF package has no `shape_enc` stage, so `--texture-mesh` uses
-the raw checkpoint tree at
-`candle-3d/models/TRELLIS.2-4B` (override with
-`LUX3D_E2E_TRELLIS2_TEXTURE_MODEL`). The image-to-3D tests exercise the
-standalone package.
+`trellis2-q4_k` GGUF package embeds the shape encoder as `shape_enc.*` tensors
+(the package is built with
+`weights quantize ... --merge-source ckpts/shape_enc_next_dc_f16c32_fp16.safetensors --merge-prefix shape_enc`),
+so `--texture-mesh` uses the same standalone package as image-to-3D. Set
+`LUX3D_E2E_TRELLIS2_TEXTURE_MODEL` only to compare against the raw checkpoint
+tree at `candle-3d/models/TRELLIS.2-4B`; the encoder is not quantized and stays
+F16 in the GGUF.
 
 ### RMBG-2.0
 

@@ -30,10 +30,11 @@ pub use runtime::{RmbgConfig, RmbgModel};
 pub use weights::{
     AuxiliaryWeightSetPaths, AuxiliaryWeightsManifest, CanonicalChecksumEntry, CanonicalChecksums,
     CanonicalWeightSet, CanonicalWeightSetPaths, CanonicalWeightsManifest, CanonicalizationPlan,
-    FutureWeightLoader, ModelAssetOptions, QuantizeOptions, QuantizeReport, RawWeightFormat,
-    WeightLocator, dtype_from_name, dtype_name, ensure_canonical_weights,
+    FutureWeightLoader, ModelAssetOptions, QuantizeMergeSource, QuantizeOptions, QuantizeReport,
+    RawWeightFormat, WeightLocator, dtype_from_name, dtype_name, ensure_canonical_weights,
     load_auxiliary_canonical_weights, load_canonical_weights, quantize_auxiliary_checkpoint,
-    quantize_checkpoint, quantize_scribble_standalone, resolve_scribble_dit_source,
+    quantize_checkpoint, quantize_checkpoint_with_merges, quantize_scribble_standalone,
+    resolve_scribble_dit_source,
 };
 
 /// Families whose GPU timings and output parity were validated with candle's
