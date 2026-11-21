@@ -28,6 +28,23 @@ use crate::{
     preprocess::Pi3xPreprocessStage,
 };
 
+/// Replication padding with a contiguous input.
+///
+/// `candle_nn::ops::replication_pad2d` builds the border rows with
+/// `narrow` + `cat`. A non-contiguous input (the bilinear upsample output is
+/// channel-last) makes candle's cat take the `copy_strided_src` fallback; on
+/// Vulkan that path runs at single-digit MB/s and a single [1,64,518,518] pad
+/// measured ~8 s. Materializing the input first costs one 68 MB copy (~1 ms)
+/// and keeps the cat on the 2D-copy fast path.
+fn replication_pad2d(xs: &Tensor, pad: usize) -> CandleResult<Tensor> {
+    let xs = if xs.is_contiguous() {
+        xs.clone()
+    } else {
+        xs.contiguous()?
+    };
+    candle_nn::ops::replication_pad2d(&xs, pad)
+}
+
 #[cfg(feature = "vision-preproc")]
 use super::vision_preproc;
 use super::{
@@ -1488,10 +1505,10 @@ impl Pi3xResidualConvBlock {
             xs.clone()
         };
         let x = self.norm1.forward(xs)?.relu()?;
-        let x = candle_nn::ops::replication_pad2d(&x, 1)?;
+        let x = replication_pad2d(&x, 1)?;
         let x = self.conv1.forward(&x)?;
         let x = self.norm2.forward(&x)?.relu()?;
-        let x = candle_nn::ops::replication_pad2d(&x, 1)?;
+        let x = replication_pad2d(&x, 1)?;
         let x = self.conv2.forward(&x)?;
         x + residual
     }
@@ -1544,7 +1561,7 @@ impl Pi3xUpsampleBlock {
 
     fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
         let x = self.upsample.forward(xs)?;
-        let x = candle_nn::ops::replication_pad2d(&x, 1)?;
+        let x = replication_pad2d(&x, 1)?;
         let mut x = self.conv.forward(&x)?;
         for block in &self.residuals {
             x = block.forward(&x)?;
@@ -1581,7 +1598,7 @@ impl Pi3xOutputBlock {
     fn forward(&self, xs: &Tensor, kernel_size: usize) -> CandleResult<Tensor> {
         let stage_time = std::env::var_os("LUX3D_STAGE_TIME").is_some();
         let mut t_op = std::time::Instant::now();
-        let x = candle_nn::ops::replication_pad2d(xs, 1)?;
+        let x = replication_pad2d(xs, 1)?;
         if stage_time {
             eprintln!(
                 "[stage]       outblock.pad: {:.2}s",
@@ -1598,7 +1615,7 @@ impl Pi3xOutputBlock {
         }
         t_op = std::time::Instant::now();
         let x = if kernel_size > 1 {
-            candle_nn::ops::replication_pad2d(&x, kernel_size / 2)?
+            replication_pad2d(&x, kernel_size / 2)?
         } else {
             x
         };
