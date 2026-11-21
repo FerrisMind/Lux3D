@@ -1,6 +1,71 @@
 # Performance notes: measured results and remaining levers (RTX 3060 12 GiB, Windows WDDM)
 
-Status: 2026-09-07, candle `wgpu/vulkan` rev `b2522dd6`, candle-3d: candle bumped efb506c9 -> b2522dd6.
+Status: 2026-11-21, candle rev `9c74af75`, RTX 3060 12 GiB / Windows 11 WDDM.
+The 2026-11-21 section below supersedes the whole-model criterion numbers from
+2026-09-07 for e2e work; the older sections stay as measurement history.
+
+## E2E Vulkan/CUDA: 2.62x -> 1.80x (2026-11-21)
+
+Full 18-scenario suite, same binary and weights, `--test-threads=1`:
+CUDA **955.13 s**, Vulkan **1717.21 s** (18/18 on both). Pre-fix Vulkan was
+2638.52 s. Full per-scenario table: [`E2E-RESULTS.md`](E2E-RESULTS.md).
+
+Fixes, all measurement-gated (numbers are e2e wall time):
+
+| Fix | Before -> after |
+|---|---|
+| TripoSG-scribble GGUF: quantize `vae.` in addition to `transformer.` (the F16 SDF decoder ran 3.4 TFLOPS; packed Q8 runs 8.5) | 764.56 -> 141.01 s |
+| Pi3X: `.contiguous()` before `replication_pad2d` (strided `cat` on the channel-last upsample output hit `copy_strided_src`, ~8 s per pad) | 33.36 -> 9.53 s |
+| TripoSR SDF query chunk 8192 -> 32768 (~50 fixed dispatches per chunk; 128^3 = 256 chunks at 8192) | 13.58 -> 5.31 s |
+| TripoSG/Scribble query chunk 16384 -> 32768 (dense/hierarchical only), K/V projected once per grid, VAE attn chunk 1024 -> 6144 | surface 69.20 -> 59.92 s; image 28.87 -> 28.02 s |
+| VGGT `fmap_norm`: replace the NHWC transpose + native LayerNorm with a ones-GEMM channel norm on the contiguous NCHW feature map | track head 7.14 -> 0.57 s; queries 19.39 -> 11.27 s; auto-FPS 36.43 -> 13.43 s |
+
+### Root causes worth remembering
+
+* **Vulkan `copy_strided_src` is the recurring trap.** A permute/NHWC view
+  materializes at ~16 MB/s. In VGGT it turned one `[1,3,128,259,259]` LayerNorm
+  into 6.47 s; in Pi3X a padded `cat` cost ~8 s. Always check `.is_contiguous()`
+  before pad/cat/layer_norm on Vulkan, or avoid the layout change entirely.
+* **Tiny-tensor dispatch cost dominates.** VGGT track adds ~4,885 dispatches
+  per pass; `CANDLE_VULKAN_CPU_PROFILE=1` measured 472 us average submit and
+  68 ms average flush drain. The tracker loop itself is only 0.01-0.02 s per
+  op once the transpose is gone.
+* **Kernel ceiling is real.** Primitive benchmark (`LUX3D_BENCH_KIND=primitives`):
+
+  | kernel | Vulkan | CUDA | ratio |
+  |---|---:|---:|---:|
+  | Q8_0 GEMM 4096x1024x1024 | 8.37 TFLOPS | 26.29 TFLOPS | 3.14x |
+  | Q8_0 GEMM 1024x4096x1024 | 7.53 TFLOPS | 26.81 TFLOPS | 3.56x |
+  | Q4_K GEMM 4096x1024x1024 | 4.92 TFLOPS | 25.45 TFLOPS | 5.17x |
+  | dense F16 4096x1024x1024 | 3.06 TFLOPS | 23.47 TFLOPS | 7.67x |
+  | dense F32 4096x1024x1024 | 4.35 TFLOPS | 3.32 TFLOPS | 0.76x |
+
+  Every q8 scenario is bounded near 2-3x by this alone. Dense F32 is the one
+  kernel where Vulkan wins, which is why TRELLIS.2 F32 sparse-conv stages have
+  lower ratios despite being dispatch-bound.
+* **CPU floor dilutes backend ratios.** TRELLIS.2 `uv_unwrap` (xatlas, 26k
+  charts) is 182 s of the 193 s texture-export stage on CUDA; the bake adds
+  8.9 s. `trellis2_texture_mesh` is 292.11 s on Vulkan vs 258.78 s on CUDA
+  (1.13x) because both backends wait on the same CPU work.
+
+### Remaining dispatch-bound work
+
+TripoSG batch / scribble dense decode (16.7M-67M SDF queries, ~40 fixed
+dispatches per 32k chunk) and TRELLIS.2 sparse conv (27 offsets x
+index_select + matmul + add) still pay Vulkan's per-dispatch submit cost.
+VGGT tracking is no longer in this group.
+
+### Measured dead ends (2026-11-21)
+
+* Reusing the VGGT DPT feature maps across auto-FPS passes: measured neutral
+  before the norm fix (20.99 vs 21.28 s), because the 6.47 s norm ran per
+  tracker call. Not revisited after the fix: the extractor is now 0.26-1.42 s
+  per pass, and the API change would only remove that.
+* TripoSG flash decoder with a 32k chunk: image mesh regressed 19.4 -> 22.95 s;
+  kept the 16384 cap.
+* `LUX3D_VULKAN_DEQUANT_WEIGHTS` for dense F16: image 7.47 -> 13.43 s infer.
+* TripoSR 65536 query chunk: slower than 32768 through allocator churn.
+* VGGT inflight budget 512 MB vs 1 GB: 17.57 s vs 24.34 s.
 
 ## Whole-model criterion on candle b2522dd6 (2026-09-07)
 
