@@ -158,6 +158,33 @@ fn triposg_vae_dtype(device: &Device, dtype: DType) -> DType {
     }
 }
 
+/// Effective SDF-query chunk for one device.
+///
+/// Each chunk costs one host/device round-trip plus ~40 fixed dispatches
+/// (cross-attention projections, norms, the FFN and the output projection),
+/// and on Vulkan every dispatch carries a fixed driver cost. Measured on the
+/// scribble dense grid (16.7M points, Q8 VAE): 16k = 136 s, 32k = 113 s,
+/// 64k = VRAM thrash (11.5 GiB / 12 GiB) and slower. The WGPU VAE decode runs
+/// dense F32 with less memory headroom, so it keeps the smaller chunk.
+fn effective_query_chunk(device: &Device, requested: usize) -> usize {
+    if device.is_wgpu() {
+        requested.min(16384)
+    } else {
+        requested
+    }
+}
+
+/// Effective SDF-query chunk for the flash decoder.
+///
+/// The flash path's refinement levels allocate large candidate/coordinate
+/// buffers on top of the dense first level; unlike the plain hierarchical
+/// grid, a 32k chunk regressed the standard TripoSG image mesh on Vulkan
+/// (22.95 s vs 19.4 s at 16k) through allocator churn. Keep the measured
+/// 16k cap for every device (the pre-32k default, so CUDA is unchanged).
+fn effective_flash_query_chunk(_device: &Device, requested: usize) -> usize {
+    requested.min(16384)
+}
+
 /// Per-run options for the TripoSG-scribble pipeline. Defaults replicate the
 /// shipped `run_triposg_scribble` call
 /// (`scripts/inference_triposg_scribble.py:32-40`): 16 rectified-flow steps,
@@ -201,7 +228,7 @@ impl Default for TripoSgScribbleRunOptions {
             num_tokens: TRIPOSG_SCRIBBLE_NUM_TOKENS,
             dense_octree_depth: TRIPOSG_SCRIBBLE_DENSE_OCTREE_DEPTH,
             hierarchical_octree_depth: TRIPOSG_SCRIBBLE_HIERARCHICAL_OCTREE_DEPTH,
-            query_chunk_size: 16384,
+            query_chunk_size: 32768,
             timesteps: None,
             bounds: None,
             faces: None,
@@ -582,7 +609,7 @@ impl Default for TripoSgRunOptions {
             hierarchical_octree_depth: 9,
             use_flash_decoder: true,
             flash_octree_depth: 9,
-            query_chunk_size: 16384,
+            query_chunk_size: 32768,
             timesteps: None,
             bounds: None,
             faces: None,
@@ -1784,7 +1811,7 @@ impl TripoSgScribblePipeline {
             bounds,
             options.dense_octree_depth,
             options.hierarchical_octree_depth,
-            options.query_chunk_size,
+            effective_query_chunk(latents.device(), options.query_chunk_size),
         )
         .map_err(|source| Lux3dError::CanonicalWeightsValidation {
             message: format!("TripoSG-scribble SDF grid decode failed: {source}"),
@@ -2425,7 +2452,7 @@ impl TripoSgPipeline {
                 &latents,
                 bounds,
                 options.flash_octree_depth,
-                options.query_chunk_size,
+                effective_flash_query_chunk(latents.device(), options.query_chunk_size),
             )
             .map_err(|source| Lux3dError::CanonicalWeightsValidation {
                 message: format!("TripoSG flash SDF grid decode failed: {source}"),
@@ -2453,7 +2480,7 @@ impl TripoSgPipeline {
                 bounds,
                 options.dense_octree_depth,
                 options.hierarchical_octree_depth,
-                options.query_chunk_size,
+                effective_query_chunk(latents.device(), options.query_chunk_size),
             )
             .map_err(|source| Lux3dError::CanonicalWeightsValidation {
                 message: format!("TripoSG SDF grid decode failed: {source}"),

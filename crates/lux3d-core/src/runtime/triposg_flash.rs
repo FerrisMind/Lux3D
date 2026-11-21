@@ -96,9 +96,13 @@ pub fn flash_sdf_grid(
     }
     let resolutions = flash_resolutions(octree_depth);
     let kv = decoder.kv_cache(latents)?;
+    // Query-independent cross-attention projections: compute once and reuse
+    // across every dense/refinement chunk (see decode_points_prepared).
+    let (k_heads, v_heads) = decoder.prepare_cross_kv(&kv)?;
     let mut grid = dense_flash_level(
         decoder,
-        &kv,
+        &k_heads,
+        &v_heads,
         bounds,
         resolutions[0],
         chunk,
@@ -109,7 +113,8 @@ pub fn flash_sdf_grid(
         let final_level = index + 2 == resolutions.len();
         grid = refine_flash_level_with_final(
             decoder,
-            &kv,
+            &k_heads,
+            &v_heads,
             &grid,
             bounds,
             resolution,
@@ -134,7 +139,8 @@ pub fn flash_sdf_grid(
 /// Dense first level: `(r + 1)^3` NumPy-float32 linspace points, z-fastest.
 fn dense_flash_level(
     decoder: &TripoSgVaeDecoder,
-    kv: &Tensor,
+    k_heads: &Tensor,
+    v_heads: &Tensor,
     bounds: [f32; 6],
     resolution: usize,
     chunk: usize,
@@ -156,14 +162,18 @@ fn dense_flash_level(
                 points.push(axes[1][y]);
                 points.push(axes[2][z]);
                 if points.len() / 3 == step {
-                    values.extend(decode_points(decoder, kv, &points, device, chunk)?);
+                    values.extend(decode_points(
+                        decoder, k_heads, v_heads, &points, device, chunk,
+                    )?);
                     points.clear();
                 }
             }
         }
     }
     if !points.is_empty() {
-        values.extend(decode_points(decoder, kv, &points, device, chunk)?);
+        values.extend(decode_points(
+            decoder, k_heads, v_heads, &points, device, chunk,
+        )?);
     }
     Ok(TripoSgFlashGrid {
         depth: resolution.trailing_zeros(),
@@ -176,7 +186,8 @@ fn dense_flash_level(
 #[allow(clippy::too_many_arguments)]
 fn refine_flash_level_with_final(
     decoder: &TripoSgVaeDecoder,
-    kv: &Tensor,
+    k_heads: &Tensor,
+    v_heads: &Tensor,
     low: &TripoSgFlashGrid,
     bounds: [f32; 6],
     resolution: usize,
@@ -247,7 +258,7 @@ fn refine_flash_level_with_final(
     while start < indices.len() {
         let len = (indices.len() - start).min(step);
         let points = &coordinates[start * 3..(start + len) * 3];
-        let decoded = decode_points(decoder, kv, points, device, chunk)?;
+        let decoded = decode_points(decoder, k_heads, v_heads, points, device, chunk)?;
         for (offset, value) in decoded.into_iter().enumerate() {
             values[indices[start + offset]] = value;
         }
@@ -263,7 +274,8 @@ fn refine_flash_level_with_final(
 
 fn decode_points(
     decoder: &TripoSgVaeDecoder,
-    kv: &Tensor,
+    k_heads: &Tensor,
+    v_heads: &Tensor,
     coordinates: &[f32],
     device: &candle_core::Device,
     chunk: usize,
@@ -273,7 +285,9 @@ fn decode_points(
     }
     let len = coordinates.len() / 3;
     let points = Tensor::from_vec(coordinates.to_vec(), (len, 3), device)?;
-    decoder.decode_points(kv, &points, chunk)?.to_vec1::<f32>()
+    decoder
+        .decode_points_prepared(k_heads, v_heads, &points, chunk)?
+        .to_vec1::<f32>()
 }
 
 /// `np.linspace(start, stop, count, dtype=np.float32)` (verified bit-exact

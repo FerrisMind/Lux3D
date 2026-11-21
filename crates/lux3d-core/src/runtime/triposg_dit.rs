@@ -62,7 +62,9 @@ fn debug_stage(label: &str, xs: &Tensor) {
     }
 }
 
-/// Self-attention query chunk (`LUX3D_TRIPOSG_ATTN_CHUNK`, default 1024).
+/// Self-attention query chunk (`LUX3D_TRIPOSG_ATTN_CHUNK`, default 6144).
+/// The DiT sequence is at most `num_tokens` (1024 by default), so this is
+/// effectively one shot; the larger default matches the VAE decode knob.
 fn attn_chunk_size() -> usize {
     static CHUNK: OnceLock<usize> = OnceLock::new();
     *CHUNK.get_or_init(|| {
@@ -70,7 +72,7 @@ fn attn_chunk_size() -> usize {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
-            .unwrap_or(1024)
+            .unwrap_or(6144)
     })
 }
 

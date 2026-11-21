@@ -97,7 +97,11 @@ pub fn hierarchical_sdf_grid(
     // The kv cache is computed ONCE and shared by the dense pass and every
     // refinement level (the reference lambda re-enters vae.decode per call,
     // which recomputes it — numerically identical, ours is just cheaper).
+    // The cross-attention K/V projections are also query-independent, so
+    // project them once here instead of once per decoder call: on Vulkan each
+    // extra call costs ~10 dispatches and the dense grid has 1k+ calls.
     let kv = decoder.kv_cache(latents)?;
+    let (k_heads, v_heads) = decoder.prepare_cross_kv(&kv)?;
 
     // ---- Dense pass -------------------------------------------------------
     let n = 1usize << dense_depth;
@@ -119,7 +123,7 @@ pub fn hierarchical_sdf_grid(
             points.push(coords[2][z]);
         }
         let points = Tensor::from_vec(points, (len, 3), latents.device())?;
-        let out = decoder.decode_points(&kv, &points, chunk)?;
+        let out = decoder.decode_points_prepared(&k_heads, &v_heads, &points, chunk)?;
         values.extend(out.to_vec1::<f32>()?);
         start += len;
     }
@@ -132,7 +136,16 @@ pub fn hierarchical_sdf_grid(
 
     // ---- Refinement levels ------------------------------------------------
     for level in (dense_depth + 1)..=hierarchical_depth {
-        grid = refine_level(decoder, &kv, grid, bounds, level, chunk, latents.device())?;
+        grid = refine_level(
+            decoder,
+            &k_heads,
+            &v_heads,
+            grid,
+            bounds,
+            level,
+            chunk,
+            latents.device(),
+        )?;
     }
     Ok(grid)
 }
@@ -141,7 +154,8 @@ pub fn hierarchical_sdf_grid(
 /// (side N = 2n, depth `level`).
 fn refine_level(
     decoder: &TripoSgVaeDecoder,
-    kv: &Tensor,
+    k_heads: &Tensor,
+    v_heads: &Tensor,
     low: TripoSgSdfGrid,
     bounds: [f32; 6],
     level: u32,
@@ -254,7 +268,7 @@ fn refine_level(
             }
         }
         let points = Tensor::from_vec(points, (len, 3), device)?;
-        let out = decoder.decode_points(kv, &points, chunk)?;
+        let out = decoder.decode_points_prepared(k_heads, v_heads, &points, chunk)?;
         let out = out.to_vec1::<f32>()?;
         for (cell_index, &(x, y, z)) in batch.iter().enumerate() {
             for (child, &(cx, cy, cz)) in [
