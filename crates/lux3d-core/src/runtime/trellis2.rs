@@ -1199,7 +1199,16 @@ pub fn build_trellis2_textured_mesh_snapped(
     if !textured_export_will_run(mesh, options) {
         return Ok(None);
     }
+    let stage_time = std::env::var_os("LUX3D_STAGE_TIME").is_some();
+    let t_bvh = std::time::Instant::now();
     let original_surface = MeshBvh::build(original_vertices, original_faces)?;
+    if stage_time {
+        eprintln!(
+            "[stage]       snap bvh: {:.2}s ({} faces)",
+            t_bvh.elapsed().as_secs_f64(),
+            original_faces.len() / 3
+        );
+    }
     build_trellis2_textured_mesh_impl(mesh, options, Some(&original_surface))
 }
 
@@ -1240,11 +1249,21 @@ fn build_trellis2_textured_mesh_impl(
         .chunks_exact(3)
         .map(|chunk| [chunk[0], chunk[1], chunk[2]])
         .collect();
+    let stage_time = std::env::var_os("LUX3D_STAGE_TIME").is_some();
+    let t_uv = std::time::Instant::now();
     let atlas = uv_unwrap(&vertices, &faces, options.texture_size as u32).map_err(|source| {
         Lux3dError::CanonicalWeightsValidation {
             message: format!("Trellis2 UV unwrap failed: {source}"),
         }
     })?;
+    if stage_time {
+        eprintln!(
+            "[stage]       uv unwrap: {:.2}s ({} charts, {} atlases)",
+            t_uv.elapsed().as_secs_f64(),
+            atlas.chart_count,
+            atlas.atlas_count
+        );
+    }
     // Normals belong to the pre-unwrap surface: compute them on the input
     // vertices/faces, then gather through the atlas `vmapping`. Recomputing
     // on atlas vertices would give duplicated seam vertices chart-local
@@ -1255,6 +1274,7 @@ fn build_trellis2_textured_mesh_impl(
         .iter()
         .map(|&original| base_normals[original as usize])
         .collect();
+    let t_bake = std::time::Instant::now();
     let texture = match original_surface {
         Some(original_surface) => bake_pbr_texture_with_snap(
             &atlas.vertices,
@@ -1279,6 +1299,14 @@ fn build_trellis2_textured_mesh_impl(
     .map_err(|source| Lux3dError::CanonicalWeightsValidation {
         message: format!("Trellis2 PBR texture bake failed: {source}"),
     })?;
+    if stage_time {
+        eprintln!(
+            "[stage]       pbr bake: {:.2}s ({} atlas faces, {} voxels)",
+            t_bake.elapsed().as_secs_f64(),
+            atlas.indices.len() / 3,
+            voxel_coords.len()
+        );
+    }
     Ok(Some(Trellis2TexturedMesh {
         vertices: atlas.vertices.iter().flatten().copied().collect(),
         faces: atlas.indices,
