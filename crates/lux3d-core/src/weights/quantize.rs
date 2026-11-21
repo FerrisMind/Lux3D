@@ -183,9 +183,12 @@ pub fn resolve_scribble_dit_source(source: &Path) -> Result<PathBuf> {
 
 /// Components merged into one standalone TripoSG-scribble GGUF.
 ///
-/// The order is fixed so the output tensor order is deterministic. Only the
-/// `transformer.` prefix is quantized by default; the other components stay in
-/// the fallback dtype, matching the evaluated DiT-only quantization policy.
+/// The order is fixed so the output tensor order is deterministic. The DiT
+/// and VAE are quantized by default: the VAE decoder is the hot path for mesh
+/// extraction (one GEMM pass over the whole SDF grid), and leaving it in F16
+/// made Vulkan mesh decode ~2.5x slower than the packed-Q8 path for no
+/// measurable quality benefit. DINOv2/CLIP stay in the fallback dtype because
+/// their Q8_0 drift reaches the mesh (see the scribble table in README.RU.md).
 const SCRIBBLE_STANDALONE_COMPONENTS: [(&str, &str); 4] = [
     (
         "transformer",
@@ -201,10 +204,12 @@ const SCRIBBLE_STANDALONE_COMPONENTS: [(&str, &str); 4] = [
 ///
 /// The output contains all four network components under `transformer.`,
 /// `vae.`, `image_encoder.` and `text_encoder.` prefixes plus the embedded
-/// resolved config and CLIP tokenizer documents. The quantizer keeps the
-/// reference policy: only rank-2 `.weight` tensors inside `transformer.` are
-/// quantized; every other tensor (including the whole VAE, DINOv2 and CLIP
-/// text encoder) is stored in the fallback dtype.
+/// resolved config and CLIP tokenizer documents. Rank-2 `.weight` tensors in
+/// the DiT and VAE are quantized by default (the VAE Q8_0 path is measured
+/// near-lossless and is the hot path for SDF mesh decode); DINOv2 and CLIP
+/// stay in the fallback dtype because their Q8_0 conditioning drift reaches
+/// the mesh. Embeddings, norms, biases and convolution kernels always stay in
+/// the fallback dtype.
 pub fn quantize_scribble_standalone(
     source: &Path,
     output: &Path,
@@ -226,7 +231,12 @@ pub fn quantize_scribble_standalone(
 
     let mut options = options;
     if options.prefixes.is_empty() {
+        // Measured policy (README.RU.md scribble table): quantizing the VAE
+        // decoder is near-lossless (0.006% CD rel, voxel IoU 0.991) and it is
+        // the hot path for SDF mesh extraction; DINOv2/CLIP Q8_0 drift reaches
+        // the mesh (0.18% CD, IoU 0.70), so those stay in the fallback dtype.
         options.prefixes.push("transformer.".to_string());
+        options.prefixes.push("vae.".to_string());
     }
 
     let mut tensors = Vec::new();
@@ -1176,8 +1186,10 @@ mod tests {
             quantize_scribble_standalone(&source, &output, QuantizeOptions::default()).unwrap();
         assert!(report.embedded_resolved_config);
         assert_eq!(report.tensors, 5);
-        assert_eq!(report.quantized, 1);
-        assert_eq!(report.fallback_tensors, 4);
+        // Default policy: DiT + VAE rank-2 linear weights (one each in the
+        // tiny fixture); DINOv2/CLIP stay in the fallback dtype.
+        assert_eq!(report.quantized, 2);
+        assert_eq!(report.fallback_tensors, 3);
         assert_eq!(report.skipped_tensors, 1);
 
         let content = read_gguf(&output);
@@ -1203,15 +1215,20 @@ mod tests {
             other => panic!("missing lux3d.components metadata: {other:?}"),
         }
 
-        // Only the transformer linear is quantized; the other components keep
+        // DiT and VAE rank-2 linears are quantized; the other components keep
         // the fallback dtype even though their tensors are rank-2 `.weight`.
-        assert_eq!(
-            content.tensor_infos["transformer.blocks.0.attn.to_q.weight"].ggml_dtype,
-            GgmlDType::Q8_0
-        );
+        for name in [
+            "transformer.blocks.0.attn.to_q.weight",
+            "vae.decoder.conv.weight",
+        ] {
+            assert_eq!(
+                content.tensor_infos[name].ggml_dtype,
+                GgmlDType::Q8_0,
+                "`{name}` must be quantized by the default policy"
+            );
+        }
         for name in [
             "transformer.blocks.0.norm.weight",
-            "vae.decoder.conv.weight",
             "image_encoder.embeddings.patch_embeddings.projection.weight",
             "text_encoder.text_model.encoder.layers.0.self_attn.q_proj.weight",
         ] {

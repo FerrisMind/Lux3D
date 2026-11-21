@@ -205,8 +205,9 @@ cargo run -p lux3d-cli -- weights normalize `
 # TripoSG-scribble standalone-пакет: один GGUF с DINOv2 image-энкодером,
 # DiT с двойным cross-attention, SDF VAE-декодером, CLIP text-энкодером и
 # CLIP-токенизатором. --source — каталог сырого чекпойнта
-# `VAST-AI/TripoSG-scribble`. Квантуются только линейные веса transformer;
-# остальные компоненты остаются в fallback dtype.
+# `VAST-AI/TripoSG-scribble`. Квантуются линейные веса DiT и VAE (VAE Q8_0
+# замерен как почти без потерь); DINOv2/CLIP остаются в fallback dtype.
+# Набор префиксов переопределяется повторяемыми `--prefix`.
 cargo run -p lux3d-cli -- weights quantize triposg --scribble --standalone `
   --source <raw-TripoSG-scribble-dir> `
   --output triposg-scribble-q8_0.gguf `
@@ -323,10 +324,10 @@ TripoSR 1 изображение при `--mc-resolution 256`):
 | TRELLIS.2-4B | q4_k | 6.52 GiB | 1070 + 284 shape_enc |
 | TripoSG-scribble | сырой чекпойнт F16 | 4.38 GiB | — |
 | TripoSG-scribble | canonical F16 | 4.38 GiB | — |
-| TripoSG-scribble | q8_0 standalone | 2.92 GiB | 308 матриц |
-| TripoSG-scribble | q6_k standalone | 2.54 GiB | 307 |
-| TripoSG-scribble | q5_k standalone | 2.33 GiB | 307 |
-| TripoSG-scribble | q4_k standalone | 2.13 GiB | 307 |
+| TripoSG-scribble | q8_0 standalone | 2.70 GiB | 467 матриц |
+| TripoSG-scribble | q6_k standalone | 2.27 GiB | 465 |
+| TripoSG-scribble | q5_k standalone | 2.03 GiB | 465 |
+| TripoSG-scribble | q4_k standalone | 1.81 GiB | 465 |
 
 F16 — чистое преобразование точности, не блочное квантование: все тензоры
 хранятся в 16 битах, линейные слои идут обычным путём без `QMatMul`. Цена —
@@ -351,10 +352,10 @@ F@1% = 1.000 на каждом бэкенде. Сборка:
 RMBG-1.4 (вспомогательный): F32 0.16 GiB → F16 0.08 GiB; записано 686
 тензоров, 112 rank-0 тренировочных буферов опущено.
 
-TripoSG-scribble сохраняет ту же DiT-only политику квантования, но с
-`--standalone` все четыре сети сливаются в один GGUF: квантуется только
-трансформер с двойным cross-attention, а CLIP text-энкодер, VAE SDF-декодер и
-DINOv2-энкодер скетча остаются в F16 fallback (не квантуются). Встроенный
+TripoSG-scribble квантует DiT и VAE-декодер, а с `--standalone` все четыре
+сети сливаются в один GGUF: CLIP text-энкодер и DINOv2-энкодер скетча
+остаются в F16 fallback, потому что их Q8_0-дрейф conditioning заметно
+попадает в меш (см. таблицу ниже). Встроенный
 `lux3d.resolved_config` содержит конфиги всех компонентов, pipeline-дефолты и
 CLIP `vocab.json`/`merges.txt`/конфиги токенизатора, поэтому файл является
 полным пакетом модели. Canonical-пакет safetensors использует то же слияние и
@@ -363,14 +364,14 @@ CLIP `vocab.json`/`merges.txt`/конфиги токенизатора, поэт
 по-прежнему работает с сырым чекпойнтом и меньше по размеру (1.67 / 1.29 /
 1.08 / 0.88 GiB для q8_0/q6_k/q5_k/q4_k).
 
-Другие компоненты можно добавить повторяемыми `--prefix`. Замеры на CUDA
-относительно меша с квантованным только transformer (тот же `mesh-input.png`,
-промпт "a cat"):
+По умолчанию квантуются `transformer.` и `vae.`; повторяемые `--prefix`
+переопределяют набор. Замеры на CUDA относительно меша с квантованным только
+transformer (тот же `mesh-input.png`, промпт "a cat"):
 
 | квантованные префиксы | размер пакета | CD rel | F@1% | voxel IoU | примечание |
 |---|---|---|---|---|---|
-| `transformer.` (по умолчанию) | 2.92 GiB | — | — | — | база |
-| `transformer.` + `vae.` | 2.70 GiB | 0.006% | 1.000 | 0.991 | почти без потерь |
+| `transformer.` | 2.92 GiB | — | — | — | старая DiT-only база |
+| `transformer.` + `vae.` (по умолчанию) | 2.70 GiB | 0.006% | 1.000 | 0.991 | почти без потерь |
 | `transformer.` + `image_encoder.` | 2.65 GiB | 0.184% | 0.939 | 0.700 | заметный дрейф |
 | `transformer.` + `text_encoder.` | 2.81 GiB | 0.159% | 0.960 | 0.710 | заметный дрейф |
 | все четыре | 2.33 GiB | 1.017% | 0.812 | 0.558 | дрейф топологии |
@@ -378,7 +379,7 @@ CLIP `vocab.json`/`merges.txt`/конфиги токенизатора, поэт
 VAE-декодер — единственный дополнительный компонент, который под Q8_0
 остаётся практически без потерь. DINOv2 и CLIP Q8_0 поддерживаются (CLIP
 де-квантуется при загрузке), но их дрейф conditioning попадает в меш, поэтому
-они opt-in, а не часть пакета по умолчанию.
+они остаются F16, а не частью пакета по умолчанию.
 
 Эталон — нативный F16 DiT чекпойнта, поднятый до F32 (`--dtype` по умолчанию
 `f32`), с теми же seed/шагами/изображением. Standalone- и DiT-only-сборки дают

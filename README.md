@@ -207,8 +207,9 @@ cargo run -p lux3d-cli -- weights normalize `
 # TripoSG-scribble standalone package: one GGUF with the DINOv2 image encoder,
 # dual-cross-attention DiT, SDF VAE decoder, CLIP text encoder and CLIP
 # tokenizer. --source is the raw `VAST-AI/TripoSG-scribble` checkpoint
-# directory. Only transformer linear weights are quantized; the other
-# components stay in the fallback dtype.
+# directory. Rank-2 linear weights in the DiT and VAE are quantized by
+# default (the VAE Q8_0 path is measured near-lossless); DINOv2/CLIP stay in
+# the fallback dtype. Pass `--prefix` to override the set.
 cargo run -p lux3d-cli -- weights quantize triposg --scribble --standalone `
   --source <raw-TripoSG-scribble-dir> `
   --output triposg-scribble-q8_0.gguf `
@@ -326,10 +327,10 @@ TripoSR 1 image at `--mc-resolution 256`):
 | TRELLIS.2-4B | q4_k | 6.52 GiB | 1070 + 284 shape_enc |
 | TripoSG-scribble | raw checkpoint F16 | 4.38 GiB | — |
 | TripoSG-scribble | canonical F16 | 4.38 GiB | — |
-| TripoSG-scribble | q8_0 standalone | 2.92 GiB | 308 matrices |
-| TripoSG-scribble | q6_k standalone | 2.54 GiB | 307 |
-| TripoSG-scribble | q5_k standalone | 2.33 GiB | 307 |
-| TripoSG-scribble | q4_k standalone | 2.13 GiB | 307 |
+| TripoSG-scribble | q8_0 standalone | 2.70 GiB | 467 matrices |
+| TripoSG-scribble | q6_k standalone | 2.27 GiB | 465 |
+| TripoSG-scribble | q5_k standalone | 2.03 GiB | 465 |
+| TripoSG-scribble | q4_k standalone | 1.81 GiB | 465 |
 
 F16 is a straight precision conversion, not block quantization: every tensor is
 stored at 16-bit and the linear layers use the regular path without `QMatMul`.
@@ -357,10 +358,10 @@ matrices whose row length is not divisible by 256 stay in F16.
 RMBG-1.4 (auxiliary): F32 0.16 GiB → F16 0.08 GiB; 686 tensors written,
 112 rank-0 training buffers omitted.
 
-TripoSG-scribble keeps the same DiT-only quantization policy but, with
-`--standalone`, merges all four networks into one GGUF: the dual-cross-attention
-transformer is quantized, while the CLIP text encoder, the VAE SDF decoder and
-the DINOv2 scribble encoder stay in the F16 fallback (they are not quantized).
+TripoSG-scribble quantizes the dual-cross-attention DiT and the SDF VAE
+decoder; with `--standalone` it merges all four networks into one GGUF. The
+CLIP text encoder and the DINOv2 scribble encoder stay in the F16 fallback
+because their Q8_0 conditioning drift reaches the mesh.
 The embedded `lux3d.resolved_config` carries every component config, the
 pipeline defaults and the CLIP `vocab.json`/`merges.txt`/tokenizer configs, so
 the resulting file is a complete model package. The canonical safetensors
@@ -375,16 +376,16 @@ CUDA against the transformer-only q8 mesh (same `mesh-input.png`, prompt
 
 | quantized prefixes | package size | CD rel | F@1% | voxel IoU | note |
 |---|---|---|---|---|---|
-| `transformer.` (default) | 2.92 GiB | — | — | — | baseline |
-| `transformer.` + `vae.` | 2.70 GiB | 0.006% | 1.000 | 0.991 | near-lossless |
+| `transformer.` | 2.92 GiB | — | — | — | old DiT-only baseline |
+| `transformer.` + `vae.` (default) | 2.70 GiB | 0.006% | 1.000 | 0.991 | near-lossless |
 | `transformer.` + `image_encoder.` | 2.65 GiB | 0.184% | 0.939 | 0.700 | noticeable drift |
 | `transformer.` + `text_encoder.` | 2.81 GiB | 0.159% | 0.960 | 0.710 | noticeable drift |
 | all four | 2.33 GiB | 1.017% | 0.812 | 0.558 | topology drift |
 
 The VAE decoder is the only extra component that stays effectively lossless
-under Q8_0. DINOv2 and CLIP Q8_0 are supported (CLIP dequantizes at load), but
-their conditioning drift propagates into the mesh, so they are opt-in rather
-than part of the default package.
+under Q8_0, so it is part of the default package. DINOv2 and CLIP Q8_0 are
+supported (CLIP dequantizes at load), but their conditioning drift propagates
+into the mesh, so they stay F16 unless `--prefix` opts them in.
 
 The reference run is the raw checkpoint's native F16 DiT promoted to F32
 (`--dtype` default `f32`), with the same seed/steps/image. Standalone and
