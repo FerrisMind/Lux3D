@@ -402,7 +402,7 @@ pub struct RunArgs {
 
     #[arg(
         long,
-        help = "Pi3X VO chunk size; for `triposg` this doubles as the SDF query chunk size (default 16384)."
+        help = "Pi3X VO chunk size; for `triposg` this doubles as the SDF query chunk size (default 32768; the flash decoder caps it at 16384)."
     )]
     pub chunk_size: Option<usize>,
 
@@ -3879,7 +3879,23 @@ fn run_triposr(
         eprintln!("[stage] infer: {:.2}s", t1.elapsed().as_secs_f64());
     }
     let t2 = std::time::Instant::now();
-    let mesh = pipeline.extract_mesh(&inference.scene_codes, mc_resolution, mc_threshold, 8192)?;
+    // Vulkan mesh decode is dispatch-bound: the triplane sampler and the
+    // density MLP issue ~50 tiny ops per chunk, and at 128^3 there are 256
+    // chunks at the old 8192 default. Measured on Vulkan: mesh 8.50 s at
+    // 8192, 4.18 s at 16384, 2.41 s at 32768 (CUDA 1.96 s); 65536 regressed
+    // to 15.1 s total through allocator/memory churn. 32768 is the measured
+    // sweet spot. The env knob is for measurement/experiments.
+    let query_chunk = std::env::var("LUX3D_TRIPOSR_QUERY_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(32768);
+    let mesh = pipeline.extract_mesh(
+        &inference.scene_codes,
+        mc_resolution,
+        mc_threshold,
+        query_chunk,
+    )?;
     if stage_time {
         eprintln!("[stage] mesh: {:.2}s", t2.elapsed().as_secs_f64());
     }
@@ -5564,7 +5580,7 @@ mod tests {
         let defaults = super::TripoSgRunOptions::default();
         assert_eq!(
             (
-                50usize, 7.0f32, 42u64, 2048usize, 8u32, 9u32, true, 9u32, 16384usize
+                50usize, 7.0f32, 42u64, 2048usize, 8u32, 9u32, true, 9u32, 32768usize
             ),
             (
                 defaults.steps,
