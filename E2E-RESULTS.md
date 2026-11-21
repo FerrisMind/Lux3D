@@ -41,33 +41,33 @@ keep the runtime default.
 |---|---|---|---|
 | CUDA | **18/18 passed** | 955.13 s (15m55s) | Same-binary reference run. |
 | Vulkan | **18/18 passed** | 1717.21 s (28m37s) | Same-binary run after the fixes below; 1.54x faster than the 2638.52 s pre-fix baseline. |
-| WGPU | 18/18 on the previous build | 3466.58 s (57m46s) | Not re-run after the 2026-11-21 changes; TripoSG still needs packed Q8 (`LUX3D_WGPU_DEQUANT_WEIGHTS=0`). |
+| WGPU | **18/18 passed** | 3479.83 s (58m00s) | Same-binary rerun; neutral vs the 3466.58 s previous run (+0.4%). TripoSG uses packed Q8 (`LUX3D_WGPU_DEQUANT_WEIGHTS=0`). |
 
-Overall Vulkan/CUDA suite ratio: **1.80x** (was 2.62x on the pre-fix baseline).
-Per-scenario ratios are in the table below.
+Overall ratios: Vulkan/CUDA **1.80x** (was 2.62x on the pre-fix baseline),
+WGPU/CUDA **3.64x**. Per-scenario ratios are in the table below.
 
 ## Automated scenario results
 
-| Test | Family / scenario | Weights | CUDA | Vulkan | Vk/CUDA | Artifact |
+| Test | Family / scenario | Weights | CUDA | Vulkan | Vk/CUDA | WGPU | Wg/CUDA | Artifact |
 |---|---|---|---|---|---|---|
-| `pi3_frames_to_point_cloud` | Pi3 multi-frame point cloud | `3d/standalone/pi3-q8_0` | 3.57 s | 6.99 s | 1.96x | `cloud.ply` 25 MiB |
-| `pi3x_frames_to_point_cloud` | Pi3X point cloud | `3d/standalone/pi3x-q8_0` | 5.27 s | 9.53 s | 1.81x | `cloud.ply` 37 MiB |
-| `pi3x_vo_inject_to_point_cloud` | Pi3X VO + pose/depth/ray injection | `3d/standalone/pi3x-q8_0` | 6.51 s | 10.84 s | 1.67x | `vo.ply` 37 MiB |
-| `triposr_image_to_mesh` | TripoSR image-to-mesh | `3d/standalone/triposr-q8_0` | 2.37 s | 5.31 s | 2.24x | `mesh.glb` 628 KiB |
-| `triposg_image_to_mesh` | TripoSG image-to-mesh, RMBG-1.4 RGB fallback | `3d/standalone/triposg-q8_0` + `rmbg-1.4` | 14.42 s | 28.02 s | 1.94x | `mesh.glb` 308 KiB |
-| `triposg_batch_to_meshes` | 2 images x 2 shapes in one batch | `3d/standalone/triposg-q8_0` | 272.66 s | 646.21 s | 2.37x | `batch_0..3.glb` |
-| `triposg_surface_to_mesh` | VAE surface encode/decode | `3d/standalone/triposg-q8_0` | 23.95 s | 59.92 s | 2.50x | `surface.glb` 18 MiB |
-| `triposg_scribble_to_mesh` | Scribble image + text prompt | `3d/huggingface/TripoSG-scribble-GGUF/triposg-scribble-q8_0.gguf` | 49.00 s | 141.01 s | 2.88x | `scribble.glb` 9.2 MiB |
-| `vggt_frames_to_point_cloud` | VGGT multi-frame point cloud | `3d/standalone/vggt-q8_0` | 5.54 s | 10.22 s | 1.84x | `cloud.ply` 11 MiB |
-| `vggt_depth_points` | VGGT depth+confidence unprojection | `3d/standalone/vggt-q8_0` | 5.80 s | 11.00 s | 1.90x | `cloud.ply`, `depth.ply` 36 MiB |
-| `vggt_glb_scene` | VGGT GLB scene with cameras | `3d/standalone/vggt-q8_0` | 5.65 s | 10.58 s | 1.87x | `scene.glb` 6.2 MiB |
-| `vggt_colmap_feedforward` | VGGT feedforward COLMAP export | `3d/standalone/vggt-q8_0` | 5.58 s | 10.64 s | 1.91x | `colmap/` binary model |
-| `vggt_track_queries` | Explicit query tracking | `3d/standalone/vggt-q8_0` | 6.34 s | 11.27 s | 1.78x | `tracks.json` |
-| `vggt_track_auto_fps` | DINOv2 + FPS automatic queries | `vggt-q8_0` + `models/dinov2_reg4` | 7.72 s | 13.43 s | 1.74x | `tracks.json` 37 KiB |
-| `trellis2_512_geometry` | TRELLIS.2 512 geometry, decimation | `3d/standalone/trellis2-q4_k` + `rmbg-2.0` | 35.48 s | 86.85 s | 2.45x | `geometry.glb` 1.4 MiB |
-| `trellis2_512_textured_glb` | TRELLIS.2 512 PBR GLB | `3d/standalone/trellis2-q4_k` + `rmbg-2.0` | 245.56 s | 362.40 s | 1.48x | `textured.glb` 3.6 MiB + PBR sidecars |
-| `trellis2_texture_mesh` | PBR bake onto an existing cube mesh | `3d/standalone/trellis2-q4_k` + `rmbg-2.0` | 258.78 s | 292.11 s | 1.13x | `cube_textured.glb` 116 KiB |
-| `ovox_roundtrip` | mesh2ovox -> ovox2mesh/ovox2glb | none | 0.64 s | 0.61 s | 0.95x | `cube.vxz`, `cube.ply`, `cube.glb` |
+| `pi3_frames_to_point_cloud` | Pi3 multi-frame point cloud | `3d/standalone/pi3-q8_0` | 3.57 s | 6.99 s | 1.96x | 8.77 s | 2.46x | `cloud.ply` 25 MiB |
+| `pi3x_frames_to_point_cloud` | Pi3X point cloud | `3d/standalone/pi3x-q8_0` | 5.27 s | 9.53 s | 1.81x | 14.22 s | 2.70x | `cloud.ply` 37 MiB |
+| `pi3x_vo_inject_to_point_cloud` | Pi3X VO + pose/depth/ray injection | `3d/standalone/pi3x-q8_0` | 6.51 s | 10.84 s | 1.67x | 19.18 s | 2.95x | `vo.ply` 37 MiB |
+| `triposr_image_to_mesh` | TripoSR image-to-mesh | `3d/standalone/triposr-q8_0` | 2.37 s | 5.31 s | 2.24x | 6.45 s | 2.72x | `mesh.glb` 628 KiB |
+| `triposg_image_to_mesh` | TripoSG image-to-mesh, RMBG-1.4 RGB fallback | `3d/standalone/triposg-q8_0` + `rmbg-1.4` | 14.42 s | 28.02 s | 1.94x | 81.34 s | 5.64x | `mesh.glb` 308 KiB |
+| `triposg_batch_to_meshes` | 2 images x 2 shapes in one batch | `3d/standalone/triposg-q8_0` | 272.66 s | 646.21 s | 2.37x | 1348.80 s | 4.95x | `batch_0..3.glb` |
+| `triposg_surface_to_mesh` | VAE surface encode/decode | `3d/standalone/triposg-q8_0` | 23.95 s | 59.92 s | 2.50x | 119.32 s | 4.98x | `surface.glb` 18 MiB |
+| `triposg_scribble_to_mesh` | Scribble image + text prompt | `3d/huggingface/TripoSG-scribble-GGUF/triposg-scribble-q8_0.gguf` | 49.00 s | 141.01 s | 2.88x | 247.38 s | 5.05x | `scribble.glb` 9.2 MiB |
+| `vggt_frames_to_point_cloud` | VGGT multi-frame point cloud | `3d/standalone/vggt-q8_0` | 5.54 s | 10.22 s | 1.84x | 20.59 s | 3.72x | `cloud.ply` 11 MiB |
+| `vggt_depth_points` | VGGT depth+confidence unprojection | `3d/standalone/vggt-q8_0` | 5.80 s | 11.00 s | 1.90x | 21.61 s | 3.73x | `cloud.ply`, `depth.ply` 36 MiB |
+| `vggt_glb_scene` | VGGT GLB scene with cameras | `3d/standalone/vggt-q8_0` | 5.65 s | 10.58 s | 1.87x | 21.50 s | 3.81x | `scene.glb` 6.2 MiB |
+| `vggt_colmap_feedforward` | VGGT feedforward COLMAP export | `3d/standalone/vggt-q8_0` | 5.58 s | 10.64 s | 1.91x | 21.07 s | 3.78x | `colmap/` binary model |
+| `vggt_track_queries` | Explicit query tracking | `3d/standalone/vggt-q8_0` | 6.34 s | 11.27 s | 1.78x | 22.93 s | 3.62x | `tracks.json` |
+| `vggt_track_auto_fps` | DINOv2 + FPS automatic queries | `vggt-q8_0` + `models/dinov2_reg4` | 7.72 s | 13.43 s | 1.74x | 33.33 s | 4.32x | `tracks.json` 37 KiB |
+| `trellis2_512_geometry` | TRELLIS.2 512 geometry, decimation | `3d/standalone/trellis2-q4_k` + `rmbg-2.0` | 35.48 s | 86.85 s | 2.45x | 232.07 s | 6.54x | `geometry.glb` 1.4 MiB |
+| `trellis2_512_textured_glb` | TRELLIS.2 512 PBR GLB | `3d/standalone/trellis2-q4_k` + `rmbg-2.0` | 245.56 s | 362.40 s | 1.48x | 691.41 s | 2.82x | `textured.glb` 3.6 MiB + PBR sidecars |
+| `trellis2_texture_mesh` | PBR bake onto an existing cube mesh | `3d/standalone/trellis2-q4_k` + `rmbg-2.0` | 258.78 s | 292.11 s | 1.13x | 568.88 s | 2.20x | `cube_textured.glb` 116 KiB |
+| `ovox_roundtrip` | mesh2ovox -> ovox2mesh/ovox2glb | none | 0.64 s | 0.61 s | 0.95x | 0.61 s | 0.95x | `cube.vxz`, `cube.ply`, `cube.glb` |
 
 `ovox_roundtrip` is the sum of its three subcommands.
 
@@ -123,6 +123,14 @@ TRELLIS.2 textured scenarios are CPU-bound in both backends: `uv_unwrap`
 (xatlas, 26k charts) takes 182 s of the 193 s texture-export stage on CUDA,
 and the backend-independent bake is another 8.9 s. That is why their ratios
 are the lowest (1.13-1.48x) despite the slow sparse-conv decode.
+
+WGPU remains **3.64x** CUDA overall and is neutral against its previous run
+(3479.83 vs 3466.58 s). The largest gaps are TripoSG (4.95-5.64x) and
+TRELLIS.2 geometry (6.54x), consistent with its dense-F16/conv kernel
+throughput; the textured scenarios are 2.20-2.82x because the CPU xatlas
+floor dominates both sides. VGGT tracking is 3.62-4.32x (its native
+channel-last LayerNorm is 0.55 s on WGPU, so the Vulkan-specific fix does not
+apply).
 
 ### What would close the remaining gap
 

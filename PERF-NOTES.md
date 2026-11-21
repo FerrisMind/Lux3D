@@ -7,8 +7,10 @@ The 2026-11-21 section below supersedes the whole-model criterion numbers from
 ## E2E Vulkan/CUDA: 2.62x -> 1.80x (2026-11-21)
 
 Full 18-scenario suite, same binary and weights, `--test-threads=1`:
-CUDA **955.13 s**, Vulkan **1717.21 s** (18/18 on both). Pre-fix Vulkan was
-2638.52 s. Full per-scenario table: [`E2E-RESULTS.md`](E2E-RESULTS.md).
+CUDA **955.13 s**, Vulkan **1717.21 s**, WGPU **3479.83 s** (18/18 on all
+three). Vulkan/CUDA 2.62x -> **1.80x**; WGPU/CUDA **3.64x**, neutral vs its
+previous 3466.58 s run. Full per-scenario table:
+[`E2E-RESULTS.md`](E2E-RESULTS.md).
 
 Fixes, all measurement-gated (numbers are e2e wall time):
 
