@@ -1118,13 +1118,32 @@ impl VggtTrackerPredictor {
         }
         let dtype = fmaps.dtype();
         let device = fmaps.device();
+        let stage_time = std::env::var_os("LUX3D_STAGE_TIME").is_some();
 
         // fmap LayerNorm over channels.
-        let fmaps = self
-            .fmap_norm
-            .forward(&fmaps.permute((0, 1, 3, 4, 2))?)?
-            .permute((0, 1, 4, 2, 3))?
-            .contiguous()?;
+        let t = std::time::Instant::now();
+        let fmaps = if device.is_vulkan() {
+            // Avoid the NHWC transpose: see `channel_layer_norm_nchw`.
+            channel_layer_norm_nchw(
+                &fmaps,
+                self.fmap_norm.weight(),
+                self.fmap_norm
+                    .bias()
+                    .ok_or_else(|| candle_core::Error::Msg("fmap_norm bias missing".into()))?,
+                self.fmap_norm.eps(),
+            )?
+        } else {
+            self.fmap_norm
+                .forward(&fmaps.permute((0, 1, 3, 4, 2))?)?
+                .permute((0, 1, 4, 2, 3))?
+                .contiguous()?
+        };
+        if stage_time {
+            eprintln!(
+                "[stage]       track.fmap_norm: {:.2}s",
+                t.elapsed().as_secs_f64()
+            );
+        }
 
         // Query pixels -> feature-map pixels (stride), broadcast over frames.
         let qp = query_points
@@ -1143,8 +1162,22 @@ impl VggtTrackerPredictor {
             .contiguous()?;
         let coords_backup = coords.clone();
 
+        let t = std::time::Instant::now();
         let corr = CorrBlock::new(&fmaps, self.corr_levels, self.corr_radius)?;
+        if stage_time {
+            eprintln!(
+                "[stage]       track.corr_pyramid: {:.2}s",
+                t.elapsed().as_secs_f64()
+            );
+        }
+        let t = std::time::Instant::now();
         let pos_tables = SincosPosTables::new(hh, ww, TRANSFORMER_DIM, &device)?;
+        if stage_time {
+            eprintln!(
+                "[stage]       track.pos_tables: {:.2}s",
+                t.elapsed().as_secs_f64()
+            );
+        }
 
         // query_ref_token [1, S, D]: slot 0 for the query frame, slot 1 for
         // every other frame.
@@ -1159,14 +1192,28 @@ impl VggtTrackerPredictor {
 
         let mut coord_preds = Vec::with_capacity(iters);
         for _ in 0..iters {
+            let t_corr = std::time::Instant::now();
             let fcorrs = corr.corr_sample(&track_feats, &coords)?; // [B, S, N, corr_dim]
+            if stage_time {
+                eprintln!(
+                    "[stage]       track.corr: {:.2}s",
+                    t_corr.elapsed().as_secs_f64()
+                );
+            }
             let corr_dim = fcorrs.dim(D::Minus1)?;
+            let t_mlp = std::time::Instant::now();
             let fcorrs_ = self.corr_mlp.forward(
                 &fcorrs
                     .permute((0, 2, 1, 3))?
                     .reshape((b * n, s, corr_dim))?
                     .contiguous()?,
             )?; // [B*N, S, C]
+            if stage_time {
+                eprintln!(
+                    "[stage]       track.corr_mlp: {:.2}s",
+                    t_mlp.elapsed().as_secs_f64()
+                );
+            }
 
             // Flow from the query frame + its 2D sine/cosine embedding.
             let flows = coords
@@ -1193,7 +1240,14 @@ impl VggtTrackerPredictor {
             x = x.broadcast_add(&query_ref_token.to_dtype(dtype)?)?;
             let x = x.reshape((b, n, s, TRANSFORMER_DIM))?.contiguous()?;
 
+            let t_update = std::time::Instant::now();
             let delta = self.updateformer.forward(&x)?; // [B, N, S, latent+2]
+            if stage_time {
+                eprintln!(
+                    "[stage]       track.updateformer: {:.2}s",
+                    t_update.elapsed().as_secs_f64()
+                );
+            }
             let delta = delta.reshape((b * n, s, c + 2))?;
             let delta_coords = delta.narrow(D::Minus1, 0, 2)?.contiguous()?;
             let delta_feats = delta.narrow(D::Minus1, 2, c)?.contiguous()?;
@@ -1250,6 +1304,53 @@ impl VggtTrackerPredictor {
 // ---------------------------------------------------------------------------
 // TrackHead wrapper + public entry points
 // ---------------------------------------------------------------------------
+
+/// LayerNorm over the channel axis of a contiguous `[B, S, C, H, W]` tensor,
+/// without the channel-last round trip.
+///
+/// Upstream normalizes `fmaps.permute(0, 1, 3, 4, 2)` (NHWC). Candle's
+/// `layer_norm` only spans the last axis, so that permute forces a
+/// `copy_strided_src` transpose; the Vulkan transpose shader is
+/// uncoalesced and ran at ~16 MB/s, so the `[1, 3, 128, 259, 259]` feature
+/// map alone took 6.5 s. Reducing over C with a ones-vector GEMM keeps every
+/// operand contiguous and turns the norm into memory-bound elementwise
+/// passes (~50 ms on the same feature map).
+fn channel_layer_norm_nchw(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    eps: f64,
+) -> CandleResult<Tensor> {
+    let (b, s, c, h, w) = x.dims5()?;
+    let rows = b * s;
+    let hw = h * w;
+    let out_dtype = x.dtype();
+    // The native Vulkan kernel accumulates in F32; match that for F16/BF16.
+    let x = if out_dtype == DType::F32 {
+        x.clone()
+    } else {
+        x.to_dtype(DType::F32)?
+    };
+    let x = x.reshape((rows, c, hw))?;
+    let ones = Tensor::ones((rows, 1, c), DType::F32, x.device())?;
+    let mean = ones.matmul(&x)?.affine(1.0 / c as f64, 0.0)?; // [rows, 1, hw]
+    let centered = x.broadcast_sub(&mean)?;
+    // Variance of the centered values (not E[x^2] - E[x]^2): no cancellation.
+    let var = ones.matmul(&centered.sqr()?)?.affine(1.0 / c as f64, 0.0)?;
+    let inv_std = (var + eps)?.sqrt()?.recip()?;
+    let normed = centered.broadcast_mul(&inv_std)?; // [rows, C, hw]
+    let weight = weight.to_dtype(DType::F32)?.reshape((1, c, 1))?;
+    let bias = bias.to_dtype(DType::F32)?.reshape((1, c, 1))?;
+    let out = normed
+        .broadcast_mul(&weight)?
+        .broadcast_add(&bias)?
+        .reshape((b, s, c, h, w))?;
+    if out_dtype == DType::F32 {
+        Ok(out)
+    } else {
+        out.to_dtype(out_dtype)
+    }
+}
 
 /// `TrackHead`: DPT feature extractor + iterative tracker.
 #[derive(Debug)]
@@ -1322,6 +1423,8 @@ impl VggtTrackHead {
         chunk_size: usize,
     ) -> CandleResult<(Vec<Tensor>, Tensor, Option<Tensor>)> {
         let (_b, s, _channels, height, width) = images.dims5()?;
+        let stage_time = std::env::var_os("LUX3D_STAGE_TIME").is_some();
+        let t = std::time::Instant::now();
         let fmaps = self.feature_extractor.forward(
             cached_layers,
             patch_start_idx,
@@ -1330,7 +1433,22 @@ impl VggtTrackHead {
             height,
             width,
         )?;
-        self.tracker.forward(query_points, &fmaps, iters)
+        if stage_time {
+            eprintln!(
+                "[stage]       track.fmaps: {:.2}s {:?}",
+                t.elapsed().as_secs_f64(),
+                fmaps.dims()
+            );
+        }
+        let t = std::time::Instant::now();
+        let out = self.tracker.forward(query_points, &fmaps, iters)?;
+        if stage_time {
+            eprintln!(
+                "[stage]       track.predictor: {:.2}s",
+                t.elapsed().as_secs_f64()
+            );
+        }
+        Ok(out)
     }
 
     /// Public track entry: explicit queries -> [`VggtTrackResult`] (F32,
@@ -1551,4 +1669,53 @@ pub fn expected_track_head_tensor_names() -> Vec<String> {
         names.push(format!("{tr}{name}"));
     }
     names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Vulkan-specific channel norm must reproduce candle's native
+    /// last-axis LayerNorm on the upstream NHWC view.
+    #[test]
+    fn channel_layer_norm_matches_native() {
+        let device = Device::Cpu;
+        let (b, s, c, h, w) = (2, 3, 16, 5, 7);
+        let elems: Vec<f32> = (0..b * s * c * h * w)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 17.0)
+            .collect();
+        let x = Tensor::from_vec(elems, (b, s, c, h, w), &device).expect("x");
+        let gamma: Vec<f32> = (0..c).map(|i| 0.5 + i as f32 * 0.01).collect();
+        let beta: Vec<f32> = (0..c).map(|i| -0.2 + i as f32 * 0.005).collect();
+        let gamma = Tensor::from_vec(gamma, c, &device).expect("gamma");
+        let beta = Tensor::from_vec(beta, c, &device).expect("beta");
+
+        let native = candle_nn::ops::layer_norm(
+            &x.permute((0, 1, 3, 4, 2))
+                .expect("permute")
+                .contiguous()
+                .expect("contiguous NHWC"),
+            &gamma,
+            &beta,
+            1e-5,
+        )
+        .expect("native layer_norm")
+        .permute((0, 1, 4, 2, 3))
+        .expect("permute back")
+        .contiguous()
+        .expect("contiguous");
+        let ours = channel_layer_norm_nchw(&x, &gamma, &beta, 1e-5).expect("channel norm");
+
+        let diff = (ours - native)
+            .expect("sub")
+            .abs()
+            .expect("abs")
+            .flatten_all()
+            .expect("flatten")
+            .max(0)
+            .expect("max")
+            .to_scalar::<f32>()
+            .expect("scalar");
+        assert!(diff < 1e-5, "channel norm differs from native: {diff}");
+    }
 }
