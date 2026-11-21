@@ -1,4 +1,5 @@
 pub(crate) mod models;
+pub(crate) mod primitives;
 
 use candle_core::Device;
 
