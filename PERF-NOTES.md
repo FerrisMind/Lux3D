@@ -506,10 +506,49 @@ attention on WDDM. Revisit only after MUL_MAT_ADD reduces the dispatch count.
 
 ## Vulkan quantized GEMM: why 90% of CUDA is unreachable (2026-11-22, rev 9c74af75)
 
-The 1.81x Vulkan/CUDA suite ratio is the quantized GEMM. Every scenario that
-runs quantized matmuls sits at 1.23-2.67x, while the one scenario with no GEMM
-(`ovox_roundtrip`) is at 0.98x. Measured primitive ceilings on the RTX 3060
-(4096^3, candle `QMatMul`, one process per configuration):
+**Correction (same day, after the CPU profile):** the quantized GEMM is not what
+sets the Vulkan wall time. On TripoSG image-to-mesh the GPU kernels sum to
+1.9 s of a 24-26 s wall, and on triposr to ~0.1 s of 4 s. What dominates is
+candle's blocking `flush_drain` on WDDM: 486 drains x 31 ms = 15.2 s for
+TripoSG and 86 x 24 ms = 2.1 s for triposr, versus zero on CUDA. The GEMM
+measurements below still bound how much a better kernel could win -- very
+little, because GEMM is 320 ms of the TripoSG wall -- and they are the reason
+the f16 coopmat work was stopped.
+
+GPU kernel totals from `LUX3D_GPU_PROFILE=1 CANDLE_VULKAN_GPU_PROFILE=1`:
+
+| scenario | wall | sum of kernels | blocking drains |
+|---|---|---|---|
+| `triposg_image_to_mesh` | 24-26 s | 1.9 s | 486 x 31 ms = 15.2 s |
+| `triposr_image_to_mesh` | 4-5 s | ~0.1 s | 86 x 24 ms = 2.1 s (0 in one run -- state dependent) |
+
+The flush reasons are `batch_limit` and `cap_compute_bytes` (the per-batch
+512 MiB compute cap), so each batch is submitted and then the 256 MiB
+in-flight budget forces a blocking fence wait. The wait costs ~31 ms on this
+driver (the comment in `vulkan_inflight_byte_budget` assumes 5-10 ms).
+Knob sweep on TripoSG (wall / peak VRAM, idle 714 MiB):
+
+| setting | wall | peak VRAM |
+|---|---|---|
+| default (budget 256 MiB, grace 2) | 26 s | 6.83 GiB |
+| `CANDLE_VK_INFLIGHT_GRACE=1` | 30 s | 5.29 GiB |
+| `CANDLE_VULKAN_INFLIGHT_MAX_BYTES=128MiB` | 30 s | 5.29 GiB |
+| `CANDLE_VULKAN_INFLIGHT_MAX_BYTES=512MiB` | 25 s | 9.07 GiB |
+| `CANDLE_VULKAN_INFLIGHT_MAX_BYTES=1GiB` | 55 s | 11.35 GiB |
+| `CANDLE_VK_POOL_MAX_BYTES=256MiB` | 25 s | 8.11 GiB |
+| `CANDLE_VK_MAX_BATCH_COMPUTE_BYTES=128MiB` | 84 s | 11.38 GiB |
+| CUDA reference | 13.8 s | 3.91 GiB |
+
+So the speed-optimal defaults also maximise memory, and the memory-reducing
+settings cost 15-20% wall. Memory parity with CUDA is not reachable through
+these knobs: Vulkan keeps ~2.9 GiB more resident during sampling (timeline:
+CUDA is flat at 3.9 GiB from load to exit; Vulkan climbs to 6.8 GiB during the
+sampling phase and drops to 4.7 GiB after). Both the drain cost and the
+retained-bytes accounting are candle-internal.
+
+Primitive ceilings measured on the RTX 3060 (4096^3, candle `QMatMul`, one
+process per configuration) -- useful as an upper bound, not as the wall-time
+explanation:
 
 | path | TFLOPS |
 |---|---|
@@ -543,11 +582,14 @@ Three findings, each measured rather than inferred:
    `OpUDiv`/`OpUMod` when it cannot prove they are powers of two) was worth
    2.3x on its own at `K_STEP=32`.
 
-3. **The 90% target is unreachable on this hardware, not merely
-   unimplemented.** Vulkan Q8_0 would need 23.7 TFLOPS to be 90% of CUDA's
-   26.29. The f16 tensor-core peak is 25.5 and the best MMA rate measured here
-   is 19.02 -- before any data movement. The INT8 ceiling is higher (51 TOPS)
-   but needs the per-block scale that Vulkan cannot apply in registers.
+3. **A better GEMM kernel cannot deliver the target, and neither can the
+   GEMM ceiling alone explain the gap.** Vulkan Q8_0 would need 23.7 TFLOPS to
+   be 90% of CUDA's 26.29; the f16 tensor-core peak is 25.5 and the best MMA
+   rate measured here is 19.02, before any data movement. But even an
+   infinitely fast GEMM would only remove 0.32 s from the 24-26 s TripoSG
+   wall. The wall is set by the blocking WDDM drains above, so a candle-side
+   fix has to target submission retirement and retained-buffer accounting
+   first, and the GEMM second.
 
 Design notes if a candle-side implementation is ever picked up:
 

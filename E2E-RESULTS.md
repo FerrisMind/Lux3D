@@ -51,6 +51,13 @@ with the field-path flush fix; its 2769.87 s is 3.48x the CUDA reference, but
 that is a cross-session comparison (the WGPU suite ran after a rebuild), so
 read the WGPU column as absolute scenario times, not as a session ratio.
 
+The Vulkan gap is not GPU compute. Kernel time sums to 1.9 s of the 24-26 s
+TripoSG wall and ~0.1 s of triposr's 4-5 s; candle's blocking WDDM
+`flush_drain` accounts for 15.2 s and 2.1 s of those walls (zero on CUDA), and
+Vulkan's peak VRAM is 6.8 GiB against CUDA's 3.9 GiB on TripoSG. The GEMM
+ceilings, the drain measurements and the memory-knob sweep are in
+[`PERF-NOTES.md`](PERF-NOTES.md).
+
 ## Automated scenario results
 
 | Test | Family / scenario | Weights | CUDA | Vulkan | Vk/CUDA | WGPU | Wg/CUDA | Artifact |
