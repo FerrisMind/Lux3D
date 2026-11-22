@@ -504,6 +504,73 @@ born matmul tile scheme with subgroup ops instead.
 Chunked two-pass with coopmat GEMMs is the measured optimum for F32 vision
 attention on WDDM. Revisit only after MUL_MAT_ADD reduces the dispatch count.
 
+## Vulkan quantized GEMM: why 90% of CUDA is unreachable (2026-11-22, rev 9c74af75)
+
+The 1.81x Vulkan/CUDA suite ratio is the quantized GEMM. Every scenario that
+runs quantized matmuls sits at 1.23-2.67x, while the one scenario with no GEMM
+(`ovox_roundtrip`) is at 0.98x. Measured primitive ceilings on the RTX 3060
+(4096^3, candle `QMatMul`, one process per configuration):
+
+| path | TFLOPS |
+|---|---|
+| CUDA Q8_0 (`mma.sync m16n8k32 s8.s8.s32`) | 26.29 |
+| Vulkan Q8_0 dp4a (`mul_mmq.comp`, production) | 8.37 |
+| Vulkan Q8_0 INT8 coopmat, 4 accumulators | 4.52 |
+| Vulkan Q8_0 INT8 coopmat, ILP-16 | 5.17 |
+| Vulkan Q8_0 INT8 coopmat, no per-block epilogue (invalid numerics) | 8.30 |
+| Vulkan Q8_0 f16 coopmat, dequant folded into staging | 9.73 |
+| ... same, MMAs only (staging hoisted out, invalid numerics) | 19.02 |
+
+Three findings, each measured rather than inferred:
+
+1. **INT8 cooperative matrices cannot replace dp4a.** CUDA applies the
+   per-32-block `d_a*d_b` scale to the int32 accumulator in registers.
+   `GL_KHR_cooperative_matrix` has no element accessor: glslc rejects
+   `coopMatGet` for both int and float accumulators, so the only way to scale
+   a block is `coopMatStore` to shared, barrier, read back, scale, accumulate.
+   That epilogue costs more than the MMA it scales -- removing it (invalid
+   numerics) takes the same kernel from 5.17 to 8.30 TFLOPS, still only at
+   dp4a parity.
+
+2. **f16 cooperative matrices with the scale folded into the staged operand
+   work, but are staging bound.** Staging `q*d` as f16 lets a single f32
+   accumulator span all of K, so there is no epilogue at all. The MMA path
+   alone runs at 19.02 TFLOPS (75% of the 25.5 TFLOPS f16 tensor peak); the
+   full kernel reaches 9.73 TFLOPS at `K_STEP=32` (14 KB shared, three
+   workgroups per SM). `K_STEP=64` (7.45) and 8 warps over a 64x128 tile
+   (5.64) are both worse: occupancy, not instruction count, sets the staging
+   rate. Replacing the spec-constant divisors with literals (glslc emits
+   `OpUDiv`/`OpUMod` when it cannot prove they are powers of two) was worth
+   2.3x on its own at `K_STEP=32`.
+
+3. **The 90% target is unreachable on this hardware, not merely
+   unimplemented.** Vulkan Q8_0 would need 23.7 TFLOPS to be 90% of CUDA's
+   26.29. The f16 tensor-core peak is 25.5 and the best MMA rate measured here
+   is 19.02 -- before any data movement. The INT8 ceiling is higher (51 TOPS)
+   but needs the per-block scale that Vulkan cannot apply in registers.
+
+Design notes if a candle-side implementation is ever picked up:
+
+- llama.cpp's Vulkan coopmat path (`mul_mm.comp` + `dequant_funcs.glsl`) folds
+  the scale into the shared f16 tile exactly this way and is the reference to
+  mirror.
+- Staging must use literal tiling constants, not specialization constants.
+- The remaining 2x on staging is global-load latency: A's 34-byte Q8_0 blocks
+  only allow 2-byte-aligned loads, and one thread currently issues two
+  dependent loads per four values. Wider per-thread copies (one full 32-value
+  block for A, one full 16-byte Q8_1 word for B) and a uniform
+  `full_m`/`full_n` fast path that drops the per-row bounds check are the next
+  things to try.
+- Numerics of the f16 path: f16 operands, f32 accumulate, nmse 1.1e-8 and
+  max_rel 1.9e-2 against the CPU reference at 1024^3 -- the same arithmetic as
+  dequantizing to f16 and running a dense f16 matmul.
+
+The experimental kernels live outside this repo, in the scratch candle clone
+`G:\jobs\candle-based-projects\candle-int8-cm`
+(`candle-vulkan-kernels/src/candle-shaders/mul_mmq_q8_0_cm1*.comp` plus the
+`CANDLE_VULKAN_Q8_0_CM1_*` selectors in `candle-core/src/vulkan_backend.rs`).
+The user's own candle checkout was not modified.
+
 ## Harnesses
 
 - bench: `LUX3D_BENCH_DEVICE=... LUX3D_BENCH_MODEL=... cargo bench -p
