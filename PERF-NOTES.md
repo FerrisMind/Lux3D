@@ -99,14 +99,22 @@ Proposed candle change (one kernel + one generator entry):
 3. Numerical gate: CPU `QMatMul` parity for Q8_0/Q4_K at the existing
    Vulkan q8_1 test tolerance.
 
-Compiler validation (2026-11-22): glslc 1.4.350 compiles
+Compiler and device validation (2026-11-22): glslc 1.4.350 compiles
 `coopmat<int8_t, gl_ScopeSubgroup, 16,32, A>` / `<32,16,B>` /
 `<int32_t,16,16,C>` with `coopMatMulAdd` to
 `OpCooperativeMatrixMulAddKHR` (signed int8 components). The RTX 3060
-exposes `VK_KHR_cooperative_matrix` revision 2. The device-side
-configuration query (`vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR`
-for `SINT8`/16x16x32) still has to run before wiring the pipeline; if the
-config is absent, the dp4a path remains the ceiling.
+exposes `VK_KHR_cooperative_matrix` revision 2 and reports the required
+configuration: M=16 N=16 K=32, A=SINT8, B=SINT8, C=SINT32, Result=SINT32,
+scope=SUBGROUP.
+
+Standalone microbenchmark (not candle): 16x16x32 SINT8 coopmat, 64x64
+workgroup tile (4x4 accumulators), 32 K-blocks, 1024 workgroups,
+device-local buffers, 100 dispatches: **31.25-31.34 TFLOPS** (three runs,
+0.0274 s). CUDA mmq Q8_0 is 26.29, Vulkan dp4a 8.37. Caveat: the benchmark
+reuses the same 128 KB A/B tiles across workgroups (L2-resident), so it
+measures the MMA ceiling; it omits Q8_0 block scales and GGUF unpacking.
+A production kernel needs 128x128 tiling or L2-aware scheduling to sustain
+it. Even at 60-70% of this ceiling, Vulkan Q8_0 GEMM matches CUDA.
 
 Expected: matching the CUDA INT8 MMA rate removes the 3.1-5.2x kernel
 ceiling; GEMM-bound scenarios then land at the non-GEMM overhead
