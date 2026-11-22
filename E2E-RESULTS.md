@@ -7,7 +7,7 @@ are already on this machine.
 
 | Item | Value |
 |---|---|
-| Date | 2026-11-21 initial sweep; CUDA/Vulkan rerun 2026-11-22 (same session) |
+| Date | 2026-11-21 initial sweep; CUDA/Vulkan rerun 2026-11-22 (same session); WGPU rerun 2026-11-22 with the field-path flush fix |
 | Host | Windows 10.0.26200 x64, Git Bash |
 | GPU | NVIDIA GeForce RTX 3060, 12 GiB, compute 8.6 |
 | CUDA | 12.8 |
