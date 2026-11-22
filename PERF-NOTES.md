@@ -99,6 +99,15 @@ Proposed candle change (one kernel + one generator entry):
 3. Numerical gate: CPU `QMatMul` parity for Q8_0/Q4_K at the existing
    Vulkan q8_1 test tolerance.
 
+Compiler validation (2026-11-22): glslc 1.4.350 compiles
+`coopmat<int8_t, gl_ScopeSubgroup, 16,32, A>` / `<32,16,B>` /
+`<int32_t,16,16,C>` with `coopMatMulAdd` to
+`OpCooperativeMatrixMulAddKHR` (signed int8 components). The RTX 3060
+exposes `VK_KHR_cooperative_matrix` revision 2. The device-side
+configuration query (`vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR`
+for `SINT8`/16x16x32) still has to run before wiring the pipeline; if the
+config is absent, the dp4a path remains the ceiling.
+
 Expected: matching the CUDA INT8 MMA rate removes the 3.1-5.2x kernel
 ceiling; GEMM-bound scenarios then land at the non-GEMM overhead
 (estimated ~1.1-1.3x). Without it, 1.81x is the measured floor.
