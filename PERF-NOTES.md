@@ -5,6 +5,17 @@ The 2026-11-22 section below supersedes the 2026-11-21 e2e numbers (which
 supersede the whole-model criterion numbers from 2026-09-07); the older
 sections stay as measurement history.
 
+## Decision (2026-11-22)
+
+The 90% target is **not met**: same-session Vulkan/CUDA is **1.81x**
+(1444.53 s vs 796.39 s). The measured cause is the missing INT8 tensor-core
+GEMM in candle Vulkan: dp4a reaches 8.37 TFLOPS, CUDA's `mma.sync` reaches
+26.29. The validated INT8-coopmat handoff below reaches 31.3 TFLOPS in a
+standalone microbenchmark, so the path exists, but it requires candle-fork
+changes. The user reserved those changes ("candle я сам все сделау. Та мне
+трогай"), so **1.81x is the accepted limit for this repository** until the
+candle kernel lands. After it lands, re-run the 18-scenario suite.
+
 ## E2E Vulkan/CUDA 1.81x: TripoSG decode sync reduction (2026-11-22)
 
 Full 18-scenario suite, same binary and weights, `--test-threads=1`, one
