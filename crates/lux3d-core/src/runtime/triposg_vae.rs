@@ -31,12 +31,14 @@
 //! (`exact_query_chunked_sdpa`, bounded by `LUX3D_TRIPOSG_ATTN_CHUNK` and the
 //! shared SDPA score budget).
 
+use std::collections::HashMap;
+
 use super::nn_blocks::{Linear, linear_dense as linear, linear_no_bias_dense as linear_no_bias};
 use crate::weights::VarBuilder;
-use candle_core::{D, DType, Result as CandleResult, Tensor};
+use candle_core::{D, DType, Device, Result as CandleResult, Tensor};
 use candle_nn::{LayerNorm, Module, layer_norm};
 
-use super::attention_math::exact_query_chunked_sdpa;
+use super::attention_math::{exact_query_chunked_sdpa, exact_query_chunked_sdpa_kt};
 
 /// Stage tracer for backend bring-up (`LUX3D_WGPU_DEBUG_STAGES=1`).
 fn debug_stage(label: &str, xs: &Tensor) {
@@ -63,6 +65,29 @@ fn attn_chunk_size() -> usize {
             .filter(|value| *value > 0)
             .unwrap_or(6144)
     })
+}
+
+/// Cached `[1, 1, num_freqs]` logspace frequency table for the decoder's
+/// query-point embedding (`2^i`, or `2^i * pi` when `include_pi`; exact in
+/// F32 for the supported `embed_frequency` range). Built once per decoder
+/// instance; previously re-created and re-uploaded on every decode chunk.
+fn build_freqs_table(
+    num_freqs: usize,
+    include_pi: bool,
+    dtype: DType,
+    device: &Device,
+) -> CandleResult<Tensor> {
+    let mut freqs = Vec::with_capacity(num_freqs);
+    for i in 0..num_freqs {
+        // logspace: f_i = 2^i (exact in F32 for the supported range).
+        let f = 2.0_f32.powi(i as i32);
+        freqs.push(if include_pi {
+            f * std::f32::consts::PI
+        } else {
+            f
+        });
+    }
+    Ok(Tensor::from_vec(freqs, (1, 1, num_freqs), device)?.to_dtype(dtype)?)
 }
 
 /// Parsed `vae` section of the canonical `resolved_config.json`.
@@ -209,6 +234,14 @@ pub struct TripoSgVaeDecoder {
     cross_block: VaeCrossBlock,
     norm_out: LayerNorm,
     proj_out: Linear,
+    /// True when the reference output negate (`logits * -1`) is folded into
+    /// `proj_out`'s weight/bias at load (dense weights only; packed GGUF
+    /// weights keep the runtime `affine(-1.0, 0.0)`).
+    proj_out_negated: bool,
+    /// Cached `[1, 1, embed_frequency]` frequency table for `embed_points`
+    /// (weight dtype + load device), replacing a per-chunk host->device
+    /// upload.
+    freqs: Tensor,
     attn_chunk: usize,
 }
 
@@ -240,7 +273,38 @@ impl TripoSgVaeDecoder {
             cfg,
         )?;
         let norm_out = layer_norm(cfg.dim, 1e-5, decoder_vb.pp("norm_out"))?;
-        let proj_out = linear(cfg.dim, 1, decoder_vb.pp("proj_out"))?;
+        let proj_vb = decoder_vb.pp("proj_out");
+        // P5: fold the reference output negate (`logits * -1`) into proj_out's
+        // weight and bias at load. IEEE negation is exact and sign-symmetric
+        // through the matmul accumulation and the bias add, so the decoded
+        // logits are bit-identical while the per-chunk `affine(-1.0, 0.0)`
+        // dispatch disappears. Packed GGUF weights keep the runtime negate:
+        // integer-block storage cannot represent the exact negation (Q8_0's
+        // -128 block value has no +128 counterpart), and dequantize-then-
+        // negate would silently swap the packed QMatMul path for a dense GEMM
+        // with a different accumulation order.
+        let (proj_out, proj_out_negated) = if proj_vb.get_quantized("weight")?.is_none() {
+            let weight = proj_vb.get((1, cfg.dim), "weight")?.neg()?;
+            let bias = proj_vb.get(1, "bias")?.neg()?;
+            let dtype = weight.dtype();
+            let device = weight.device().clone();
+            let tensors = HashMap::from([
+                ("weight".to_string(), weight),
+                ("bias".to_string(), bias),
+            ]);
+            let negated_vb = VarBuilder::from_tensors(tensors, dtype, &device);
+            (linear(cfg.dim, 1, negated_vb)?, true)
+        } else {
+            (linear(cfg.dim, 1, proj_vb)?, false)
+        };
+        // P3: the frequency table is query-independent — build it once per
+        // decoder instance instead of re-uploading it on every chunk.
+        let freqs = build_freqs_table(
+            cfg.embed_frequency,
+            cfg.embed_include_pi,
+            post_quant.dtype(),
+            vb.device(),
+        )?;
 
         Ok(Self {
             cfg: cfg.clone(),
@@ -249,6 +313,8 @@ impl TripoSgVaeDecoder {
             cross_block,
             norm_out,
             proj_out,
+            proj_out_negated,
+            freqs,
             attn_chunk: attn_chunk_size(),
         })
     }
@@ -303,13 +369,16 @@ impl TripoSgVaeDecoder {
 
     /// Cross-attention K/V projections for a `[1, L, dim]` kv cache.
     ///
-    /// The projections depend only on the cache, not on the query points, so a
-    /// caller that decodes many point chunks (the SDF grid builders) should
-    /// compute them once and call [`Self::decode_points_prepared`] per chunk.
-    /// Recomputing them per chunk is numerically identical but costs ~10
-    /// dispatches per call, which dominates on Vulkan where each dispatch
-    /// carries a fixed driver cost.
-    pub fn prepare_cross_kv(&self, kv_cache: &Tensor) -> CandleResult<(Tensor, Tensor)> {
+    /// Returns `(k_heads, k_t, v_heads)` where `k_heads` is `[B, heads, L,
+    /// head_dim]`, `k_t` is the transposed+contiguous key `[B, heads,
+    /// head_dim, L]` the chunked SDPA consumes, and `v_heads` is `[B, heads,
+    /// L, head_dim]`. All three depend only on the cache, not on the query
+    /// points, so a caller that decodes many point chunks (the SDF grid
+    /// builders) should compute them once and call
+    /// [`Self::decode_points_prepared`] per chunk. Recomputing them per chunk
+    /// is numerically identical but costs ~10 dispatches per call, which
+    /// dominates on Vulkan where each dispatch carries a fixed driver cost.
+    pub fn prepare_cross_kv(&self, kv_cache: &Tensor) -> CandleResult<(Tensor, Tensor, Tensor)> {
         let kv_dims = kv_cache.dims();
         if kv_dims.len() != 3 || kv_dims[2] != self.cfg.dim {
             candle_core::bail!(
@@ -340,15 +409,16 @@ impl TripoSgVaeDecoder {
         points: &Tensor,
         chunk: usize,
     ) -> CandleResult<Tensor> {
-        let (k_heads, v_heads) = self.prepare_cross_kv(kv_cache)?;
-        self.decode_points_prepared(&k_heads, &v_heads, points, chunk)
+        let (k_heads, k_t, v_heads) = self.prepare_cross_kv(kv_cache)?;
+        self.decode_points_prepared(&k_heads, &k_t, &v_heads, points, chunk)
     }
 
     /// [`Self::decode_points`] with cross-attention K/V already projected by
-    /// [`Self::prepare_cross_kv`].
+    /// [`Self::prepare_cross_kv`] (`(k_heads, k_t, v_heads)` 3-tuple).
     pub fn decode_points_prepared(
         &self,
         k_heads: &Tensor,
+        k_t: &Tensor,
         v_heads: &Tensor,
         points: &Tensor,
         chunk: usize,
@@ -388,6 +458,7 @@ impl TripoSgVaeDecoder {
             let attn_out = self.cross_block.attn2.forward(
                 &self.cross_block.norm2.forward(&hidden)?,
                 k_heads,
+                k_t,
                 v_heads,
                 self.attn_chunk,
             )?;
@@ -403,10 +474,17 @@ impl TripoSgVaeDecoder {
             debug_stage("decode-ff", &ff);
             hidden = (hidden + ff)?;
 
-            // norm_out -> proj_out ([len, 1]) -> NEGATE -> [len].
+            // norm_out -> proj_out ([len, 1]) -> NEGATE -> [len]. The negate
+            // is folded into proj_out's weight/bias at load for dense weights
+            // (P5); packed GGUF weights keep the runtime affine negate.
             let logits = self.proj_out.forward(&self.norm_out.forward(&hidden)?)?;
             debug_stage("decode-logits", &logits);
-            chunks.push(logits.flatten_all()?.affine(-1.0, 0.0)?);
+            let logits = if self.proj_out_negated {
+                logits
+            } else {
+                logits.affine(-1.0, 0.0)?
+            };
+            chunks.push(logits.flatten_all()?);
             debug_stage("decode-chunk-negate", chunks.last().unwrap());
             start += len;
         }
@@ -440,25 +518,20 @@ impl TripoSgVaeDecoder {
 
     /// Frequency positional embedding of query points, reference
     /// `FrequencyPositionalEmbedding(num_freqs=8, logspace=True,
-    /// input_dim=3, include_input=True, include_pi=False)`:
+    /// input_dim=3, include_input=True, include_pi=false)`:
     /// `cat([x, sin(x * 2^i), cos(x * 2^i)])` with the sin / cos terms
     /// grouped BY AXIS (x0*f0..f7, x1*f0..f7, x2*f0..f7), raw input first ->
     /// `[N, 3 * (2 * num_freqs + 1)]` (51 dims for the reference config).
+    ///
+    /// The `[1, 1, num_freqs]` table is cached on the decoder instance
+    /// (`self.freqs`, built at load in the weight dtype on the load device);
+    /// the per-call `to_dtype` is a no-op Arc clone whenever the query path
+    /// already runs in the decoder dtype, which is always the case here
+    /// (`decode_points_prepared` casts the points to the weight dtype).
     fn embed_points(&self, points: &Tensor) -> CandleResult<Tensor> {
         let (rows, cols) = points.dims2()?;
         let num_freqs = self.cfg.embed_frequency;
-        let mut freqs = Vec::with_capacity(num_freqs);
-        for i in 0..num_freqs {
-            // logspace: f_i = 2^i (exact in F32 for the supported range).
-            let f = 2.0_f32.powi(i as i32);
-            freqs.push(if self.cfg.embed_include_pi {
-                f * std::f32::consts::PI
-            } else {
-                f
-            });
-        }
-        let freqs = Tensor::from_vec(freqs, (1, 1, num_freqs), points.device())?
-            .to_dtype(points.dtype())?;
+        let freqs = self.freqs.to_dtype(points.dtype())?;
         let products = points
             .reshape((rows, cols, 1))?
             .broadcast_mul(&freqs)?
@@ -686,10 +759,16 @@ impl VaeEncoderCrossBlock {
         encoder_hidden: &Tensor,
         attn_chunk: usize,
     ) -> CandleResult<Tensor> {
-        let (k_heads, v_heads) = self.attn2.prepare_kv(encoder_hidden)?;
-        let attn =
-            self.attn2
-                .forward(&self.norm2.forward(hidden)?, &k_heads, &v_heads, attn_chunk)?;
+        // `k_t` is computed here once per encode call, exactly where the
+        // chunked SDPA used to build it (same values, same cost — hoisted).
+        let (k_heads, k_t, v_heads) = self.attn2.prepare_kv(encoder_hidden)?;
+        let attn = self.attn2.forward(
+            &self.norm2.forward(hidden)?,
+            &k_heads,
+            &k_t,
+            &v_heads,
+            attn_chunk,
+        )?;
         let hidden = (hidden + attn)?;
         let ff = self.ff_out.forward(
             &self
@@ -1129,9 +1208,13 @@ impl VaeCrossAttention {
     }
 
     /// Apply `norm_cross` then the k/v projections, and pre-split the heads
-    /// (per-head stride `2 * head_dim` over `cat([k, v])`). Called once per
-    /// decode call; the result is shared by all query chunks.
-    fn prepare_kv(&self, kv_cache: &Tensor) -> CandleResult<(Tensor, Tensor)> {
+    /// (per-head stride `2 * head_dim` over `cat([k, v])`). Returns
+    /// `(k_heads, k_t, v_heads)`: `k_t` is the transposed+contiguous key
+    /// `[B, heads, head_dim, seq]` the chunked SDPA scores consume, hoisted
+    /// here so the per-chunk transpose + contiguous copy (a 4-8 MiB device
+    /// copy per decode chunk) runs once per decode call instead. Called once
+    /// per decode call; the result is shared by all query chunks.
+    fn prepare_kv(&self, kv_cache: &Tensor) -> CandleResult<(Tensor, Tensor, Tensor)> {
         let (batch, seq, _) = kv_cache.dims3()?;
         let kv_normed = self.norm_cross.forward(kv_cache)?;
         let k = self.to_k.forward(&kv_normed)?;
@@ -1144,22 +1227,27 @@ impl VaeCrossAttention {
         ))?;
         let parts = kv.chunk(2, D::Minus1)?;
         let k = parts[0].transpose(1, 2)?.contiguous()?;
+        let k_t = k.transpose(2, 3)?.contiguous()?;
         let v = parts[1].transpose(1, 2)?.contiguous()?;
-        Ok((k, v))
+        Ok((k, k_t, v))
     }
 
     /// Cross-attention for one query chunk. `xs` is the pre-norm query tokens
     /// (norm2 is applied here, matching `x += attn2(norm2(x), kv)`); the
     /// query uses the STANDARD head-major split (the processor does not
-    /// re-split the cross-attention query). `k_heads`/`v_heads` come from
-    /// [`Self::prepare_kv`].
+    /// re-split the cross-attention query). `k_t`/`v_heads` come from
+    /// [`Self::prepare_kv`]; `k_heads` ([B, heads, seq, head_dim], the
+    /// un-transposed layout) is accepted alongside for call-site symmetry
+    /// with `prepare_kv` but the scores only read the transposed `k_t`.
     fn forward(
         &self,
         xs: &Tensor,
         k_heads: &Tensor,
+        k_t: &Tensor,
         v_heads: &Tensor,
         attn_chunk: usize,
     ) -> CandleResult<Tensor> {
+        let _ = k_heads;
         let (batch, seq, _) = xs.dims3()?;
         let scale = (1.0 / (self.head_dim as f64).sqrt()) as f32;
         let q = self
@@ -1168,7 +1256,7 @@ impl VaeCrossAttention {
             .reshape((batch, seq, self.heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
-        let out = exact_query_chunked_sdpa(&q, k_heads, v_heads, scale, attn_chunk)?;
+        let out = exact_query_chunked_sdpa_kt(&q, k_t, v_heads, scale, attn_chunk)?;
         let out = out
             .transpose(1, 2)?
             .reshape((batch, seq, self.heads * self.head_dim))?;

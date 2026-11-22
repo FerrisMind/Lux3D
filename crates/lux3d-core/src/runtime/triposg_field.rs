@@ -57,6 +57,52 @@ pub struct TripoSgSdfGrid {
 /// Hard cap: reject `hierarchical_depth > 10` (grid side > 1024).
 const MAX_HIERARCHICAL_DEPTH: u32 = 10;
 
+/// Device-side ceiling for accumulated (not yet downloaded) chunk logits in
+/// the grid builders. A 256 MiB pending buffer + its `Tensor::cat` result
+/// peak at ~512 MiB, far below the 12 GiB card budget, while still collapsing
+/// thousands of per-chunk blocking D2H flushes into a handful per level.
+const MAX_PENDING_DEVICE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Concatenate the pending chunk-logit tensors of one level into a single
+/// device tensor (single-input fast path avoids the copy), ready for one
+/// blocking D2H download.
+fn cat_level_chunks(pending: &[Tensor]) -> CandleResult<Tensor> {
+    if pending.len() == 1 {
+        Ok(pending[0].clone())
+    } else {
+        Tensor::cat(pending, 0)
+    }
+}
+
+/// Scatter one contiguous run of decoded child logits (8 per marked cell, in
+/// `marked_cells` order — the same child order the query points were built
+/// in) into the high grid.
+fn scatter_refined_children(
+    high: &mut [f32],
+    big: usize,
+    marked_cells: &[(usize, usize, usize)],
+    decoded: &[f32],
+) {
+    debug_assert_eq!(decoded.len(), marked_cells.len() * 8);
+    for (cell_index, &(x, y, z)) in marked_cells.iter().enumerate() {
+        for (child, &(cx, cy, cz)) in [
+            (2 * x, 2 * y, 2 * z),
+            (2 * x, 2 * y, 2 * z + 1),
+            (2 * x, 2 * y + 1, 2 * z),
+            (2 * x, 2 * y + 1, 2 * z + 1),
+            (2 * x + 1, 2 * y, 2 * z),
+            (2 * x + 1, 2 * y, 2 * z + 1),
+            (2 * x + 1, 2 * y + 1, 2 * z),
+            (2 * x + 1, 2 * y + 1, 2 * z + 1),
+        ]
+        .iter()
+        .enumerate()
+        {
+            high[cx + cy * big + cz * big * big] = decoded[cell_index * 8 + child];
+        }
+    }
+}
+
 /// Decode the hierarchical SDF grid for `latents [1, 2048, 64]`.
 ///
 /// `bounds` is `[xmin, ymin, zmin, xmax, ymax, zmax]`; the pipeline default
@@ -101,7 +147,7 @@ pub fn hierarchical_sdf_grid(
     // project them once here instead of once per decoder call: on Vulkan each
     // extra call costs ~10 dispatches and the dense grid has 1k+ calls.
     let kv = decoder.kv_cache(latents)?;
-    let (k_heads, v_heads) = decoder.prepare_cross_kv(&kv)?;
+    let (k_heads, k_t, v_heads) = decoder.prepare_cross_kv(&kv)?;
 
     // ---- Dense pass -------------------------------------------------------
     let n = 1usize << dense_depth;
@@ -109,6 +155,16 @@ pub fn hierarchical_sdf_grid(
     let total = n * n * n;
     let mut values = Vec::with_capacity(total);
     let step = chunk.max(1).min(total);
+    // Keep every chunk's logits on the device and download the level with ONE
+    // blocking D2H (`to_vec1`) instead of one per chunk — each per-chunk
+    // download is a WDDM submission flush that stalls the GPU pipeline.
+    // Chunks are produced in ascending linear point order, so concatenating
+    // them in collection order reproduces the per-chunk `extend` exactly.
+    // The pending buffer is flushed whenever it would exceed
+    // `MAX_PENDING_DEVICE_BYTES` (cat peak = pending + result), which keeps
+    // extreme dense depths (e.g. 1024^3 = 4 GiB of F32) memory-safe.
+    let mut pending: Vec<Tensor> = Vec::new();
+    let mut pending_values = 0usize;
     let mut start = 0usize;
     while start < total {
         let len = (total - start).min(step);
@@ -123,9 +179,18 @@ pub fn hierarchical_sdf_grid(
             points.push(coords[2][z]);
         }
         let points = Tensor::from_vec(points, (len, 3), latents.device())?;
-        let out = decoder.decode_points_prepared(&k_heads, &v_heads, &points, chunk)?;
-        values.extend(out.to_vec1::<f32>()?);
+        let out = decoder.decode_points_prepared(&k_heads, &k_t, &v_heads, &points, chunk)?;
+        pending.push(out);
+        pending_values += len;
+        if pending_values * std::mem::size_of::<f32>() > MAX_PENDING_DEVICE_BYTES {
+            values.extend(cat_level_chunks(&pending)?.to_vec1::<f32>()?);
+            pending.clear();
+            pending_values = 0;
+        }
         start += len;
+    }
+    if !pending.is_empty() {
+        values.extend(cat_level_chunks(&pending)?.to_vec1::<f32>()?);
     }
     let mut grid = TripoSgSdfGrid {
         depth: dense_depth,
@@ -139,6 +204,7 @@ pub fn hierarchical_sdf_grid(
         grid = refine_level(
             decoder,
             &k_heads,
+            &k_t,
             &v_heads,
             grid,
             bounds,
@@ -152,9 +218,11 @@ pub fn hierarchical_sdf_grid(
 
 /// One refinement level: low grid (side n, depth `level - 1`) -> high grid
 /// (side N = 2n, depth `level`).
+#[allow(clippy::too_many_arguments)]
 fn refine_level(
     decoder: &TripoSgVaeDecoder,
     k_heads: &Tensor,
+    k_t: &Tensor,
     v_heads: &Tensor,
     low: TripoSgSdfGrid,
     bounds: [f32; 6],
@@ -248,7 +316,14 @@ fn refine_level(
             }
         }
     }
-    for batch in marked_coords.chunks(cells_per_batch) {
+    // Collect the per-batch decoder outputs on the device (same flush cap as
+    // the dense pass) and download the level once; batches are sequential, so
+    // the concatenated values line up with the batch/child scatter order of
+    // the corresponding marked-cell window.
+    let mut pending: Vec<Tensor> = Vec::new();
+    let mut pending_values = 0usize;
+    let mut pending_first_batch = 0usize;
+    for (batch_index, batch) in marked_coords.chunks(cells_per_batch).enumerate() {
         let len = batch.len() * 8;
         let mut points = Vec::with_capacity(len * 3);
         for &(x, y, z) in batch {
@@ -268,25 +343,25 @@ fn refine_level(
             }
         }
         let points = Tensor::from_vec(points, (len, 3), device)?;
-        let out = decoder.decode_points_prepared(k_heads, v_heads, &points, chunk)?;
-        let out = out.to_vec1::<f32>()?;
-        for (cell_index, &(x, y, z)) in batch.iter().enumerate() {
-            for (child, &(cx, cy, cz)) in [
-                (2 * x, 2 * y, 2 * z),
-                (2 * x, 2 * y, 2 * z + 1),
-                (2 * x, 2 * y + 1, 2 * z),
-                (2 * x, 2 * y + 1, 2 * z + 1),
-                (2 * x + 1, 2 * y, 2 * z),
-                (2 * x + 1, 2 * y, 2 * z + 1),
-                (2 * x + 1, 2 * y + 1, 2 * z),
-                (2 * x + 1, 2 * y + 1, 2 * z + 1),
-            ]
-            .iter()
-            .enumerate()
-            {
-                high[cx + cy * big + cz * big * big] = out[cell_index * 8 + child];
-            }
+        let out = decoder.decode_points_prepared(k_heads, k_t, v_heads, &points, chunk)?;
+        pending.push(out);
+        pending_values += len;
+        if pending_values * std::mem::size_of::<f32>() > MAX_PENDING_DEVICE_BYTES {
+            let decoded = cat_level_chunks(&pending)?.to_vec1::<f32>()?;
+            scatter_refined_children(
+                &mut high,
+                big,
+                &marked_coords[pending_first_batch..batch_index + 1],
+                &decoded,
+            );
+            pending.clear();
+            pending_values = 0;
+            pending_first_batch = batch_index + 1;
         }
+    }
+    if !pending.is_empty() {
+        let decoded = cat_level_chunks(&pending)?.to_vec1::<f32>()?;
+        scatter_refined_children(&mut high, big, &marked_coords[pending_first_batch..], &decoded);
     }
 
     Ok(TripoSgSdfGrid {

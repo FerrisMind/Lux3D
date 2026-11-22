@@ -98,10 +98,11 @@ pub fn flash_sdf_grid(
     let kv = decoder.kv_cache(latents)?;
     // Query-independent cross-attention projections: compute once and reuse
     // across every dense/refinement chunk (see decode_points_prepared).
-    let (k_heads, v_heads) = decoder.prepare_cross_kv(&kv)?;
+    let (k_heads, k_t, v_heads) = decoder.prepare_cross_kv(&kv)?;
     let mut grid = dense_flash_level(
         decoder,
         &k_heads,
+        &k_t,
         &v_heads,
         bounds,
         resolutions[0],
@@ -114,6 +115,7 @@ pub fn flash_sdf_grid(
         grid = refine_flash_level_with_final(
             decoder,
             &k_heads,
+            &k_t,
             &v_heads,
             &grid,
             bounds,
@@ -137,9 +139,18 @@ pub fn flash_sdf_grid(
 }
 
 /// Dense first level: `(r + 1)^3` NumPy-float32 linspace points, z-fastest.
+///
+/// Chunk outputs stay on the device and are downloaded with ONE blocking D2H
+/// (`to_vec1`) per level instead of one per chunk (each download is a WDDM
+/// submission flush). Chunks cover the points in ascending linear order, so
+/// concatenating them in collection order reproduces the per-chunk `extend`
+/// exactly. The pending buffer flushes past `MAX_PENDING_DEVICE_BYTES`
+/// (same constant and rationale as the hierarchical field builder) to stay
+/// memory-safe on adversarial resolutions.
 fn dense_flash_level(
     decoder: &TripoSgVaeDecoder,
     k_heads: &Tensor,
+    k_t: &Tensor,
     v_heads: &Tensor,
     bounds: [f32; 6],
     resolution: usize,
@@ -152,7 +163,8 @@ fn dense_flash_level(
         np_float32_linspace(bounds[1], bounds[4], dims),
         np_float32_linspace(bounds[2], bounds[5], dims),
     ];
-    let mut values = Vec::with_capacity(dims * dims * dims);
+    let mut pending: Vec<Tensor> = Vec::new();
+    let mut pending_values = 0usize;
     let mut points = Vec::new();
     let step = chunk.max(1);
     for x in 0..dims {
@@ -162,19 +174,25 @@ fn dense_flash_level(
                 points.push(axes[1][y]);
                 points.push(axes[2][z]);
                 if points.len() / 3 == step {
-                    values.extend(decode_points(
-                        decoder, k_heads, v_heads, &points, device, chunk,
+                    pending.push(decode_points(
+                        decoder, k_heads, k_t, v_heads, &points, device, chunk,
                     )?);
+                    pending_values += step;
+                    if pending_values * std::mem::size_of::<f32>() > MAX_PENDING_DEVICE_BYTES {
+                        pending = vec![cat_level_chunks(&pending)?];
+                        pending_values = 0;
+                    }
                     points.clear();
                 }
             }
         }
     }
     if !points.is_empty() {
-        values.extend(decode_points(
-            decoder, k_heads, v_heads, &points, device, chunk,
+        pending.push(decode_points(
+            decoder, k_heads, k_t, v_heads, &points, device, chunk,
         )?);
     }
+    let values = cat_level_chunks(&pending)?.to_vec1::<f32>()?;
     Ok(TripoSgFlashGrid {
         depth: resolution.trailing_zeros(),
         dims,
@@ -187,6 +205,7 @@ fn dense_flash_level(
 fn refine_flash_level_with_final(
     decoder: &TripoSgVaeDecoder,
     k_heads: &Tensor,
+    k_t: &Tensor,
     v_heads: &Tensor,
     low: &TripoSgFlashGrid,
     bounds: [f32; 6],
@@ -254,15 +273,36 @@ fn refine_flash_level_with_final(
     }
     let mut values = vec![-10000.0_f32; dims * dims * dims];
     let step = chunk.max(1);
+    // Keep the per-chunk outputs on the device and download once (same
+    // WDDM-flush saving and flush cap as the dense field builder); the
+    // concatenated window lines up with `indices[start..]` because the chunks
+    // are sequential slices of the same coordinate array.
+    let mut pending: Vec<Tensor> = Vec::new();
+    let mut pending_values = 0usize;
+    let mut pending_start = 0usize;
     let mut start = 0usize;
     while start < indices.len() {
         let len = (indices.len() - start).min(step);
         let points = &coordinates[start * 3..(start + len) * 3];
-        let decoded = decode_points(decoder, k_heads, v_heads, points, device, chunk)?;
-        for (offset, value) in decoded.into_iter().enumerate() {
-            values[indices[start + offset]] = value;
+        let decoded = decode_points(decoder, k_heads, k_t, v_heads, points, device, chunk)?;
+        pending.push(decoded);
+        pending_values += len;
+        if pending_values * std::mem::size_of::<f32>() > MAX_PENDING_DEVICE_BYTES {
+            let window = cat_level_chunks(&pending)?.to_vec1::<f32>()?;
+            for (offset, value) in window.into_iter().enumerate() {
+                values[indices[pending_start + offset]] = value;
+            }
+            pending.clear();
+            pending_values = 0;
+            pending_start = start + len;
         }
         start += len;
+    }
+    if !pending.is_empty() {
+        let window = cat_level_chunks(&pending)?.to_vec1::<f32>()?;
+        for (offset, value) in window.into_iter().enumerate() {
+            values[indices[pending_start + offset]] = value;
+        }
     }
     Ok(TripoSgFlashGrid {
         depth: low.depth,
@@ -272,22 +312,38 @@ fn refine_flash_level_with_final(
     })
 }
 
+/// Decode one coordinate slice and keep the logits on the device (the level
+/// loops concatenate these tensors and download once per level).
 fn decode_points(
     decoder: &TripoSgVaeDecoder,
     k_heads: &Tensor,
+    k_t: &Tensor,
     v_heads: &Tensor,
     coordinates: &[f32],
     device: &candle_core::Device,
     chunk: usize,
-) -> CandleResult<Vec<f32>> {
+) -> CandleResult<Tensor> {
     if coordinates.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Tensor::new(Vec::<f32>::new(), device)?);
     }
     let len = coordinates.len() / 3;
     let points = Tensor::from_vec(coordinates.to_vec(), (len, 3), device)?;
-    decoder
-        .decode_points_prepared(k_heads, v_heads, &points, chunk)?
-        .to_vec1::<f32>()
+    decoder.decode_points_prepared(k_heads, k_t, v_heads, &points, chunk)
+}
+
+/// Device-side ceiling for accumulated (not yet downloaded) chunk logits —
+/// same constant and rationale as the hierarchical field builder
+/// (`triposg_field.rs`).
+const MAX_PENDING_DEVICE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Concatenate the pending chunk-logit tensors of one level into a single
+/// device tensor (single-input fast path avoids the copy).
+fn cat_level_chunks(pending: &[Tensor]) -> CandleResult<Tensor> {
+    if pending.len() == 1 {
+        Ok(pending[0].clone())
+    } else {
+        Tensor::cat(pending, 0)
+    }
 }
 
 /// `np.linspace(start, stop, count, dtype=np.float32)` (verified bit-exact

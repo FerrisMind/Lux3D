@@ -212,9 +212,25 @@ pub(crate) fn exact_query_chunked_sdpa(
     scale: f32,
     chunk_size: usize,
 ) -> CandleResult<Tensor> {
+    let k_t = k.transpose(2, 3)?.contiguous()?;
+    exact_query_chunked_sdpa_kt(q, &k_t, v, scale, chunk_size)
+}
+
+/// [`exact_query_chunked_sdpa`] with the key already transposed to
+/// `[b, h, head_dim, seq]` and contiguous. Callers that serve many query
+/// chunks from one fixed kv tensor (the TripoSG VAE SDF decode: hundreds of
+/// chunks share one cross-attention K/V projection) hoist the per-chunk
+/// transpose + contiguous copy out of the chunk loop this way. Values are
+/// identical to the non-`kt` variant.
+pub(crate) fn exact_query_chunked_sdpa_kt(
+    q: &Tensor,
+    k_t: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    chunk_size: usize,
+) -> CandleResult<Tensor> {
     let q = q.affine(scale as f64, 0.0)?;
     let q_seq = q.dim(2)?;
-    let k_t = k.transpose(2, 3)?.contiguous()?;
     // v arrives as a strided view (e.g. unbound from a fused qkv buffer);
     // the closing `attn.matmul(&v)` needs a contiguous right operand on
     // CUDA/vulkan (a no-op clone when already contiguous).
