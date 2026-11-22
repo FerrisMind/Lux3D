@@ -142,6 +142,38 @@ ceiling; GEMM-bound scenarios then land at the non-GEMM overhead
 * `CANDLE_VK_POOL_MAX_BYTES=512M`: surface 45.3 vs 46.3-47.8 s, scribble
   90.9 vs 90.5 s — within noise; not enabled by default.
 
+## WGPU TripoSG field-path regression and fix (2026-11-22)
+
+The TripoSG dense/refine grid builders (`triposg_field.rs`) keep every chunk
+logit tensor on the device and download once per 256 MiB. On WGPU that policy
+is much slower than on CUDA/Vulkan: the measured cost of `Tensor::cat` grows
+with the pending window, so a large device-side buffer costs more than the
+per-chunk D2H it replaces. Measured on the two field-path scenarios (same
+binary, `--test-threads=1`):
+
+| pending policy | surface | batch |
+|---|---:|---:|
+| per-chunk D2H (no cat) | **106.68 s** | 1244.63 s |
+| 16-chunk cat window | 198.91 s | **1128.52 s** |
+| 256 MiB byte cap | 384.72 s | **1116.14 s** |
+
+WGPU now flushes every 16 chunks and does not use the byte cap; CUDA/Vulkan
+keep the 256 MiB cap. The 16-chunk window minimizes the surface+batch sum
+(1327 s vs 1351 s per-chunk and 1501 s byte-cap): surface alone prefers
+per-chunk D2H, batch alone prefers the byte cap, and 16 is the crossover.
+The flash decoder path keeps the 256 MiB cap on every backend because its
+chunk tensors are large enough that one D2H per level wins (image 72.74 s vs
+75.23 s per-chunk).
+
+The chunk-count flush exposed a latent indexing bug in `refine_level`: the
+flush window was tracked as a batch index but used to slice `marked_coords`
+(a cell vector). On CUDA/Vulkan no scenario crossed the 256 MiB cap
+mid-level, so the window was always `[0..]` and the bug stayed dormant; the
+WGPU 16-chunk flush made the two index spaces diverge and panicked
+(`len 33632, index 33632`). The window now tracks the first pending cell
+(`pending_first_cell`) and derives it from
+`batch_index * cells_per_batch`; surface and batch both pass with the fix.
+
 ## E2E Vulkan/CUDA: 2.62x -> 1.80x (2026-11-21)
 
 Full 18-scenario suite, same binary and weights, `--test-threads=1`:

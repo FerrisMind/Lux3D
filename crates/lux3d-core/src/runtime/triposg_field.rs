@@ -63,6 +63,32 @@ const MAX_HIERARCHICAL_DEPTH: u32 = 10;
 /// thousands of per-chunk blocking D2H flushes into a handful per level.
 const MAX_PENDING_DEVICE_BYTES: usize = 256 * 1024 * 1024;
 
+/// WGPU's `Tensor::cat` over many small chunk tensors is slower than periodic
+/// small cats and than per-chunk D2H on the surface grid, so WGPU uses the
+/// chunk-count cap below instead of the byte cap. CUDA/Vulkan keep the 256 MiB
+/// device buffer.
+fn max_pending_device_bytes(device: &Device) -> usize {
+    if device.is_wgpu() {
+        usize::MAX
+    } else {
+        MAX_PENDING_DEVICE_BYTES
+    }
+}
+
+/// WGPU `Tensor::cat` cost grows with the number of inputs, so a single large
+/// cat is slower than periodic small cats; per-chunk D2H is also expensive on
+/// the 512-chunk batch grids. Flush every 16 chunks on WGPU; CUDA/Vulkan keep
+/// the byte cap only.
+const MAX_PENDING_CHUNKS_WGPU: usize = 16;
+
+fn max_pending_chunks(device: &Device) -> usize {
+    if device.is_wgpu() {
+        MAX_PENDING_CHUNKS_WGPU
+    } else {
+        usize::MAX
+    }
+}
+
 /// Concatenate the pending chunk-logit tensors of one level into a single
 /// device tensor (single-input fast path avoids the copy), ready for one
 /// blocking D2H download.
@@ -148,6 +174,8 @@ pub fn hierarchical_sdf_grid(
     // extra call costs ~10 dispatches and the dense grid has 1k+ calls.
     let kv = decoder.kv_cache(latents)?;
     let (k_heads, k_t, v_heads) = decoder.prepare_cross_kv(&kv)?;
+    let pending_cap = max_pending_device_bytes(latents.device());
+    let pending_chunks = max_pending_chunks(latents.device());
 
     // ---- Dense pass -------------------------------------------------------
     let n = 1usize << dense_depth;
@@ -182,7 +210,9 @@ pub fn hierarchical_sdf_grid(
         let out = decoder.decode_points_prepared(&k_heads, &k_t, &v_heads, &points, chunk)?;
         pending.push(out);
         pending_values += len;
-        if pending_values * std::mem::size_of::<f32>() > MAX_PENDING_DEVICE_BYTES {
+        if pending_values * std::mem::size_of::<f32>() > pending_cap
+            || pending.len() >= pending_chunks
+        {
             values.extend(cat_level_chunks(&pending)?.to_vec1::<f32>()?);
             pending.clear();
             pending_values = 0;
@@ -306,6 +336,8 @@ fn refine_level(
     ];
     let mins = [bounds[0] as f64, bounds[1] as f64, bounds[2] as f64];
     let cells_per_batch = (chunk / 8).max(1);
+    let pending_cap = max_pending_device_bytes(device);
+    let pending_chunks = max_pending_chunks(device);
     let mut marked_coords = Vec::new();
     for z in 0..n {
         for y in 0..n {
@@ -322,8 +354,9 @@ fn refine_level(
     // the corresponding marked-cell window.
     let mut pending: Vec<Tensor> = Vec::new();
     let mut pending_values = 0usize;
-    let mut pending_first_batch = 0usize;
+    let mut pending_first_cell = 0usize;
     for (batch_index, batch) in marked_coords.chunks(cells_per_batch).enumerate() {
+        let batch_start = batch_index * cells_per_batch;
         let len = batch.len() * 8;
         let mut points = Vec::with_capacity(len * 3);
         for &(x, y, z) in batch {
@@ -346,22 +379,24 @@ fn refine_level(
         let out = decoder.decode_points_prepared(k_heads, k_t, v_heads, &points, chunk)?;
         pending.push(out);
         pending_values += len;
-        if pending_values * std::mem::size_of::<f32>() > MAX_PENDING_DEVICE_BYTES {
+        if pending_values * std::mem::size_of::<f32>() > pending_cap
+            || pending.len() >= pending_chunks
+        {
             let decoded = cat_level_chunks(&pending)?.to_vec1::<f32>()?;
             scatter_refined_children(
                 &mut high,
                 big,
-                &marked_coords[pending_first_batch..batch_index + 1],
+                &marked_coords[pending_first_cell..batch_start + batch.len()],
                 &decoded,
             );
             pending.clear();
             pending_values = 0;
-            pending_first_batch = batch_index + 1;
+            pending_first_cell = batch_start + batch.len();
         }
     }
     if !pending.is_empty() {
         let decoded = cat_level_chunks(&pending)?.to_vec1::<f32>()?;
-        scatter_refined_children(&mut high, big, &marked_coords[pending_first_batch..], &decoded);
+        scatter_refined_children(&mut high, big, &marked_coords[pending_first_cell..], &decoded);
     }
 
     Ok(TripoSgSdfGrid {

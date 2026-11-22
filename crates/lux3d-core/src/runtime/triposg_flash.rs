@@ -144,8 +144,7 @@ pub fn flash_sdf_grid(
 /// (`to_vec1`) per level instead of one per chunk (each download is a WDDM
 /// submission flush). Chunks cover the points in ascending linear order, so
 /// concatenating them in collection order reproduces the per-chunk `extend`
-/// exactly. The pending buffer flushes past `MAX_PENDING_DEVICE_BYTES`
-/// (same constant and rationale as the hierarchical field builder) to stay
+/// exactly. The pending buffer flushes past `MAX_PENDING_DEVICE_BYTES` to stay
 /// memory-safe on adversarial resolutions.
 fn dense_flash_level(
     decoder: &TripoSgVaeDecoder,
@@ -167,6 +166,7 @@ fn dense_flash_level(
     let mut pending_values = 0usize;
     let mut points = Vec::new();
     let step = chunk.max(1);
+    let pending_cap = MAX_PENDING_DEVICE_BYTES;
     for x in 0..dims {
         for y in 0..dims {
             for z in 0..dims {
@@ -178,7 +178,7 @@ fn dense_flash_level(
                         decoder, k_heads, k_t, v_heads, &points, device, chunk,
                     )?);
                     pending_values += step;
-                    if pending_values * std::mem::size_of::<f32>() > MAX_PENDING_DEVICE_BYTES {
+                    if pending_values * std::mem::size_of::<f32>() > pending_cap {
                         pending = vec![cat_level_chunks(&pending)?];
                         pending_values = 0;
                     }
@@ -273,6 +273,7 @@ fn refine_flash_level_with_final(
     }
     let mut values = vec![-10000.0_f32; dims * dims * dims];
     let step = chunk.max(1);
+    let pending_cap = MAX_PENDING_DEVICE_BYTES;
     // Keep the per-chunk outputs on the device and download once (same
     // WDDM-flush saving and flush cap as the dense field builder); the
     // concatenated window lines up with `indices[start..]` because the chunks
@@ -287,7 +288,7 @@ fn refine_flash_level_with_final(
         let decoded = decode_points(decoder, k_heads, k_t, v_heads, points, device, chunk)?;
         pending.push(decoded);
         pending_values += len;
-        if pending_values * std::mem::size_of::<f32>() > MAX_PENDING_DEVICE_BYTES {
+        if pending_values * std::mem::size_of::<f32>() > pending_cap {
             let window = cat_level_chunks(&pending)?.to_vec1::<f32>()?;
             for (offset, value) in window.into_iter().enumerate() {
                 values[indices[pending_start + offset]] = value;
@@ -332,8 +333,10 @@ fn decode_points(
 }
 
 /// Device-side ceiling for accumulated (not yet downloaded) chunk logits —
-/// same constant and rationale as the hierarchical field builder
-/// (`triposg_field.rs`).
+/// same constant and rationale as the hierarchical field builder. The flash
+/// path keeps this on every backend: its chunk tensors are large enough that
+/// the single-D2H saving outweighs the WGPU `cat` cost (measured image
+/// 72.74 s with 256 MiB vs 75.23 s with per-chunk D2H).
 const MAX_PENDING_DEVICE_BYTES: usize = 256 * 1024 * 1024;
 
 /// Concatenate the pending chunk-logit tensors of one level into a single
