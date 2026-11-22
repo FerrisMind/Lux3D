@@ -66,6 +66,43 @@ the ~42 s FLOP floor at the measured Vulkan Q8 rate), so it is retired.
   GEMM-bound scenarios; that work lives in the candle fork and is explicitly
   out of scope here.
 
+### Candle-side handoff: the Q8_0/Q4_K Vulkan GEMM gap
+
+Measured at rev `9c74af75` on the RTX 3060: CUDA Q8_0 **26.29 TFLOPS** vs
+Vulkan **8.37** (3.14x); Q4_K **25.45** vs **4.92** (5.17x). The cause is a
+missing kernel path, not a Lux3D scheduling issue:
+
+* **CUDA** uses INT8 tensor-core MMA. `mmq_instance_q8_0.cu` feeds
+  `mmq_mma.cuh:857,879`:
+  `mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32` on Ampere (m16n8k16 on
+  Turing). 26.29 TFLOPS is near the 3060 INT8 tensor peak.
+* **Vulkan** uses only `GL_EXT_integer_dot_product` (dp4a) in
+  `candle-vulkan-kernels/src/shaders/mul_mmq.comp` (64x64 tile, 128 threads).
+  `vulkan-shaders-gen.cpp:619-620` generates the `_q8_1` variant only under
+  `!f16acc && !coopmat && !coopmat2`, so no cooperative-matrix quantized GEMM
+  exists. 8.37 TFLOPS is ~33% of the 3060 dp4a peak (~25.4 TOPS).
+* Upstream llama.cpp b10455 has the same gate
+  (`ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp:626-627`), so this is
+  not a candle regression; the Vulkan backend never had an INT8 tensor-core
+  GEMM.
+
+Proposed candle change (one kernel + one generator entry):
+
+1. Generate `matmul_q8_0_q8_1_cm1` (and the Q4_K/Q5_K/Q6_K siblings) from a
+   coopmat variant of `mul_mmq.comp`: `VK_KHR_cooperative_matrix` with A/B
+   `int8_t`, C `int32_t`; `coopMatMulAdd` per K=32 block, then apply the
+   Q8_0 `d_a*d_b` block scale into the float accumulator in the epilogue.
+   Mirror `mmq_mma.cuh`'s per-block scaling; do not accumulate across block
+   boundaries without applying the scale.
+2. Gate on `VK_KHR_cooperative_matrix` int8 component support and glslc
+   coopmat support; keep the dp4a `mul_mmq` as the fallback.
+3. Numerical gate: CPU `QMatMul` parity for Q8_0/Q4_K at the existing
+   Vulkan q8_1 test tolerance.
+
+Expected: matching the CUDA INT8 MMA rate removes the 3.1-5.2x kernel
+ceiling; GEMM-bound scenarios then land at the non-GEMM overhead
+(estimated ~1.1-1.3x). Without it, 1.81x is the measured floor.
+
 ### Measured dead ends (2026-11-22)
 
 * TRELLIS.2 F32 sparse kernels on Vulkan (halves dispatches/conv, 191 -> 84):

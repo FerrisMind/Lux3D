@@ -200,8 +200,12 @@ kernel throughput.
 The Q8_0/Q4_K Vulkan GEMM kernels are 3.1-5.2x slower than CUDA; no Lux3D
 change can recover that. The candle-side levers, in measured order:
 
-1. Q8_0/Q4_K Vulkan GEMM: integer-dot / coopmat path with subgroup reduction,
-   matching the CUDA dp4a throughput. This alone bounds every q8 scenario.
+1. Q8_0/Q4_K Vulkan GEMM: add a `VK_KHR_cooperative_matrix` INT8 path
+   (A/B int8, C int32, per-block scale in the epilogue). CUDA reaches 26.29
+   TFLOPS with `mma.sync...s8.s8.s32`; Vulkan's `mul_mmq.comp` only has dp4a
+   and reaches 8.37. Concrete file/line handoff and the generator gate are in
+   [`PERF-NOTES.md`](PERF-NOTES.md#candle-side-handoff-the-q8_0q4_k-vulkan-gemm-gap).
+   This alone bounds every q8 scenario.
 2. Vulkan dispatch/flush overhead on the remaining dispatch-bound paths:
    TripoSG dense SDF decode (~40 fixed dispatches per chunk) and TRELLIS.2
    sparse conv. The VGGT tracker is no longer in this group.
