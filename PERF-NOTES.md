@@ -1,8 +1,81 @@
 # Performance notes: measured results and remaining levers (RTX 3060 12 GiB, Windows WDDM)
 
-Status: 2026-11-21, candle rev `9c74af75`, RTX 3060 12 GiB / Windows 11 WDDM.
-The 2026-11-21 section below supersedes the whole-model criterion numbers from
-2026-09-07 for e2e work; the older sections stay as measurement history.
+Status: 2026-11-22, candle rev `9c74af75`, RTX 3060 12 GiB / Windows 11 WDDM.
+The 2026-11-22 section below supersedes the 2026-11-21 e2e numbers (which
+supersede the whole-model criterion numbers from 2026-09-07); the older
+sections stay as measurement history.
+
+## E2E Vulkan/CUDA 1.81x: TripoSG decode sync reduction (2026-11-22)
+
+Full 18-scenario suite, same binary and weights, `--test-threads=1`, one
+session: CUDA **796.39 s**, Vulkan **1444.53 s** (18/18 both). Vulkan/CUDA
+**1.81x**. Both absolute walls dropped ~16% vs 2026-11-21 (955.13 /
+1717.21 s), but the ratio is unchanged: the fixes removed host-side sync and
+repeated per-chunk work that both backends paid. Full per-scenario table:
+[`E2E-RESULTS.md`](E2E-RESULTS.md).
+
+Fixes, all measurement-gated (numbers are e2e wall time):
+
+| Fix | Before -> after |
+|---|---|
+| P1: accumulate decode chunks on-device per level, one blocking D2H (was 512 syncs/level; batch ~2048 -> ~8) | scribble 141.01 -> 92.00 s; surface 59.92 -> 47.87 s; batch 646.21 -> 545.86 s; image 28.02 -> 24.87 s |
+| P2: build `k_t = k.transpose(2,3).contiguous()` once in `prepare_cross_kv` (was one 4 MiB copy + dispatch per chunk) | included above |
+| P3: cache the decoder freqs table at load (was one H2D per chunk) | included above |
+| P5: fold the output negate into `proj_out` weights at load (packed GGUF keeps the runtime `affine(-1)`) | included above |
+
+CPU parity is bit-identical for dense and refinement levels; the CUDA numbers
+improved by the same mechanism, which is why the ratio did not move.
+
+### Attribution: what still separates Vulkan from CUDA
+
+| scenario group | Vk/CUDA | dominant bound | 90% reachable? |
+|---|---:|---|---|
+| `ovox_roundtrip` | 0.98x | CPU/IO only | **yes** (already) |
+| `trellis2_texture_mesh` | 1.23x | CPU xatlas/bake floor | no (GPU part >1.11) |
+| `trellis2_512_textured_glb` | 1.57x | CPU xatlas 182 s + q4_k decode | no |
+| VGGT (4 point/scene + 2 track) | 1.81-2.15x | q8 aggregator GEMM (3.14x ceiling) | no |
+| TripoSG image | 1.93x | q8 VAE SDF decode GEMM | no |
+| TripoSG scribble | 2.11x | q8 VAE SDF decode GEMM | no |
+| TripoSG batch | 2.24x | q8 VAE SDF decode GEMM | no |
+| TripoSG surface | 2.25x | q8 VAE SDF decode GEMM | no |
+| Pi3 | 2.34x | q8 GEMM | no |
+| TripoSR | 2.64x | q8 GEMM + triplane sampler | no |
+| TRELLIS.2 geometry | 2.67x | q4_k GEMM (5.17x ceiling) + sparse conv | no |
+
+After P1, the TripoSG decode stage is no longer host-sync-bound: the
+remaining time scales with the per-chunk q8 GEMMs, and the primitive ceiling
+(8.37 vs 26.29 TFLOPS) bounds those scenarios near 3x before any Lux3D
+overhead. An earlier note cited "7.4 s of actual GPU kernel time" for the
+scribble decode; that figure predates P1 and was incomplete (it contradicts
+the ~42 s FLOP floor at the measured Vulkan Q8 rate), so it is retired.
+
+### Remaining Rust-level levers (measured risk, not landed)
+
+* **P6: batch the decode across samples** (batch scenario only). All 4 samples
+  share identical dense query grids; only the kv cache differs. Remove the
+  batch-1 bail in `prepare_cross_kv`, reshape points to `[B,N,3]`, one
+  hierarchical pass per level: 2048 -> 512 chunks. Medium-large risk; per
+  sample parity required. Does not help single-sample scenarios.
+* **Grouped TRELLIS.2 offsets** (Patch C): stack the 26 gather tables into one
+  `[26,N]` select, one batched GEMM, one ones-GEMM reduce, row-chunked to
+  512 MiB-1 GiB. ~191 -> ~5 dispatches per chunk but bandwidth-bound; needs
+  A/B. Do not use `index_add` scatter on Vulkan (two permute
+  materializations) or `narrow` slices for per-offset matmuls (nonzero
+  offset forces a full copy).
+* **Candle Vulkan Q8_0/Q4_K GEMM kernels** are the only path to 1.11x on the
+  GEMM-bound scenarios; that work lives in the candle fork and is explicitly
+  out of scope here.
+
+### Measured dead ends (2026-11-22)
+
+* TRELLIS.2 F32 sparse kernels on Vulkan (halves dispatches/conv, 191 -> 84):
+  geometry+texture decode F32 104.65 s vs F16 86.95 s warm. The F32 gather
+  and GEMM bandwidth loss outweighs the dispatch saving; reverted.
+* TripoSG 64k decode chunk: surface mesh 344.64 s vs ~45 s. The 32k transients
+  (FF 512 MiB x2, SDPA outputs 1 GiB + cat) cross the allocator/VRAM edge.
+* Decode SDPA `attn_chunk` 6144 -> 24576: surface 49.13 vs 48.59 s, neutral.
+* `CANDLE_VK_POOL_MAX_BYTES=512M`: surface 45.3 vs 46.3-47.8 s, scribble
+  90.9 vs 90.5 s — within noise; not enabled by default.
 
 ## E2E Vulkan/CUDA: 2.62x -> 1.80x (2026-11-21)
 
