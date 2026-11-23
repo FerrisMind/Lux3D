@@ -15,6 +15,8 @@ fn main() -> candle_core::Result<()> {
     let (mut rows, mut k, mut n, mut iters) = (4096usize, 1024usize, 1024usize, 3usize);
     let mut dtype = "f32".to_string();
     let mut quant = None;
+    let mut contig_b = false;
+    let mut no_check = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--device" => device_name = args.next().unwrap_or_default(),
@@ -24,6 +26,8 @@ fn main() -> candle_core::Result<()> {
             "--iters" => iters = args.next().and_then(|v| v.parse().ok()).unwrap_or(iters),
             "--dtype" => dtype = args.next().unwrap_or(dtype),
             "--quant" => quant = args.next(),
+            "--contig-b" => contig_b = true,
+            "--no-check" => no_check = true,
             other => candle_core::bail!("unexpected argument `{other}`"),
         }
     }
@@ -72,17 +76,25 @@ fn main() -> candle_core::Result<()> {
         let start = std::time::Instant::now();
         let out = match &q {
             Some(qm) => qm.forward(&xs)?,
+            None if contig_b => xs.matmul(&w.t()?.contiguous()?)?,
             None => xs.matmul(&w.t()?)?,
         };
+        let enqueue = start.elapsed().as_secs_f64();
+        device.synchronize()?;
+        let sync = start.elapsed().as_secs_f64();
+        if no_check {
+            println!("iter {iter}: total={sync:.3}s enqueue={enqueue:.3}s sync={sync:.3}s");
+            continue;
+        }
         let sum = out
             .to_dtype(DType::F32)?
             .flatten_all()?
             .sum_all()?
             .to_scalar::<f32>()?;
-        device.synchronize()?;
         println!(
-            "iter {iter}: {:.3}s sum={sum:.3}",
-            start.elapsed().as_secs_f64()
+            "iter {iter}: total={:.3}s enqueue={enqueue:.3}s sync={sync:.3}s check={:.3}s sum={sum:.3}",
+            start.elapsed().as_secs_f64(),
+            start.elapsed().as_secs_f64() - sync
         );
     }
     #[cfg(feature = "vulkan")]

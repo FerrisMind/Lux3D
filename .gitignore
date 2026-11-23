@@ -1,6 +1,7 @@
 # Rust / Cargo
 /target/
 /target_verify/
+/target-cuda/
 
 # Python
 __pycache__/
