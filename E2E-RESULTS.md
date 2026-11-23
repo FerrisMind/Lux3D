@@ -58,6 +58,75 @@ Vulkan's peak VRAM is 6.8 GiB against CUDA's 3.9 GiB on TripoSG. The GEMM
 ceilings, the drain measurements and the memory-knob sweep are in
 [`PERF-NOTES.md`](PERF-NOTES.md).
 
+## 2026-11-23 exact-mode rerun (TripoSG VAE fixes)
+
+Command (same as above, Vulkan pinned by name because the AMD card changed the
+loader ordinals):
+
+```bash
+CANDLE_VULKAN_DEVICE_NAME="RTX 3060" bash full_suite.sh vk_exact_clean vulkan
+# 18/18 passed, suite wall 1459.56 s
+```
+
+Two things make this the first fully valid exact-mode baseline:
+
+- `triposg_batch_to_meshes` now completes all four samples. The previous
+  Vulkan run (2026-11-22) failed that scenario with exit 1 after 344 s, so the
+  1263 s total from that session is missing its remaining work and is **not**
+  a like-for-like baseline. With the adaptive SDF decode chunk plus the
+  mode-dependent FF row split the scenario passes in 518.60 s.
+- Same-session per-scenario drift between sessions is 10-15% on unchanged
+  code (trellis2 geometry 62.89 -> 69.24 s, textured 333.78 -> 381.28 s with
+  identical sources), so cross-session ratios below are indicative only.
+
+Per-scenario, clean Vulkan exact run vs the CUDA reference suite on this
+machine (CUDA column from the 2026-11-22 session; seconds, aggregated over the
+scenario's CLI invocations):
+
+| Scenario | CUDA | Vulkan | Vk/CUDA |
+|---|---|---|---|
+| `triposg_batch_to_meshes` | 244.22 | 518.60 | 2.12x |
+| `trellis2_512_textured_glb` | 240.19 | 381.28 | 1.59x |
+| `trellis2_texture_mesh` | 204.43 | 265.48 | 1.30x |
+| `triposg_scribble_to_mesh` | 45.56 | 73.82 | 1.62x |
+| `trellis2_512_geometry` | 35.66 | 69.24 | 1.94x |
+| `triposg_surface_to_mesh` | 21.26 | 54.91 | 2.58x |
+| `vggt_track_auto_fps` | 14.54 | 19.24 | 1.32x |
+| `triposg_image_to_mesh` | 12.92 | 18.57 | 1.44x |
+| `vggt_track_queries` | 5.52 | 8.82 | 1.60x |
+| `vggt_depth_points` | 5.15 | 7.00 | 1.36x |
+| `pi3x_vo_inject_to_point_cloud` | 5.64 | 7.64 | 1.35x |
+| `vggt_glb_scene` | 4.98 | 6.83 | 1.37x |
+| `vggt_frames_to_point_cloud` | 4.85 | 6.69 | 1.38x |
+| `vggt_colmap_feedforward` | 6.15 | 6.77 | 1.10x |
+| `pi3x_frames_to_point_cloud` | 5.84 | 6.55 | 1.12x |
+| `pi3_frames_to_point_cloud` | 3.95 | 5.07 | 1.28x |
+| `triposr_image_to_mesh` | 1.95 | 2.91 | 1.49x |
+| `ovox_roundtrip` | 0.42 | 0.14 | 0.33x |
+| **Total** | **863.23** | **1459.56** | **1.69x** |
+
+Where the remaining gap is, measured back to back in one session
+(`stage_run.sh ... triposg_image`, Vulkan and the `target-cuda` CLI binary,
+`LUX3D_STAGE_TIME=1`):
+
+| stage | CUDA | Vulkan | Vk/CUDA |
+|---|---|---|---|
+| `infer` (denoise DiT) | 3.50 s | 6.07 s | 1.73x |
+| `triposg.sdf` (VAE SDF decode) | 7.49 s | 10.44 s | 1.39x |
+| `flash.dense dims=64` | 0.80 s | 1.22 s | 1.53x |
+| `flash.refine dims=127` | 0.53 s | 0.80 s | 1.51x |
+| `flash.refine dims=253` | 2.13 s | 3.13 s | 1.47x |
+| `flash.refine dims=505` | 3.96 s | 5.23 s | 1.32x |
+| `triposg.dmc` | 1.27 s | 1.29 s | 1.02x |
+| wall | 13 s | 18 s | 1.38x |
+
+The whole residual is the Q8_0 GEMM: dp4a runs at 9.5-10.3 TFLOPS against
+CUDA's int8 tensor-core mmq at ~34 TOPS (3.3x on ff_in), while attention
+(f32 GEMM), softmax, layernorm, contiguity copies and the DMC octree are at
+parity or faster on Vulkan. The per-op table, the int8 coopmat experiment
+(bit-exact but 1.6x slower than dp4a), the tile sweeps and the WDDM
+queue-depth limit are in [`PERF-NOTES.md`](PERF-NOTES.md).
+
 ## Automated scenario results
 
 | Test | Family / scenario | Weights | CUDA | Vulkan | Vk/CUDA | WGPU | Wg/CUDA | Artifact |

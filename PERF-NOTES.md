@@ -607,11 +607,96 @@ Design notes if a candle-side implementation is ever picked up:
   max_rel 1.9e-2 against the CPU reference at 1024^3 -- the same arithmetic as
   dequantizing to f16 and running a dense f16 matmul.
 
-The experimental kernels live outside this repo, in the scratch candle clone
-`G:\jobs\candle-based-projects\candle-int8-cm`
-(`candle-vulkan-kernels/src/candle-shaders/mul_mmq_q8_0_cm1*.comp` plus the
-`CANDLE_VULKAN_Q8_0_CM1_*` selectors in `candle-core/src/vulkan_backend.rs`).
-The user's own candle checkout was not modified.
+The earlier experiments lived outside this repo, in the scratch candle clone
+`G:\jobs\candle-based-projects\candle-int8-cm`. The work now happens directly in
+the user's candle checkout (`G:\jobs\candle-based-projects\candle`):
+`candle-vulkan-kernels/src/shaders/mul_mmq_cm.comp` plus the
+`CANDLE_VK_Q8_COOPMAT` selector in `candle-core/src/vulkan_backend.rs`. That
+checkout is left uncommitted — the user commits candle themselves.
+
+## Where the Vulkan/CUDA gap actually is (2026-11-23, rev 9c74af75 + local patch)
+
+Same-session per-op comparison on the TripoSG VAE flash shapes
+(`cargo run --release --example flash_bench -p lux3d-core --features vulkan`,
+`--iters 6..10`, min shown; CUDA from `target-cuda`, CANDLE_VULKAN_DEVICE_NAME
+pinned to the RTX 3060). Shapes: attention/ff at a 16384-point outer chunk,
+dim 1024, ff 4096, kv_len 1024.
+
+| op | CUDA | VK dp4a (default) | VK f16 coopmat | VK int8 coopmat (old) |
+|---|---|---|---|---|
+| q8 to_q/to_out `16384x1024@1024x1024` | 1.220 ms | 3.617 ms | 1.971 ms | 6.398 ms |
+| q8 ff_in `16384x1024@1024x4096` | 4.058 ms | 13.392 ms | 8.417 ms | 23.530 ms |
+| q8 ff_out `16384x4096@4096x1024` | 4.474 ms | 13.255 ms | 10.519 ms | 27.789 ms |
+| f32 softmax `1x8x1024x1024` (CUDA at its 6144 q-chunk) | 8.289 ms | 0.706 ms | 0.749 ms | 0.709 ms |
+| layernorm `16384x1024` | 1.123 ms | 0.615 ms | 0.623 ms | 0.616 ms |
+
+So the exact-mode gap is one op: the Q8_0 GEMM (dp4a 9.5-10.3 TFLOPS vs CUDA's
+int8 tensor-core mmq at ~34 TOPS), i.e. 3.3x. Everything else in the VAE
+decoder is at parity or faster on Vulkan (the CUDA-side softmax in candle is
+what is slow there, ~11x the Vulkan kernel on the same logical work).
+
+Measured dead ends on this hardware (do not retry):
+
+- dp4a tile sweep (`CANDLE_VK_Q8_TILE`): 64x128 = 21.66 ms, 128x64 = 14.46 ms,
+  default 64x64 = 13.84 ms on q8 ff_in.
+- Deeper submission queues (`CANDLE_VK_MAX_PENDING_SUBMISSIONS` 96/128/160/256):
+  `VK_ERROR_DEVICE_LOST` at the SDF decode even with the default batch size.
+  WDDM resets the GPU past a queue depth of 64 (already documented in the
+  backend); `CANDLE_VK_MAX_BATCH_DISPATCHES=256` with pending 256 crashes the
+  same way, and batch 128 alone is neutral.
+- f16 coopmat as the default: 1.45-2.35x faster than dp4a, but the f16 operand
+  rounding moves the isosurface (8738 vs 10528 vertices, -17%), so it stays
+  opt-in.
+- The old int8 coopmat kernel (0.47-0.80x of dp4a): the opaque MMA register
+  layout forced a shared spill + subgroup barrier per 32-wide block and a
+  1152-byte-strided SSBO read per MMA tile.
+
+Why a bigger workgroup tile is the lever, not another staging tweak: with a
+64x64 tile the weight matrix is re-read `n/64 = 256` times for ff_in
+(4.25 MiB x 256 = 1.1 GiB) and the q8_1 activations `m/64 = 64` times
+(18.9 MiB x 64 = 1.2 GiB). The DP4A kernel is at ~2.3 GiB of traffic for
+68.7 GMAC, i.e. roughly half memory-bound; CUDA's MMQ uses 128-wide tiles
+(and stream-k) which halves both counts.
+
+### Exact int8 tensor-core mmq: rewritten, bit-exact, still slower (measured)
+
+`mul_mmq_cm.comp` was rewritten to amortize everything around the mandatory
+per-32-block spill: one staging group covers FOUR blocks (KG = 128) into dense
+byte panels (A quants stripped of scales through the existing
+`block_q8_0_packed16` view, B quants as 128-bit `ivec4` words of a
+`block_q8_1_x4` record), the panels are padded to a 144-byte stride, and all
+four cm tiles of a block spill into a warp-private 4 KiB stage between two
+subgroup barriers. Shared usage 23.5 KiB (2 workgroups/SM); the host gate for
+the path now also requires `subgroup_size == 32`, because the staging hands
+each panel row/column to two threads and 2 * BM must equal the workgroup size.
+
+Bit-exactness against dp4a holds: `q8_check` dumps of a 256x512@512x512 Q8_0
+matmul compare at `max_abs = 0`, `rms_rel = 0`.
+
+Timings (RTX 3060, flash_bench, min of 6):
+
+| variant | to_q | ff_in | ff_out |
+|---|---|---|---|
+| dp4a (default) | 3.60 ms | 13.39 ms | 13.23 ms |
+| int8 cm, unpadded 128 B panel stride | 12.81 ms | 48.29 ms | 50.87 ms |
+| int8 cm, 144 B padded stride, 1-tile stage (8 barriers/block) | 6.00 ms | 21.52 ms | 24.10 ms |
+| int8 cm, 144 B padded stride, 4-tile stage (2 barriers/block) | 5.86 ms | 21.23 ms | 23.57 ms |
+| f16 cm (`CANDLE_VK_Q8_COOPMAT=f16`), inexact | 1.83 ms | 8.29 ms | 10.46 ms |
+
+Two findings worth keeping:
+
+- The 128-byte panel stride was a 16-way shared bank conflict: every row of a
+  tile started on bank 0. Padding to 144 B (36 words, still a 16-byte multiple)
+  took ff_in from 48.3 to 21.5 ms.
+- Barrier count is not the limiter: the tile-serialized (8 barriers/block) and
+  the four-tile (2 barriers/block) forms are within noise of each other. The
+  int8 path is instruction-bound in the **epilogue**: the opaque MMA register
+  layout cannot be scaled in place, so every output element costs a shared
+  store + load + FMA per 32-wide block (32 outputs/thread for a 64x64 tile =>
+  ~384 epilogue instructions per 128-K group against 16 MMA instructions).
+  dp4a needs no spill, so exact mode stays on dp4a. Tensor cores only pay off
+  when the block scale folds into the operand, which is the f16 path (and its
+  operand rounding is what shifts the isosurface).
 
 ## Harnesses
 
