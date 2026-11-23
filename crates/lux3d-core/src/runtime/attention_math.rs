@@ -21,7 +21,13 @@ impl Rope2d {
         if half % 2 != 0 {
             candle_core::bail!("rope token_dim must be divisible by 4, got {token_dim}");
         }
-        let max_position = positions.flatten_all()?.max(0)?.to_scalar::<u32>()? as usize + 1;
+        // `positions` is always a (..., 2) integer grid, so every coordinate is
+        // smaller than the number of position pairs. Sizing the table from the
+        // shape avoids a device->host `max()` readback per attention layer
+        // (measured 40 syncs of 18 bytes per Pi3X decode, each costing a WDDM
+        // scheduling quantum on Vulkan). A slightly larger table is harmless:
+        // rows are gathered by index and the extra rows are never read.
+        let max_position = positions.elem_count() / 2 + 1;
 
         let (cos, sin) = self.cos_sin(half, max_position, positions.device())?;
         let pos_y = positions.i((.., .., 0))?;
