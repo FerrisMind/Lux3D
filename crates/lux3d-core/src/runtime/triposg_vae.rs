@@ -42,6 +42,26 @@ use super::attention_math::{exact_query_chunked_sdpa, exact_query_chunked_sdpa_k
 
 /// Stage tracer for backend bring-up (`LUX3D_WGPU_DEBUG_STAGES=1`).
 fn debug_stage(label: &str, xs: &Tensor) {
+    // `LUX3D_VAE_STAGE_TIME=1`: synchronize and print elapsed-since-previous
+    // stage for the first decoder chunks. Diagnostic only (the syncs perturb
+    // the schedule), capped so the SDF loop cannot flood the log.
+    if std::env::var_os("LUX3D_VAE_STAGE_TIME").is_some() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static PRINTED: AtomicUsize = AtomicUsize::new(0);
+        static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+        if PRINTED.fetch_add(1, Ordering::Relaxed) < 24 {
+            let started = std::time::Instant::now();
+            let _ = xs.device().synchronize();
+            let mut last = LAST.lock().unwrap();
+            let elapsed = last.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+            eprintln!(
+                "[vae-stage] {label}: sync={:.2}ms prev={elapsed:.2}s",
+                started.elapsed().as_secs_f64() * 1e3
+            );
+            *last = Some(std::time::Instant::now());
+        }
+        return;
+    }
     if std::env::var_os("LUX3D_WGPU_DEBUG_STAGES").is_none() {
         return;
     }
@@ -51,19 +71,21 @@ fn debug_stage(label: &str, xs: &Tensor) {
     }
 }
 
-/// Self-attention query chunk (`LUX3D_TRIPOSG_ATTN_CHUNK`, default 6144) —
-/// the same knob the DiT uses. The SDF decode's cross-attention runs over the
-/// full query chunk (up to 32k points); 6144 keeps the scores buffer at
-/// ~400 MiB and measured 4% faster than 1024 on Vulkan by cutting the number
-/// of tiny dependent dispatches, with no CUDA regression.
-fn attn_chunk_size() -> usize {
+/// Self-attention query chunk (`LUX3D_TRIPOSG_ATTN_CHUNK`) — the same knob
+/// the DiT uses. The SDF decode's cross-attention runs over up to 32k query
+/// points, so a 6144-query chunk makes each score buffer ~400 MiB. That fills
+/// candle's 512 MiB per-batch compute cap in a handful of dispatches, and each
+/// resulting flush hits the retained-byte budget, which is what forces the
+/// blocking WDDM drains (see PERF-NOTES.md). 1024 measured the same wall time
+/// with a 0.75 GiB lower peak on TripoSG; CUDA keeps 6144.
+fn attn_chunk_size(device: &Device) -> usize {
     static CHUNK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CHUNK.get_or_init(|| {
         std::env::var("LUX3D_TRIPOSG_ATTN_CHUNK")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
-            .unwrap_or(6144)
+            .unwrap_or(if device.is_vulkan() { 1024 } else { 6144 })
     })
 }
 
@@ -315,7 +337,7 @@ impl TripoSgVaeDecoder {
             proj_out,
             proj_out_negated,
             freqs,
-            attn_chunk: attn_chunk_size(),
+            attn_chunk: attn_chunk_size(vb.device()),
         })
     }
 
@@ -590,7 +612,7 @@ impl TripoSgVaeEncoder {
             self_blocks,
             norm_out: layer_norm(cfg.width_encoder, 1e-5, encoder_vb.pp("norm_out"))?,
             quant: linear(cfg.width_encoder, cfg.latent_channels * 2, vb.pp("quant"))?,
-            attn_chunk: attn_chunk_size(),
+            attn_chunk: attn_chunk_size(vb.device()),
         })
     }
 

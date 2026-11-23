@@ -99,6 +99,8 @@ pub fn flash_sdf_grid(
     // Query-independent cross-attention projections: compute once and reuse
     // across every dense/refinement chunk (see decode_points_prepared).
     let (k_heads, k_t, v_heads) = decoder.prepare_cross_kv(&kv)?;
+    let stage_time = std::env::var_os("LUX3D_STAGE_TIME").is_some();
+    let dense_started = std::time::Instant::now();
     let mut grid = dense_flash_level(
         decoder,
         &k_heads,
@@ -109,9 +111,18 @@ pub fn flash_sdf_grid(
         chunk,
         latents.device(),
     )?;
+    if stage_time {
+        eprintln!(
+            "[stage]     flash.dense dims={} points={:.1}M: {:.2}s",
+            grid.dims,
+            (grid.values.len() as f64) / 1e6,
+            dense_started.elapsed().as_secs_f64()
+        );
+    }
 
     for (index, &resolution) in resolutions[1..].iter().enumerate() {
         let final_level = index + 2 == resolutions.len();
+        let level_started = std::time::Instant::now();
         grid = refine_flash_level_with_final(
             decoder,
             &k_heads,
@@ -124,6 +135,14 @@ pub fn flash_sdf_grid(
             latents.device(),
             final_level,
         )?;
+        if stage_time {
+            eprintln!(
+                "[stage]     flash.refine dims={} points={:.1}M: {:.2}s",
+                grid.dims,
+                (grid.values.len() as f64) / 1e6,
+                level_started.elapsed().as_secs_f64()
+            );
+        }
     }
     for value in &mut grid.values {
         if *value == -10000.0 {

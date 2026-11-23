@@ -62,17 +62,19 @@ fn debug_stage(label: &str, xs: &Tensor) {
     }
 }
 
-/// Self-attention query chunk (`LUX3D_TRIPOSG_ATTN_CHUNK`, default 6144).
-/// The DiT sequence is at most `num_tokens` (1024 by default), so this is
-/// effectively one shot; the larger default matches the VAE decode knob.
-fn attn_chunk_size() -> usize {
+/// Self-attention query chunk (`LUX3D_TRIPOSG_ATTN_CHUNK`). The DiT sequence
+/// is `num_tokens` (1024 by default), so 1024 is effectively one shot; Vulkan
+/// uses 1024 to keep the score buffers small enough that candle's per-batch
+/// compute cap is not hit every few dispatches (see PERF-NOTES.md). CUDA keeps
+/// 6144.
+fn attn_chunk_size(device: &Device) -> usize {
     static CHUNK: OnceLock<usize> = OnceLock::new();
     *CHUNK.get_or_init(|| {
         std::env::var("LUX3D_TRIPOSG_ATTN_CHUNK")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
-            .unwrap_or(6144)
+            .unwrap_or(if device.is_vulkan() { 1024 } else { 6144 })
     })
 }
 
@@ -262,7 +264,7 @@ impl TripoSgDiT {
             blocks,
             norm_out,
             proj_out,
-            attn_chunk: attn_chunk_size(),
+            attn_chunk: attn_chunk_size(vb.device()),
         })
     }
 

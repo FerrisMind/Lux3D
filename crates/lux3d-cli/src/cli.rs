@@ -3973,6 +3973,11 @@ fn run_triposg(
         } else {
             "infer"
         };
+        // Attribute the GPU tail of the conditioning/denoise phase to this
+        // stage instead of letting it leak into the first SDF sync.
+        if let Err(err) = device.synchronize() {
+            eprintln!("[stage] {label} sync failed: {err}");
+        }
         eprintln!("[stage] {label}: {:.2}s", t1.elapsed().as_secs_f64());
     }
     let t2 = std::time::Instant::now();

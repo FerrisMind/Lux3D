@@ -2444,9 +2444,11 @@ impl TripoSgPipeline {
             }
         })?;
         let bounds = options.effective_bounds();
+        let stage_time = std::env::var_os("LUX3D_STAGE_TIME").is_some();
         let mut mesh_cpu = if options.use_flash_decoder {
             // Reference default (`use_flash_decoder=True`): hierarchical
             // flash SDF query schedule + clean-room DiffDMC.
+            let sdf_started = std::time::Instant::now();
             let grid = flash_sdf_grid(
                 vae,
                 &latents,
@@ -2457,11 +2459,24 @@ impl TripoSgPipeline {
             .map_err(|source| Lux3dError::CanonicalWeightsValidation {
                 message: format!("TripoSG flash SDF grid decode failed: {source}"),
             })?;
+            if stage_time {
+                eprintln!(
+                    "[stage]   triposg.sdf: {:.2}s",
+                    sdf_started.elapsed().as_secs_f64()
+                );
+            }
+            let dmc_started = std::time::Instant::now();
             let mesh = flash_dual_marching_cubes(&grid).map_err(|source| {
                 Lux3dError::CanonicalWeightsValidation {
                     message: format!("TripoSG flash DMC failed: {source}"),
                 }
             })?;
+            if stage_time {
+                eprintln!(
+                    "[stage]   triposg.dmc: {:.2}s",
+                    dmc_started.elapsed().as_secs_f64()
+                );
+            }
             // Reference pipelines wrap the DMC output in
             // `trimesh.Trimesh(..., process=True)`, which drops vertices no
             // face references (NaN-padded boundary shells at depth >= 7).
