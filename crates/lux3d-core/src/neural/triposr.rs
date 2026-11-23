@@ -81,7 +81,7 @@ impl TripoNeuralStage {
         let device = scene_code.device().clone();
         let total_positions = (resolution as usize).pow(3);
         let step = chunk_size.max(1);
-        let mut density_values = vec![0f32; total_positions];
+        let mut density_chunks = Vec::new();
         let mut query_positions = Vec::with_capacity(step * 3);
         let mut start = 0usize;
         while start < total_positions {
@@ -99,20 +99,23 @@ impl TripoNeuralStage {
                         message: format!("failed to materialize TripoSR query chunk: {source}"),
                     }
                 })?;
-            let density_chunk = pipeline
-                .query_triplane_density(&scene_code, &query_chunk, len)?
-                .contiguous()
-                .and_then(|tensor| tensor.to_device(&Device::Cpu))
-                .and_then(|tensor| tensor.flatten_all())
-                .and_then(|tensor| tensor.to_vec1::<f32>())
-                .map_err(
-                    |source| crate::error::Lux3dError::CanonicalWeightsValidation {
-                        message: format!("failed to gather TripoSR density chunk on cpu: {source}"),
-                    },
-                )?;
-            density_values[start..start + len].copy_from_slice(&density_chunk);
+            // Keep each chunk on the device. A per-chunk `to_vec1` forces a
+            // blocking fence wait per chunk (69 for a 128^3 grid), which
+            // serializes the GPU against the host during the whole field
+            // sweep and cost ~40% of the TripoSR mesh stage on Vulkan. The
+            // full grid is only 4 bytes per cell, so cat once and download
+            // once.
+            density_chunks.push(pipeline.query_triplane_density(&scene_code, &query_chunk, len)?);
             start += len;
         }
+        let density_refs = density_chunks.iter().collect::<Vec<_>>();
+        let density_values = Tensor::cat(&density_refs, 0)
+            .and_then(|tensor| tensor.to_device(&Device::Cpu))
+            .and_then(|tensor| tensor.flatten_all())
+            .and_then(|tensor| tensor.to_vec1::<f32>())
+            .map_err(|source| crate::error::Lux3dError::CanonicalWeightsValidation {
+                message: format!("failed to gather TripoSR density grid on cpu: {source}"),
+            })?;
 
         Ok(TripoDensityGridCpu {
             resolution,
@@ -140,7 +143,7 @@ impl TripoNeuralStage {
         })?;
         let step = chunk_size.max(1);
         let vertex_count = vertices.len() / 3;
-        let mut colors = vec![0f32; vertices.len()];
+        let mut color_chunks = Vec::new();
         let mut start = 0usize;
         while start < vertex_count {
             let len = (vertex_count - start).min(step);
@@ -154,22 +157,20 @@ impl TripoNeuralStage {
                         ),
                     },
                 )?;
-            let color_chunk = pipeline
-                .query_triplane_color(&scene_code, &vertex_tensor, len)?
-                .contiguous()
-                .and_then(|tensor| tensor.to_device(&Device::Cpu))
-                .and_then(|tensor| tensor.flatten_all())
-                .and_then(|tensor| tensor.to_vec1::<f32>())
-                .map_err(
-                    |source| crate::error::Lux3dError::CanonicalWeightsValidation {
-                        message: format!(
-                            "failed to gather TripoSR vertex color chunk on cpu: {source}"
-                        ),
-                    },
-                )?;
-            colors[offset..end].copy_from_slice(&color_chunk);
+            // Same one-download strategy as the density grid: the color pass
+            // runs over the final mesh bounds and does not need a per-chunk
+            // blocking readback.
+            color_chunks.push(pipeline.query_triplane_color(&scene_code, &vertex_tensor, len)?);
             start += len;
         }
+        let color_refs = color_chunks.iter().collect::<Vec<_>>();
+        let colors = Tensor::cat(&color_refs, 0)
+            .and_then(|tensor| tensor.to_device(&Device::Cpu))
+            .and_then(|tensor| tensor.flatten_all())
+            .and_then(|tensor| tensor.to_vec1::<f32>())
+            .map_err(|source| crate::error::Lux3dError::CanonicalWeightsValidation {
+                message: format!("failed to gather TripoSR vertex colors on cpu: {source}"),
+            })?;
 
         Ok(colors
             .into_iter()
