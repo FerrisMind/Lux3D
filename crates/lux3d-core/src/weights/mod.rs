@@ -495,9 +495,33 @@ fn cache_root(options: &ModelAssetOptions) -> Result<PathBuf> {
         return Ok(cache_dir.clone());
     }
 
+    // One model store for the whole install: `LUX3D_MODEL_CACHE` points the
+    // default canonical-package root (and the HF download staging under it) at
+    // the same tree the benchmark/e2e harnesses use, so a family is downloaded
+    // once instead of once per cache location.
+    if let Some(root) = std::env::var_os("LUX3D_MODEL_CACHE") {
+        let root = PathBuf::from(root);
+        if !root.as_os_str().is_empty() {
+            return Ok(root);
+        }
+    }
+
     dirs::cache_dir()
         .map(|root| root.join("LuxRT").join("models"))
         .ok_or(Lux3dError::CacheDirUnavailable)
+}
+
+/// Drop the Hugging Face staging cache for `repo_id` after its files were
+/// materialized into the package dir.
+///
+/// `copy_asset` copies every required file out of the hub cache, so keeping the
+/// cache would store each model twice (13 GB + 11 GB of byte-identical blobs on
+/// this checkout). The cache is only a download intermediate: a later
+/// re-download simply fetches it again. Best-effort — a file still held open by
+/// another process keeps the directory alive and the next run reuses it.
+fn drop_hub_repo_cache(hub_cache: &Path, repo_id: &str) {
+    let dir = hub_cache.join(format!("models--{}", repo_id.replace('/', "--")));
+    let _ = fs::remove_dir_all(dir);
 }
 
 fn package_dir(cache_root: &Path, family: ModelFamily) -> PathBuf {
@@ -526,7 +550,7 @@ fn download_canonical_package(
         .filter(|value| !value.is_empty());
 
     let api = ApiBuilder::from_env()
-        .with_cache_dir(hub_cache)
+        .with_cache_dir(hub_cache.clone())
         .with_token(token)
         .with_user_agent("ferrismind", "LuxRT")
         .with_progress(false)
@@ -550,6 +574,9 @@ fn download_canonical_package(
             })?;
         copy_asset(&fetched, &package_dir.join(filename))?;
     }
+
+    // Single copy on disk: the package dir now holds every required file.
+    drop_hub_repo_cache(&hub_cache, family.huggingface_repo_id());
 
     Ok(())
 }

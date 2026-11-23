@@ -133,10 +133,18 @@ fn validate_raw_model_dir(family: ModelFamily, path: &Path) -> anyhow::Result<()
 }
 
 fn download_raw_model_dir_for_tests(family: ModelFamily) -> anyhow::Result<PathBuf> {
-    let cache_base = dirs::cache_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("LuxRT")
-        .join("raw-test-models");
+    // `LUX3D_RAW_MODEL_CACHE` keeps the raw-loader test models in the same
+    // single store as the canonical packages (`LUX3D_MODEL_CACHE`), instead of
+    // a second %LOCALAPPDATA%\LuxRT tree.
+    let cache_base = std::env::var_os("LUX3D_RAW_MODEL_CACHE")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| {
+            dirs::cache_dir()
+                .unwrap_or_else(std::env::temp_dir)
+                .join("LuxRT")
+                .join("raw-test-models")
+        });
     let raw_dir = cache_base.join(family.as_str());
     fs::create_dir_all(&raw_dir)
         .with_context(|| format!("failed to create {}", raw_dir.display()))?;
@@ -166,7 +174,7 @@ fn download_raw_model_dir_for_tests(family: ModelFamily) -> anyhow::Result<PathB
         .filter(|value| !value.is_empty());
 
     let api = ApiBuilder::from_env()
-        .with_cache_dir(hub_cache)
+        .with_cache_dir(hub_cache.clone())
         .with_token(token)
         .with_user_agent("ferrismind", "LuxRT-tests")
         .with_progress(false)
@@ -210,6 +218,15 @@ fn download_raw_model_dir_for_tests(family: ModelFamily) -> anyhow::Result<PathB
     }
 
     validate_raw_model_dir(family, &raw_dir)?;
+
+    // One copy on disk: every required raw file was copied out of the hub
+    // staging cache, so drop the hub's per-repo dir (byte-identical blobs).
+    let repo_dir = hub_cache.join(format!(
+        "models--{}",
+        official_raw_model_repo_id(family).replace('/', "--")
+    ));
+    let _ = fs::remove_dir_all(repo_dir);
+
     Ok(raw_dir)
 }
 
