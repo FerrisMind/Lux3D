@@ -48,8 +48,18 @@ fn debug_stage(label: &str, xs: &Tensor) {
     if std::env::var_os("LUX3D_VAE_STAGE_TIME").is_some() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static PRINTED: AtomicUsize = AtomicUsize::new(0);
+        static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
-        if PRINTED.fetch_add(1, Ordering::Relaxed) < 24 {
+        // The KV self-attention blocks alone emit ~190 stages before the first
+        // SDF query chunk, so the default cap hides the query-path split.
+        // `LUX3D_VAE_STAGE_PRINTS` raises it for profiling runs.
+        let cap = *CAP.get_or_init(|| {
+            std::env::var("LUX3D_VAE_STAGE_PRINTS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(24)
+        });
+        if PRINTED.fetch_add(1, Ordering::Relaxed) < cap {
             let started = std::time::Instant::now();
             let _ = xs.device().synchronize();
             let mut last = LAST.lock().unwrap();
@@ -87,6 +97,67 @@ fn attn_chunk_size(device: &Device) -> usize {
             .filter(|value| *value > 0)
             .unwrap_or(if device.is_vulkan() { 1024 } else { 6144 })
     })
+}
+
+/// Row chunk for the decoder feed-forward (`dim -> dim * 4 -> dim`).
+///
+/// The SDF query path runs up to 32768 points per decoder pass, so an
+/// unchunked FF allocates `[1, 32768, 4096]` f32 three times over (`ff_in`
+/// output, GELU, `ff_out`). Measured on the 4-sample TripoSG batch (RTX 3060
+/// 12 GiB):
+///   - no split:  1681 s, 11.75 GiB peak (fails/thrashes at the memory limit)
+///   - 16384 rows: 325 s fast mode, 10.4 GiB peak; exact mode thrashes
+///   - 8192 rows:  419 s fast mode; exact mode 515 s, 9.4 GiB peak
+///
+/// The exact path additionally allocates the q8_1 activation pre-pass per
+/// GEMM, so it needs the smaller transient; fast mode keeps the wider GEMM.
+/// Splitting the sequence is numerically indistinguishable (each output row
+/// reduces over the same K).
+fn ff_row_chunk() -> usize {
+    static CHUNK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CHUNK.get_or_init(|| {
+        if let Some(value) = std::env::var("LUX3D_TRIPOSG_FF_ROW_CHUNK")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            return value.max(1);
+        }
+        let fast = std::env::var("CANDLE_VK_FAST")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        if fast { 16384 } else { 8192 }
+    })
+}
+
+/// Apply `ff_out(gelu(ff_in(xs)))` with the sequence split into
+/// [`ff_row_chunk`] rows so each `dim * 4` intermediate stays bounded.
+/// Supports the `[n, dim]` and `[1, n, dim]` ranks the decoder uses; other
+/// ranks keep the unchunked path.
+fn feed_forward_bounded(
+    ff_in: &Linear,
+    ff_out: &Linear,
+    xs: &Tensor,
+) -> CandleResult<Tensor> {
+    let rank = xs.rank();
+    let seq_dim = match rank {
+        2 => 0,
+        3 => 1,
+        _ => return ff_out.forward(&ff_in.forward(xs)?.gelu_erf()?),
+    };
+    let chunk = ff_row_chunk();
+    let rows = xs.dim(seq_dim)?;
+    if rows <= chunk {
+        return ff_out.forward(&ff_in.forward(xs)?.gelu_erf()?);
+    }
+    let mut parts = Vec::with_capacity(rows.div_ceil(chunk));
+    let mut start = 0usize;
+    while start < rows {
+        let len = (rows - start).min(chunk);
+        let part = xs.narrow(seq_dim, start, len)?;
+        parts.push(ff_out.forward(&ff_in.forward(&part)?.gelu_erf()?)?);
+        start += len;
+    }
+    let refs = parts.iter().collect::<Vec<_>>();
+    Tensor::cat(&refs, seq_dim)
 }
 
 /// Cached `[1, 1, num_freqs]` logspace frequency table for the decoder's
@@ -374,11 +445,10 @@ impl TripoSgVaeDecoder {
                 .forward(&block.norm1.forward(&hidden)?, self.attn_chunk)?;
             debug_stage("kv-self-attn", &attn_out);
             hidden = (hidden + attn_out)?;
-            let ff = block.ff_out.forward(
-                &block
-                    .ff_in
-                    .forward(&block.norm3.forward(&hidden)?)?
-                    .gelu_erf()?,
+            let ff = feed_forward_bounded(
+                &block.ff_in,
+                &block.ff_out,
+                &block.norm3.forward(&hidden)?,
             )?;
             debug_stage("kv-self-ff", &ff);
             hidden = (hidden + ff)?;
@@ -457,25 +527,31 @@ impl TripoSgVaeDecoder {
         let points = points.to_dtype(k_heads.dtype())?;
         debug_stage("decode-points-cast", &points);
         let num_points = points.dim(0)?;
-        let step = chunk.max(1);
-        let mut chunks = Vec::new();
-        let mut start = 0usize;
-        while start < num_points {
-            let len = (num_points - start).min(step);
-            let query_points = points.narrow(0, start, len)?.contiguous()?;
-            debug_stage("decode-narrow", &query_points);
-            let embedded = self.embed_points(&query_points)?; // [len, 51]
+        let mut step = chunk.max(1);
+        // Smallest query step the allocation-retry ladder falls back to. Each
+        // step costs ~40 fixed dispatches per chunk, but halving the step also
+        // halves the largest FF transient (`[len, dim * 4]` f32): 2048 points
+        // peaks at 32 MiB instead of 256 MiB at 16384.
+        const MIN_QUERY_STEP: usize = 2048;
+
+        // One decode pass over `query_points`: block 16 (cross-attention +
+        // FFN), norm_out, proj_out, negate. Extracted so an allocation failure
+        // can retry the SAME points with a smaller step.
+        let decode_chunk = |query_points: &Tensor| -> CandleResult<Tensor> {
+            let len = query_points.dim(0)?;
+            debug_stage("decode-narrow", query_points);
+            let embedded = self.embed_points(query_points)?; // [len, 51]
             debug_stage("decode-embed", &embedded);
 
             // Block 16 (cross-attention only): x += attn2(norm2(x), kv);
             // x += ff(norm3(x)). The reference treats the query chunk as a
             // batch-1 sequence ([1, N, 3] -> [1, N, dim]); restore that rank
             // after the flat projection.
-            let mut hidden =
-                self.cross_block
-                    .proj_query
-                    .forward(&embedded)?
-                    .reshape((1, len, self.cfg.dim))?;
+            let mut hidden = self
+                .cross_block
+                .proj_query
+                .forward(&embedded)?
+                .reshape((1, len, self.cfg.dim))?;
             debug_stage("decode-proj-query", &hidden);
             let attn_out = self.cross_block.attn2.forward(
                 &self.cross_block.norm2.forward(&hidden)?,
@@ -486,12 +562,10 @@ impl TripoSgVaeDecoder {
             )?;
             debug_stage("decode-attn2", &attn_out);
             hidden = (hidden + attn_out)?;
-            let ff = self.cross_block.ff_out.forward(
-                &self
-                    .cross_block
-                    .ff_in
-                    .forward(&self.cross_block.norm3.forward(&hidden)?)?
-                    .gelu_erf()?,
+            let ff = feed_forward_bounded(
+                &self.cross_block.ff_in,
+                &self.cross_block.ff_out,
+                &self.cross_block.norm3.forward(&hidden)?,
             )?;
             debug_stage("decode-ff", &ff);
             hidden = (hidden + ff)?;
@@ -506,9 +580,36 @@ impl TripoSgVaeDecoder {
             } else {
                 logits.affine(-1.0, 0.0)?
             };
-            chunks.push(logits.flatten_all()?);
-            debug_stage("decode-chunk-negate", chunks.last().unwrap());
-            start += len;
+            let logits = logits.flatten_all()?;
+            debug_stage("decode-chunk-negate", &logits);
+            Ok(logits)
+        };
+
+        let mut chunks = Vec::new();
+        let mut start = 0usize;
+        while start < num_points {
+            let len = (num_points - start).min(step);
+            let query_points = points.narrow(0, start, len)?.contiguous()?;
+            match decode_chunk(&query_points) {
+                Ok(logits) => {
+                    chunks.push(logits);
+                    start += len;
+                }
+                Err(err) => {
+                    // A failed GPU allocation is recoverable: the allocator's
+                    // reclaim ladder already flushed its pool before returning,
+                    // so the same points usually fit at half the step. Halve
+                    // down to MIN_QUERY_STEP and only then propagate.
+                    if step <= MIN_QUERY_STEP {
+                        return Err(err);
+                    }
+                    step = (step / 2).max(MIN_QUERY_STEP);
+                    eprintln!(
+                        "[triposg] SDF decode chunk of {len} points failed ({err}); \
+                         retrying with {step} points"
+                    );
+                }
+            }
         }
         // SDF values feed host-side marching cubes; keep the public output F32.
         // The grid builders pass one outer chunk per call, so avoid the
@@ -792,12 +893,7 @@ impl VaeEncoderCrossBlock {
             attn_chunk,
         )?;
         let hidden = (hidden + attn)?;
-        let ff = self.ff_out.forward(
-            &self
-                .ff_in
-                .forward(&self.norm3.forward(&hidden)?)?
-                .gelu_erf()?,
-        )?;
+        let ff = feed_forward_bounded(&self.ff_in, &self.ff_out, &self.norm3.forward(&hidden)?)?;
         hidden + ff
     }
 }
@@ -1078,12 +1174,7 @@ impl VaeSelfBlock {
             .attn1
             .forward(&self.norm1.forward(hidden)?, attn_chunk)?;
         let hidden = (hidden + attn)?;
-        let ff = self.ff_out.forward(
-            &self
-                .ff_in
-                .forward(&self.norm3.forward(&hidden)?)?
-                .gelu_erf()?,
-        )?;
+        let ff = feed_forward_bounded(&self.ff_in, &self.ff_out, &self.norm3.forward(&hidden)?)?;
         hidden + ff
     }
 }
