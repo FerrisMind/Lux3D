@@ -19,65 +19,136 @@
 
 <h1 align="center">Lux3D / candle-3d</h1>
 
-## Table of Contents
-
-- [What is this?](#what-is-this)
-- [Key Features](#key-features)
-- [Demo](#demo)
-- [Repository Layout](#repository-layout)
-- [Quick Start](#quick-start)
-- [Performance](#performance)
-- [System Requirements](#system-requirements)
-- [License](#license)
-
-## What is this?
-
-Lux3D / candle-3d is a Rust 2024 workspace that provides:
-
-- a Candle-first inference runtime
-- contract inspection for supported model families
-- canonical weight normalization and validation
-- geometry export tooling for point clouds and meshes
-
-Supported model families:
-
-- `pi3`
-- `pi3x`
-- `triposr`
-- `vggt` — VGGT-1B multi-view point/depth/camera inference with optional feedforward or
-  track-based COLMAP export (bundle adjustment opt-in via `--colmap-ba`), depth unprojection,
-  explicit-query or automatic stage-A tracking, and the demo-style GLB scene export. Original
-  weights are CC-BY-NC-4.0 (non-commercial); the commercial checkpoint is distributed separately.
-- `triposg` — TripoSG image-to-mesh inference (DINOv2-large encoder, 21-block rectified-flow
-  DiT, SDF VAE decoder/encoder, reference-default flash decoder + clean-room DiffDMC), plus
-  TripoSG-scribble dual conditioning (`--mode scribble`, standalone one-file GGUF package),
-  batched multi-image `--num-shapes` runs and the reference VAE surface-encode path
-  (`--surface-input`). MIT licensed; the BriaRMBG 1.4 fallback for RGB input ships as the
-  separate `rmbg-1.4` package under the BRIA license.
-- `trellis2` — TRELLIS.2-4B image-to-3D inference (DINOv3 ViT-L/16 encoder, SS flow DiT,
-  shape/texture SLAT flow transformers, FlexiDualGrid VAE, O-Voxel dual-grid mesh with PBR
-  vertex attributes) plus a texturing pipeline for existing meshes (`--texture-mesh`).
-  Reference-default `1024_cascade` pipeline at 12 steps per stage, SS/shape guidance 7.5
-  (texture guidance 1.0), seed 42. Code and model card are MIT; the bundled DINOv3 encoder
-  is a separately licensed gated Meta model. RGB inputs run the reference RMBG-2.0/BiRefNet
-  background remover, shipped as the separate `rmbg-2.0` package under CC-BY-NC-4.0;
-  inputs with a usable alpha channel skip background removal.
-
-## Key Features
-
-- `lux3d-core` implements contracts, runtime loading, export logic, and weight validation.
-- `lux3d-cli` exposes `inspect`, `weights normalize`, `weights quantize`, `run`, and the
-  `ovox mesh2ovox` / `ovox2mesh` / `ovox2glb` volume commands.
-- `lux3d-server-core` exposes an OpenAI-style async HTTP API for Pi3, Pi3X, TripoSR, VGGT, TripoSG, and TRELLIS.2 generation, plus TRELLIS.2 mesh texturing (`POST /v1/meshes/texturings`).
-- Python baseline tooling lives in [`tools/python_baseline/README.md`](https://github.com/oxide-lab/Lux3d/blob/main/tools/python_baseline/README.md).
-- Model-family-specific licensing can be inspected through the CLI before redistribution.
-- **Experimental:** Vulkan and WGPU inference via `--device vulkan` / `--device wgpu` (build with `--features vulkan` / `--features wgpu`). CUDA is the primary backend; the full real-weight e2e suite (18 scenarios, including TripoSG image/batch/surface/scribble) passes on Vulkan and WGPU (see [`E2E-RESULTS.md`](E2E-RESULTS.md)). WGPU remains experimental — may be unstable, produce wrong results, or not work at all depending on hardware and drivers.
-
 ## Demo
 
 https://github.com/user-attachments/assets/0a9f766f-68d3-482a-9c94-c55d0c355808
 
-## Repository Layout
+## What is this?
+
+Lux3D / candle-3d is a Rust 2024 workspace that runs 3D reconstruction and
+generation models on [Candle](https://github.com/FerrisMind/candle) with a
+CUDA-first runtime and Vulkan/WGPU fallbacks. It provides:
+
+- a single CLI for contract inspection, weight normalization, GGUF
+  quantization, inference, and O-Voxel conversion;
+- reproducible canonical weight packages with manifests and checksums;
+- clean-room ports of the reference preprocessing, sampling, and mesh export
+  paths;
+- an OpenAI-style asynchronous HTTP API for point-cloud and mesh generation.
+
+Every model family keeps its upstream license. Review the per-family terms in
+[docs/models.md](docs/models.md) before redistributing weights.
+
+## Supported models
+
+| Family | Task | Output | Upstream |
+|--------|------|--------|----------|
+| [`pi3`](docs/models.md#pi3-and-pi3x) | Multi-view point cloud | PLY / XYZ | [yyfz/Pi3](https://github.com/yyfz/Pi3) |
+| [`pi3x`](docs/models.md#pi3-and-pi3x) | Multi-view point cloud + VO | PLY / XYZ | [yyfz/Pi3](https://github.com/yyfz/Pi3) |
+| [`triposr`](docs/models.md#triposr) | Single-image mesh | GLB / OBJ / PLY / STL | [VAST-AI-Research/TripoSR](https://github.com/VAST-AI-Research/TripoSR) |
+| [`vggt`](docs/vggt.md) | Multi-view geometry + COLMAP | PLY / XYZ / COLMAP / GLB | [facebookresearch/vggt](https://github.com/facebookresearch/vggt) |
+| [`triposg`](docs/models.md#triposg) | Image-to-mesh, scribble, surface encode | GLB / OBJ / PLY / STL | [VAST-AI-Research/TripoSG](https://github.com/VAST-AI-Research/TripoSG) |
+| [`trellis2`](docs/trellis2.md) | Image-to-3D, mesh texturing, O-Voxel | GLB / OBJ / PLY / STL | [microsoft/TRELLIS.2](https://github.com/microsoft/TRELLIS.2) |
+
+Canonical packages are published under `oxide-lab/*` on Hugging Face and
+auto-download into the user cache. `oxide-lab/TRELLIS.2-4B` is reserved but not
+yet published, so TRELLIS.2 needs an explicit `--model-path`.
+
+## Quick start
+
+### Prerequisites
+
+- Rust 1.85+ with `edition = "2024"` support
+- Python 3.x for normalization and evaluation scripts
+- An NVIDIA GPU for verified CUDA inference; Vulkan and WGPU are supported but
+  experimental (see [experimental backends](docs/inference.md#experimental-backends-vulkan-and-wgpu))
+
+### Build
+
+```powershell
+cargo build --release -p lux3d-cli --features cuda
+```
+
+Default builds are CPU-only. GPU backends are Cargo features: `cuda`, `vulkan`,
+`wgpu`, `metal`.
+
+### Inspect and prepare weights
+
+```powershell
+# Show the contract expected by a family
+cargo run -p lux3d-cli -- inspect --repo-root <runtime-root> triposg
+
+# Normalize a raw checkpoint into the canonical package
+cargo run -p lux3d-cli -- weights normalize `
+  --repo-root <runtime-root> `
+  --raw-model-dir <raw-triposg-dir> `
+  --output-dir <canonical-triposg-dir> triposg
+```
+
+Full weight guides: [canonical packages and quantization](docs/weights.md).
+
+### Generate
+
+```powershell
+# Image -> mesh (auto-downloads the canonical TripoSG package)
+cargo run -p lux3d-cli --features cuda -- run triposg `
+  --source .\input.png --output .\out.glb
+
+# Image -> textured GLB (explicit TRELLIS.2 package; RMBG-2.0 is separate)
+cargo run -p lux3d-cli --features cuda -- run trellis2 `
+  --model-path <canonical-trellis2-dir> `
+  --rmbg-model-path <canonical-rmbg2-dir> `
+  --source .\input.png --output .\out.glb
+```
+
+All family commands, flags, and output-format rules:
+[docs/inference.md](docs/inference.md).
+
+### Serve
+
+```powershell
+cargo run -p lux3d-server --features cuda -- --host 127.0.0.1 --port 8080
+curl http://127.0.0.1:8080/health
+```
+
+Endpoints, request fields, and SSRF policy: [docs/server.md](docs/server.md).
+
+## Documentation
+
+| Document | Contents |
+|----------|----------|
+| [docs/models.md](docs/models.md) | Supported families, pipeline summaries, upstream attribution, licensing |
+| [docs/inference.md](docs/inference.md) | `run` commands for every family, output formats, experimental backends, O-Voxel commands |
+| [docs/vggt.md](docs/vggt.md) | VGGT preprocessing, COLMAP export, tracking, GLB scene, tensor dumps |
+| [docs/trellis2.md](docs/trellis2.md) | TRELLIS.2 pipeline variants, sampling, post-processing, texture baking, mesh texturing |
+| [docs/weights.md](docs/weights.md) | Canonical package layout, normalization, GGUF quantization, measured fidelity |
+| [docs/server.md](docs/server.md) | HTTP API, server flags, job workflow, embedding the router |
+| [docs/performance.md](docs/performance.md) | Backend benchmarks, warm-loop results, memory behavior |
+| [FEATURES.md](FEATURES.md) | Feature inventory and user stories |
+| [E2E.md](E2E.md) | End-to-end scenario matrix and how to run it |
+| [E2E-RESULTS.md](E2E-RESULTS.md) | Latest real-weight e2e results |
+| [PERF-NOTES.md](PERF-NOTES.md) | Performance investigation log and remaining levers |
+
+## Performance
+
+Measured inference time (`[stage] infer`: preprocessing + neural pass, weights
+excluded) on an NVIDIA GeForce RTX 3060 12 GiB, Windows (WDDM):
+
+| Model | CUDA | Vulkan | WGPU | Vulkan/CUDA | WGPU/CUDA |
+|---|---:|---:|---:|---:|---:|
+| pi3 (5 frames, 518×518) | **4.82 s** | 7.83 s | 13.96 s | 1.62× | 2.90× |
+| pi3x (6 frames, 518×518) | **7.00 s** | 11.10 s | 31.84 s | 1.59× | 4.55× |
+| triposr (single image) | **1.23 s** | 3.36 s | 4.89 s | 2.73× | 3.98× |
+| vggt (3 frames, 518×518) | **6.76 s** | 10.96 s | 19.34 s | 1.62× | 2.86× |
+
+TripoSG preview (`--steps 2 --num-tokens 1024 --flash-octree-depth 5`): infer
+6.84 s CUDA / 8.56 s Vulkan / 13.13 s WGPU at a ~8.3–8.7 GiB peak. TRELLIS.2
+`1024_cascade` with texture runs in 438 s on CUDA with a 7.8 GiB peak.
+
+Full tables, VRAM numbers, warm-loop results, and known gaps:
+[docs/performance.md](docs/performance.md).
+
+## Repository layout
 
 | Path | Purpose |
 |------|---------|
@@ -85,898 +156,35 @@ https://github.com/user-attachments/assets/0a9f766f-68d3-482a-9c94-c55d0c355808
 | `crates/lux3d-cli` | CLI front-end for inspection, normalization, and inference runs |
 | `crates/lux3d-server-core` | Embeddable Axum router and HTTP API for external applications |
 | `crates/lux3d-server` | Standalone HTTP server binary |
-| `tools/python_baseline` | Python parity tooling and canonical-weight normalization scripts |
+| `docs/` | User guides: models, inference, VGGT, TRELLIS.2, weights, server, performance |
+| `scripts/` | Quantization evaluation, geometry comparison, keypoint conversion |
+| [`tools/python_baseline`](tools/python_baseline/README.md) | Python parity tooling and canonical-weight normalization scripts |
 | `.github/assets` | Project documentation assets |
 
-## Quick Start
-
-### Workspace Checks
-
-```powershell
-cargo metadata --no-deps
-cargo run -p lux3d-cli -- --help
-```
-
-### Inspect Contracts
-
-```powershell
-cargo run -p lux3d-cli -- inspect --repo-root <runtime-root> pi3
-cargo run -p lux3d-cli -- inspect --repo-root <runtime-root> pi3x
-cargo run -p lux3d-cli -- inspect --repo-root <runtime-root> triposr
-cargo run -p lux3d-cli -- inspect --repo-root <runtime-root> vggt
-cargo run -p lux3d-cli -- inspect --repo-root <runtime-root> triposg
-cargo run -p lux3d-cli -- inspect --repo-root <runtime-root> trellis2
-```
-
-### Normalize Canonical Weights
-
-```powershell
-cargo run -p lux3d-cli -- weights normalize --repo-root <runtime-root> --raw-model-dir <raw-pi3-dir> --output-dir <canonical-pi3-dir> pi3
-cargo run -p lux3d-cli -- weights normalize --repo-root <runtime-root> --raw-model-dir <raw-pi3x-dir> --output-dir <canonical-pi3x-dir> pi3x
-cargo run -p lux3d-cli -- weights normalize --repo-root <runtime-root> --raw-model-dir <raw-triposr-dir> --output-dir <canonical-triposr-dir> triposr
-cargo run -p lux3d-cli -- weights normalize --repo-root <runtime-root> --raw-model-dir <raw-vggt-dir> --output-dir <canonical-vggt-dir> vggt
-cargo run -p lux3d-cli -- weights normalize --repo-root <runtime-root> --raw-model-dir <raw-triposg-dir> --output-dir <canonical-triposg-dir> triposg
-cargo run -p lux3d-cli -- weights normalize --repo-root <runtime-root> --raw-model-dir <raw-trellis2-dir> --output-dir <canonical-trellis2-dir> trellis2
-
-# Auxiliary RMBG-2.0 package (CC-BY-NC): use the packer directly.
-python -I tools/python_baseline/normalize_weights.py --family rmbg2 `
-  --raw-model-dir <raw-RMBG-2.0-dir> --output-dir <canonical-rmbg2-dir>
-```
-
-TRELLIS.2 normalization packs the flat `microsoft/TRELLIS.2-4B` layout (seven
-`ckpts/*.json` + `*.safetensors` checkpoint pairs, the external `ss_dec` sparse
-structure decoder, and the DINOv3 config/model files) into the canonical package
-layout that `Trellis2Pipeline::load` and the server expect. The texturing-only shape encoder is not packed into
-the merged canonical weight file. `--texture-mesh` loads it from the raw
-`ckpts/shape_enc_next_dc_f16c32_fp16.safetensors`, from
-`external/shape_enc/model.safetensors` beside a canonical `model.gguf`, or
-from `shape_enc.*` tensors embedded in a standalone GGUF with
-`weights quantize --merge-source` (see the TRELLIS.2 notes under Run
-Inference).
-
-### Quantize Weights to GGUF
-
-`weights quantize` packs the canonical `model.safetensors` into `model.gguf`.
-Only rank-2 `*.weight` matrices become GGUF blocks; norms, biases, embeddings,
-convolutions, and rows that do not divide into the dtype block stay in the
-fallback dtype. Quantized linears run through `QMatMul` (integer dot-product
-kernels), everything else is dequantized on demand.
-
-The converter embeds the sibling `resolved_config.json` in GGUF metadata, so
-`model.gguf` can be used as a **standalone package**: put it alone in a
-directory and pass that directory as `--model-path`. The loader synthesizes
-the manifest/checksums and reads the config from the GGUF. If `model.gguf`
-sits next to a full canonical package, the package files are still validated
-and the GGUF supplies the weights. Rank-0 tensors (training-only buffers such
-as BatchNorm `num_batches_tracked`) are omitted; they are not used at
-inference. `--model-path` also accepts a standalone `.gguf` file directly, so
-quantized files can be distributed flat (`TripoSG-1.5B-Q8_0.gguf`,
-`VGGT-1B-Q8_0.gguf`, ...).
-
-`general.architecture` is derived from the resolved config: top-level
-`architecture`, then `family`, then the model name (`triposg`, `vggt`,
-`rmbg`). For example RMBG writes `BriaRMBG`, TripoSG writes `triposg`, and
-VGGT (whose config has neither key) writes `vggt`. `lux3d.family` always
-records the runtime package family.
-
-```powershell
-# Q8_0 weights, F16 fallback (reference-quality default)
-cargo run -p lux3d-cli -- weights quantize triposg `
-  --source <canonical-triposg-dir>/model.safetensors `
-  --output <gguf-triposg-dir>/model.gguf --dtype q8_0 --fallback-dtype f16
-
-# K-quants: smaller files, 256-wide blocks
-cargo run -p lux3d-cli -- weights quantize vggt `
-  --source <canonical-vggt-dir>/model.safetensors `
-  --output <gguf-vggt-dir>/model.gguf --dtype q4_k --fallback-dtype f16
-
-# Pi3, Pi3X and TripoSR use the same converter.
-cargo run -p lux3d-cli -- weights quantize pi3 `
-  --source <canonical-pi3-dir>/model.safetensors `
-  --output <gguf-pi3-dir>/model.gguf --dtype q8_0 --fallback-dtype f16
-cargo run -p lux3d-cli -- weights quantize pi3x `
-  --source <canonical-pi3x-dir>/model.safetensors `
-  --output <gguf-pi3x-dir>/model.gguf --dtype q8_0 --fallback-dtype f16
-cargo run -p lux3d-cli -- weights quantize triposr `
-  --source <canonical-triposr-dir>/model.safetensors `
-  --output <gguf-triposr-dir>/model.gguf --dtype q8_0 --fallback-dtype f16
-
-# TRELLIS.2: quantize only the flow-DiT linear weights (`QMatMul` path);
-# DINOv3/VAE/decoder tensors, 3D conv kernels, norms and biases stay F16
-# (their loaders read dense tensors). The F16 build drops the prefixes.
-# The shape encoder lives outside the canonical package; `--merge-source`
-# embeds it in the standalone GGUF under `shape_enc.*` so `--texture-mesh`
-# works without the raw TRELLIS.2-4B checkpoint tree.
-cargo run -p lux3d-cli -- weights quantize trellis2 `
-  --source <canonical-trellis2-dir>/model.safetensors `
-  --output trellis2-q8_0.gguf --dtype q8_0 --fallback-dtype f16 `
-  --prefix ss_flow. --prefix shape_dit_512. --prefix shape_dit_1024. `
-  --prefix tex_dit_512. --prefix tex_dit_1024. `
-  --merge-source <raw-TRELLIS.2-4B-dir>/ckpts/shape_enc_next_dc_f16c32_fp16.safetensors `
-  --merge-prefix shape_enc
-
-# TripoSG-scribble canonical package: the normalizer detects the extra
-# `text_encoder/model.safetensors` shard, merges transformer/vae/image_encoder/
-# text_encoder under one safetensors file, and embeds the configs, pipeline
-# defaults and CLIP tokenizer. `--model-path <dir>` loads it directly.
-cargo run -p lux3d-cli -- weights normalize `
-  --repo-root <runtime-root> `
-  --raw-model-dir <raw-TripoSG-scribble-dir> `
-  --output-dir <canonical-triposg-scribble-dir> triposg
-
-# TripoSG-scribble standalone package: one GGUF with the DINOv2 image encoder,
-# dual-cross-attention DiT, SDF VAE decoder, CLIP text encoder and CLIP
-# tokenizer. --source is the raw `VAST-AI/TripoSG-scribble` checkpoint
-# directory. Rank-2 linear weights in the DiT and VAE are quantized by
-# default (the VAE Q8_0 path is measured near-lossless); DINOv2/CLIP stay in
-# the fallback dtype. Pass `--prefix` to override the set.
-cargo run -p lux3d-cli -- weights quantize triposg --scribble --standalone `
-  --source <raw-TripoSG-scribble-dir> `
-  --output triposg-scribble-q8_0.gguf `
-  --dtype q8_0 --fallback-dtype f16
-
-# Legacy DiT-only override: quantizes only the dual-cross-attention DiT; the
-# text encoder, VAE and DINOv2 stay in the raw checkpoint. Write to
-# `<checkpoint>/transformer/model.gguf` for automatic pickup, or pass the
-# `.gguf` file directly as `--model-path`.
-cargo run -p lux3d-cli -- weights quantize triposg --scribble `
-  --source <raw-TripoSG-scribble-dir> `
-  --output <raw-TripoSG-scribble-dir>/transformer/model.gguf `
-  --dtype q8_0 --fallback-dtype f16
-
-# RMBG-1.4 is an auxiliary package: separate GGUF, F16, same standalone rules.
-cargo run -p lux3d-cli -- weights quantize --aux-family rmbg `
-  --source <canonical-rmbg-dir>/model.safetensors `
-  --output <gguf-rmbg-dir>/model.gguf --dtype f16 --fallback-dtype f16
-
-# RMBG-2.0/BiRefNet for TRELLIS.2 is a separate auxiliary package too.
-# F16 is the reference-fidelity default (alpha max |diff| = 1 on the validation
-# image); Q8_0 shrinks 0.82 GiB to 0.24 GiB with alpha max |diff| = 7.
-cargo run -p lux3d-cli -- weights quantize --aux-family rmbg2 `
-  --source <canonical-rmbg2-dir>/model.safetensors `
-  --output <gguf-rmbg2-f16-dir>/model.gguf --dtype f16 --fallback-dtype f16
-cargo run -p lux3d-cli -- weights quantize --aux-family rmbg2 `
-  --source <canonical-rmbg2-dir>/model.safetensors `
-  --output <gguf-rmbg2-q8_0-dir>/model.gguf --dtype q8_0 --fallback-dtype f16
-
-# Run with only the GGUF directories; no safetensors/manifest/checksums needed.
-cargo run -p lux3d-cli -- run triposg --device cuda `
-  --model-path <gguf-triposg-dir> --rmbg-model-path <gguf-rmbg-dir> `
-  --source <image> --output out.obj
-cargo run -p lux3d-cli -- run trellis2 --device cuda `
-  --model-path <gguf-trellis2-dir> --rmbg-model-path <gguf-rmbg2-f16-dir> `
-  --source <image> --output out.glb
-
-# TripoSG-scribble canonical package: pass the directory containing
-# `model.safetensors`, `resolved_config.json`, `manifest.json` and
-# `checksums.json`. No raw checkpoint is needed.
-cargo run -p lux3d-cli -- run triposg --device cuda --mode scribble `
-  --prompt "a cat with wings" --model-path <canonical-triposg-scribble-dir> `
-  --source <scribble.png> --output out.glb
-
-# TripoSG-scribble standalone package: pass the `.gguf` file or a directory
-# containing only `model.gguf`. No raw checkpoint, safetensors or tokenizer
-# files are needed.
-cargo run -p lux3d-cli -- run triposg --device cuda --mode scribble `
-  --prompt "a cat with wings" --model-path triposg-scribble-q8_0.gguf `
-  --source <scribble.png> --output out.glb
-cargo run -p lux3d-cli -- run triposg --device cuda --mode scribble `
-  --prompt "a cat with wings" --model-path <dir-containing-model.gguf> `
-  --source <scribble.png> --output out.glb
-
-# Legacy DiT-only override: the raw checkpoint supplies the float text
-# encoder/VAE/DINOv2 and tokenizer. A sibling `transformer/model.gguf` is
-# picked up automatically; the `.gguf` can also be passed directly.
-cargo run -p lux3d-cli -- run triposg --device cuda --mode scribble `
-  --prompt "a cat with wings" --model-path models/TripoSG-scribble `
-  --source <scribble.png> --output out.glb
-cargo run -p lux3d-cli -- run triposg --device cuda --mode scribble `
-  --prompt "a cat with wings" --model-path <scribble-dit-q8_0.gguf> `
-  --source <scribble.png> --output out.glb
-
-# Optional: `--all-2d` also quantizes non-`*.weight` rank-2 tensors;
-# `--prefix transformer.` (repeatable) restricts quantization for bisection.
-```
-
-Supported `--dtype` values: `f16`, `f32`, `bf16`, `q8_0`, `q4_0`, `q4_1`,
-`q5_0`, `q5_1`, `q2_k`, `q3_k`, `q4_k`, `q5_k`, `q6_k`. `q8_1`/`q8_k` are
-activation-side GGML types and are rejected as weight targets. A GGUF created
-without an embedded config (no sibling `resolved_config.json` at conversion
-time) can still sit next to a full canonical package, but is rejected as a
-standalone package.
-
-Measured on the bundled canonical packages (`RTX 3060 12 GiB`; TripoSG
-`--steps 2 --num-tokens 1024 --flash-octree-depth 5`, VGGT/Pi3/Pi3X 3 frames,
-TripoSR 1 image at `--mc-resolution 256`):
-
-| model | variant | package size | weights kept |
-|---|---|---|---|
-| TripoSG | canonical F32 | 7.40 GiB | — |
-| TripoSG | q8_0 | 1.97 GiB | 527 matrices |
-| TripoSG | q6_k | 1.52 GiB | 525 |
-| TripoSG | q5_k | 1.28 GiB | 525 |
-| TripoSG | q4_k | 1.05 GiB | 525 |
-| VGGT | canonical F32 | 4.68 GiB | — |
-| VGGT | q8_0 | 1.33 GiB | 384 |
-| VGGT | q6_k | 1.09 GiB | 331 |
-| VGGT | q5_k | 0.95 GiB | 331 |
-| VGGT | q4_k | 0.82 GiB | 331 |
-| Pi3 | canonical F32 | 3.57 GiB | — |
-| Pi3 | f16 | 1.79 GiB | all tensors |
-| Pi3 | q8_0 | 0.95 GiB | 318 |
-| Pi3 | q6_k | 0.74 GiB | 318 |
-| Pi3 | q5_k | 0.62 GiB | 318 |
-| Pi3 | q4_k | 0.51 GiB | 318 |
-| Pi3X | canonical F32 | 5.07 GiB | — |
-| Pi3X | f16 | 2.53 GiB | all tensors |
-| Pi3X | q8_0 | 1.37 GiB | 466 |
-| Pi3X | q6_k | 1.06 GiB | 466 |
-| Pi3X | q5_k | 0.90 GiB | 466 |
-| Pi3X | q4_k | 0.74 GiB | 466 |
-| TripoSR | canonical F32 | 1.56 GiB | — |
-| TripoSR | f16 | 0.78 GiB | all tensors |
-| TripoSR | q8_0 | 0.42 GiB | 244 |
-| TripoSR | q6_k | 0.33 GiB | 235 |
-| TripoSR | q5_k | 0.27 GiB | 235 |
-| TripoSR | q4_k | 0.23 GiB | 235 |
-| TRELLIS.2-4B | canonical (BF16/F16/F32 mix) | 15.07 GiB | — |
-| TRELLIS.2-4B | f16 | 15.16 GiB | all tensors + 284 shape_enc |
-| TRELLIS.2-4B | q8_0 | 9.53 GiB | 1074 DiT linears + 284 shape_enc |
-| TRELLIS.2-4B | q6_k | 8.07 GiB | 1070 + 284 shape_enc |
-| TRELLIS.2-4B | q5_k | 7.27 GiB | 1070 + 284 shape_enc |
-| TRELLIS.2-4B | q4_k | 6.52 GiB | 1070 + 284 shape_enc |
-| TripoSG-scribble | raw checkpoint F16 | 4.38 GiB | — |
-| TripoSG-scribble | canonical F16 | 4.38 GiB | — |
-| TripoSG-scribble | q8_0 standalone | 2.70 GiB | 467 matrices |
-| TripoSG-scribble | q6_k standalone | 2.27 GiB | 465 |
-| TripoSG-scribble | q5_k standalone | 2.03 GiB | 465 |
-| TripoSG-scribble | q4_k standalone | 1.81 GiB | 465 |
-
-F16 is a straight precision conversion, not block quantization: every tensor is
-stored at 16-bit and the linear layers use the regular path without `QMatMul`.
-It costs about twice the Q8_0 size but preserves the F32 result: on
-CUDA/Vulkan/WGPU/CPU the three builds drift at most 0.034% / 0.042% / 0.0014%
-CD (Pi3/Pi3X/TripoSR) with F@1% = 1.000 on every backend. Build it with
-`--dtype f16 --fallback-dtype f16`.
-
-TRELLIS.2-4B quantization is DiT-only by policy: the five flow transformers
-(`ss_flow`, `shape_dit_512/1024`, `tex_dit_512/1024`) load linears through the
-`QMatMul` path, while DINOv3 (`image_cond`), the sparse VAE decoders and the
-dense structure decoder read dense tensors (3D conv kernels, norms), so those
-stages stay F16 in every variant. Standalone builds pass the raw
-`ckpts/shape_enc_next_dc_f16c32_fp16.safetensors` stage through
-`--merge-source ... --merge-prefix shape_enc`; it is stored F16 (its 3D
-convolution kernels flattened) and makes `--texture-mesh` self-contained.
-Candle's GGUF container caps tensor rank at four, so the 3D convolution
-kernels are stored flattened and reshaped by the loader. The K-quants skip
-four `input_layer` matrices whose row length does not divide into 256-wide
-blocks; Q8_0 additionally skips one (row length 8).
-
-TripoSR Q8_0 quantizes 244 matrices; the K-quants use 256-wide blocks, so nine
-matrices whose row length is not divisible by 256 stay in F16.
-
-RMBG-1.4 (auxiliary): F32 0.16 GiB → F16 0.08 GiB; 686 tensors written,
-112 rank-0 training buffers omitted.
-
-TripoSG-scribble quantizes the dual-cross-attention DiT and the SDF VAE
-decoder; with `--standalone` it merges all four networks into one GGUF. The
-CLIP text encoder and the DINOv2 scribble encoder stay in the F16 fallback
-because their Q8_0 conditioning drift reaches the mesh.
-The embedded `lux3d.resolved_config` carries every component config, the
-pipeline defaults and the CLIP `vocab.json`/`merges.txt`/tokenizer configs, so
-the resulting file is a complete model package. The canonical safetensors
-package uses the same merge and embedded config/tokenizer, preserves the raw
-F16 weights, and is loaded with `--model-path <canonical-triposg-scribble-dir>`.
-The legacy DiT-only override still works with the raw checkpoint and is smaller
-(1.67 / 1.29 / 1.08 / 0.88 GiB for q8_0/q6_k/q5_k/q4_k).
-
-Other components can be added with repeatable `--prefix` flags. Measured on
-CUDA against the transformer-only q8 mesh (same `mesh-input.png`, prompt
-"a cat"):
-
-| quantized prefixes | package size | CD rel | F@1% | voxel IoU | note |
-|---|---|---|---|---|---|
-| `transformer.` | 2.92 GiB | — | — | — | old DiT-only baseline |
-| `transformer.` + `vae.` (default) | 2.70 GiB | 0.006% | 1.000 | 0.991 | near-lossless |
-| `transformer.` + `image_encoder.` | 2.65 GiB | 0.184% | 0.939 | 0.700 | noticeable drift |
-| `transformer.` + `text_encoder.` | 2.81 GiB | 0.159% | 0.960 | 0.710 | noticeable drift |
-| all four | 2.33 GiB | 1.017% | 0.812 | 0.558 | topology drift |
-
-The VAE decoder is the only extra component that stays effectively lossless
-under Q8_0, so it is part of the default package. DINOv2 and CLIP Q8_0 are
-supported (CLIP dequantizes at load), but their conditioning drift propagates
-into the mesh, so they stay F16 unless `--prefix` opts them in.
-
-The reference run is the raw checkpoint's native F16 DiT promoted to F32
-(`--dtype` default `f32`), with the same seed/steps/image. Standalone and
-DiT-only builds produce byte-identical meshes for the same quantized DiT and
-input (verified on CUDA for all four variants); the table below is therefore
-shared. Scribble drift (CUDA, RTX 3060; `cat_with_wings.png`, prompt
-"a cat with wings", 16 steps, 512 tokens, dense/hierarchical depth 8, seed 42;
-reference 80,109 vertices / 159,976 faces):
-
-| variant | CD rel | F@0.5% | F@1% | voxel IoU | normal | vertices | faces | max drift | mean drift |
-|---|---|---|---|---|---|---|---|---|---|
-| q8_0 | 0.461% | 0.626 | 0.907 | 0.268 | 0.925 | 82,145 | 164,044 | 0.0669 | 0.0131 |
-| q6_k | 0.603% | 0.515 | 0.812 | 0.204 | 0.908 | 84,865 | 169,440 | 0.1043 | 0.0171 |
-| q5_k | 0.557% | 0.523 | 0.857 | 0.203 | 0.920 | 76,732 | 153,204 | 0.0654 | 0.0158 |
-| q4_k | 0.744% | 0.444 | 0.742 | 0.167 | 0.893 | 83,340 | 166,368 | 0.1421 | 0.0211 |
-
-Max/mean drift are the existing `compare_geometry.py` nearest-neighbour
-metrics (`max`, `chamfer_l1_mean` in mesh units); voxel IoU captures the
-topology change (marching-cubes vertex/face counts move by up to 6%). The
-CFG-distilled scribble DiT is far more quantization-sensitive than the image
-TripoSG model: only Q8_0 keeps F@1% above 0.90, and every K-quant changes the
-surface topology substantially. Prefer Q8_0 for scribble; Q6_K is a compact
-fallback, Q5_K/Q4_K are preview-grade. The standalone package is the default
-distribution format; the DiT-only GGUF remains available for users who already
-keep the raw checkpoint.
-
-### Quantization Fidelity
-
-`scripts/compare_geometry.py` computes drift against the float reference:
-symmetric Chamfer-L1 (relative to the reference bbox diagonal), F-score@tau,
-surface voxel IoU, normal consistency for meshes; pointmap/depth PSNR,
-AbsRel, Chamfer and camera-pose AUC for VGGT tensor dumps.
-`scripts/eval_quantization.py` runs the reference plus every quantized package
-and prints the table. For TripoSG, the reference run refuses a raw checkpoint
-directory that contains a sibling `transformer/model.gguf` (the loader would
-prefer it and silently evaluate a quantized reference); pass
-`--allow-reference-gguf` only if that is intentional.
-
-```powershell
-# Mesh drift (TripoSG/TripoSR)
-python scripts/compare_geometry.py mesh <reference.obj> <quantized.obj>
-
-# VGGT: dump raw tensors next to the PLY, then compare
-cargo run -p lux3d-cli -- run vggt --model-path <pkg> --source <frames> --output <out.ply> --dump-npz <out.npz>
-python scripts/compare_geometry.py vggt <reference.npz> <quantized.npz>
-
-# One-shot sweep over several quantized packages
-python scripts/eval_quantization.py triposg --binary target/release/lux3d-cli.exe `
-  --reference <canonical-triposg-dir> --variant q8_0=<dir-q8_0> --variant q4_k=<dir-q4_k> `
-  --source <input-image> --device cuda --output-dir out/eval -- --steps 2 --num-tokens 1024 --flash-octree-depth 5
-
-# The same loop covers the point-cloud and TripoSR families.
-python scripts/eval_quantization.py pi3x --binary target/release/lux3d-cli.exe `
-  --reference <canonical-pi3x-dir> --variant q8_0=<dir-q8_0> `
-  --source <frames-dir> --device cuda --output-dir out/eval-pi3x
-python scripts/eval_quantization.py triposr --binary target/release/lux3d-cli.exe `
-  --reference <canonical-triposr-dir> --variant q4_k=<dir-q4_k> `
-  --source <input-image> --device cuda --output-dir out/eval-triposr `
-  --mc-resolution 256 --mc-threshold 25.0
-
-# TRELLIS.2 (variants are standalone .gguf files, not directories)
-python scripts/eval_quantization.py trellis2 --binary target/release/lux3d-cli.exe `
-  --reference <canonical-trellis2-dir> --variant q8_0=trellis2-q8_0.gguf `
-  --source <input-image> --device cuda --output-dir out/eval-trellis2 -- `
-  --pipeline-type 512 --steps 12 --texture false --seed 42
-
-# TripoSG-scribble (variants are standalone or DiT-only .gguf files; the raw
-# reference dir is exported as LUX3D_TRIPOSG_SCRIBBLE_MODEL_DIR for the
-# reference run and any legacy DiT-only variants)
-python scripts/eval_quantization.py triposg --scribble `
-  --reference <raw-TripoSG-scribble-dir> --variant q8_0=triposg-scribble-q8_0.gguf `
-  --source <scribble.png> --device cuda --output-dir out/eval-scribble -- `
-  --mode scribble --prompt "a cat with wings"
-```
-
-TripoSG mesh drift (2 steps, 1024 tokens, depth 5; reference is the same
-backend's F32 mesh):
-
-| variant | backend | CD rel | F@1% | voxel IoU | VRAM (delta) | wall |
-|---|---|---|---|---|---|---|
-| q8_0 | CUDA | 0.026% | 0.996 | 0.994 | 3.1 GiB | 10.4 s |
-| q8_0 | Vulkan | 0.184% | 0.978 | 0.970 | 3.9 GiB | 13.3 s |
-| q6_k | CUDA | 0.135% | 0.988 | 0.988 | — | — |
-| q6_k | Vulkan | 0.134% | 0.995 | 0.995 | — | — |
-| q5_k | CUDA | 0.155% | 0.993 | 0.994 | — | — |
-| q5_k | Vulkan | 0.224% | 0.980 | 0.984 | — | — |
-| q4_k | CUDA | 0.253% | 0.973 | 0.953 | 2.2 GiB | 10.0 s |
-| q4_k | Vulkan | 0.180% | 0.982 | 0.972 | 2.3 GiB | 12.7 s |
-| F32 | CUDA | — | — | — | 8.6 GiB | 14.9 s |
-| F32 | Vulkan | — | — | — | 8.8 GiB | 17.1 s |
-
-Two-step sampling is input-sensitive. On a deliberately harsh RGB input
-(`mesh-input-rgb.png`, exercising the RMBG path) Q5_K and Q4_0 drifted to
-~1.4% Chamfer while Q4_K stayed at 0.23% and Q8_0 at 0.06%. The outliers are
-repeatable on that input but do not reproduce on the alpha input above, so
-treat Q5_K/Q4_0 as input-dependent and prefer Q8_0/Q6_K/Q4_K for deployment.
-
-VGGT (3 frames; reference is the same backend's F32 tensors; pose AUC on the
-2 relative frame pairs):
-
-| variant | backend | pointmap PSNR | depth PSNR | depth AbsRel | CD rel | pose AUC@5 | VRAM (delta) |
-|---|---|---|---|---|---|---|---|
-| q8_0 | CUDA | 53.1 dB | 48.1 dB | 0.0038 | 0.274% | 1.0 | 4.7 GiB |
-| q8_0 | Vulkan | 55.9 dB | 53.5 dB | 0.0020 | 0.182% | 1.0 | 4.4 GiB |
-| q8_0 | WGPU | 55.4 dB | 51.0 dB | 0.0027 | 0.193% | 1.0 | — |
-| q6_k | CUDA | 45.7 dB | 44.8 dB | 0.0053 | 0.571% | 1.0 | — |
-| q6_k | Vulkan | 46.5 dB | 49.5 dB | 0.0026 | 0.413% | 0.5 | — |
-| q5_k | CUDA | 34.7 dB | 35.9 dB | 0.0144 | 1.54% | 0.0 | — |
-| q5_k | Vulkan | 36.4 dB | 35.0 dB | 0.0180 | 1.39% | 1.0 | — |
-| q4_k | CUDA | 24.7 dB | 23.5 dB | 0.0683 | 3.50% | 0.0 | 4.2 GiB |
-| q4_k | Vulkan | 26.9 dB | 25.8 dB | 0.0511 | 2.84% | 0.0 | 3.7 GiB |
-| F32 | CUDA | — | — | — | — | — | 6.7 GiB |
-| F32 | Vulkan | — | — | — | — | — | 7.3 GiB |
-
-Pi3/Pi3X point clouds and TripoSR mesh (CUDA detail; reference is the same
-backend's F32 run; Pi3/Pi3X 3 frames, TripoSR `mesh-input.png` at 256):
-
-| family | variant | CD rel | F@0.5% | F@1% | voxel IoU | normal |
-|---|---|---|---|---|---|---|
-| Pi3 | f16 | 0.034% | 1.000 | 1.000 | — | — |
-| Pi3 | q8_0 | 0.166% | 0.990 | 0.99995 | — | — |
-| Pi3 | q6_k | 0.139% | 0.985 | 0.99907 | — | — |
-| Pi3 | q5_k | 0.851% | 0.469 | 0.706 | — | — |
-| Pi3 | q4_k | 0.813% | 0.475 | 0.696 | — | — |
-| Pi3X | f16 | 0.037% | 1.000 | 1.000 | — | — |
-| Pi3X | q8_0 | 0.081% | 0.99999 | 1.000 | — | — |
-| Pi3X | q6_k | 0.873% | 0.129 | 0.598 | — | — |
-| Pi3X | q5_k | 2.279% | 0.000 | 0.000 | — | — |
-| Pi3X | q4_k | 0.789% | 0.274 | 0.719 | — | — |
-| TripoSR | f16 | 0.001% | 1.000 | 1.000 | 0.998 | 1.000 |
-| TripoSR | q8_0 | 0.036% | 0.9997 | 0.99994 | 0.920 | 0.993 |
-| TripoSR | q6_k | 0.050% | 0.9998 | 0.99995 | 0.886 | 0.991 |
-| TripoSR | q5_k | 0.058% | 0.9996 | 0.99985 | 0.863 | 0.990 |
-| TripoSR | q4_k | 0.129% | 0.9964 | 0.99985 | 0.682 | 0.978 |
-
-The quantized packages on every backend, each compared against that backend's
-own F32 run. F32 outputs agree across backends within 0.04% CD with
-F@1% = 1.000, so the spread below is quantization behavior, not baseline
-noise:
-
-| family | variant | CD rel CUDA / Vulkan / WGPU / CPU | F@1% CUDA / Vulkan / WGPU / CPU |
-|---|---|---|---|
-| Pi3 | q8_0 | 0.166 / 0.172 / 0.259 / 0.251% | 0.99995 / 1.000 / 0.9999 / 0.9999 |
-| Pi3 | q6_k | 0.139 / 0.455 / 0.546 / 0.555% | 0.99907 / 0.966 / 0.919 / 0.895 |
-| Pi3 | q5_k | 0.851 / 0.190 / 0.240 / 0.209% | 0.706 / 0.995 / 0.986 / 0.990 |
-| Pi3 | q4_k | 0.813 / 1.191 / 0.964 / 1.016% | 0.696 / 0.535 / 0.663 / 0.644 |
-| Pi3X | q8_0 | 0.081 / 0.071 / 0.086 / 0.155% | 1.000 / 1.000 / 1.000 / 1.000 |
-| Pi3X | q6_k | 0.873 / 1.818 / 1.181 / 1.613% | 0.598 / 0.070 / 0.237 / 0.089 |
-| Pi3X | q5_k | 2.279 / 3.383 / 2.819 / 2.749% | 0.000 / 0.000 / 0.000 / 0.000 |
-| Pi3X | q4_k | 0.789 / 0.328 / 0.383 / 0.370% | 0.719 / 0.947 / 0.930 / 0.938 |
-| TripoSR | q8_0 | 0.036 / 0.025 / 0.032 / 0.028% | 0.9999 / 1.000 / 1.000 / 0.9999 |
-| TripoSR | q6_k | 0.050 / 0.052 / 0.056 / 0.038% | 0.9999 / 1.000 / 0.9999 / 1.000 |
-| TripoSR | q5_k | 0.058 / 0.055 / 0.066 / 0.061% | 0.9998 / 0.9999 / 0.9999 / 0.9999 |
-| TripoSR | q4_k | 0.129 / 0.131 / 0.132 / 0.136% | 0.9998 / 0.9997 / 0.9997 / 0.9997 |
-
-TripoSR voxel IoU is also backend-independent: 0.920/0.944/0.930/0.939 for
-Q8_0 and 0.682/0.675/0.675/0.663 for Q4_K (CUDA/Vulkan/WGPU/CPU), so the
-topology warning below holds on every backend. F16 is not in the table because
-it is not block-quantized, but it keeps F@1% = 1.000 on all four backends with
-CD ≤ 0.034% (Pi3), ≤ 0.042% (Pi3X) and ≤ 0.0014% (TripoSR); TripoSR voxel IoU
-is 0.997–0.998 and normal consistency ≥ 0.9996.
-
-Q8_0 is the only uniformly safe variant: F@1% ≥ 0.9999 for all three families
-on all four backends. Pi3 Q6_K is excellent on CUDA (0.99907) but drops to
-0.895–0.966 on CPU/Vulkan/WGPU, so treat it as a CUDA-only choice; Pi3
-Q5_K/Q4_K are backend-sensitive, so keep them out of production.
-Pi3X needs Q8_0 — Q6_K/Q5_K/Q4_K collapse despite the usual monotonic storage
-error. The image `encoder.` is the sensitive module: keeping it F16 restores
-Q6_K F@1% from 0.598 to 0.99996, but the resulting package is 1.40 GiB versus
-1.37 GiB for all-Q8_0, so Q8_0 is strictly better. TripoSR is the most
-quantization-tolerant family here: Q8_0 through Q4_K keep F@1% ≥ 0.9997 on
-every backend. Q4_K still loses surface topology (voxel IoU 0.66–0.68 versus
-0.92–0.94 at Q8_0), so prefer Q6_K/Q8_0 when topology fidelity matters.
-
-TripoSG and VGGT: TripoSG stays within ~0.25% Chamfer even at Q4_K, so
-Q4_K/Q5_K are practical there. VGGT is pose-sensitive: Q8_0 is near-lossless,
-Q6_K is an acceptable fallback, Q5_K is marginal, and Q4_K is not viable
-(pointmap and camera pose collapse), matching the published finding that naive
-4-bit quantization destroys VGGT-style reconstruction. Use `--dump-npz` and the
-script above on your own validation set before shipping a lower-bit variant.
-RMBG-1.4 is a small matting network and is kept as a separate F16 GGUF, which
-halves its footprint with no measurable mask drift.
-
-TRELLIS.2-4B mesh drift (CUDA, RTX 3060 12 GiB; 512 pipeline, 12 steps per
-sampler, seed 42, texture off, `mesh-input.png`; reference is the canonical
-F32 package on the same backend). The F16 build is essentially exact; the
-O-Voxel dual-grid output is discrete, so quantization flips some voxel
-occupancies — voxel IoU measures that topology drift, not positional error:
-
-| variant | CD rel | F@0.5% | F@1% | voxel IoU | normal | vertices (ref 914,470) | load | infer wall |
-|---|---|---|---|---|---|---|---|---|
-| f16 | 0.0027% | 0.9999 | 1.000 | 0.996 | 0.993 | 914,157 | 0.03 s | 142.8 s |
-| q8_0 | 0.187% | 0.9139 | 0.9835 | 0.623 | 0.904 | 943,514 | 0.03 s | 98.7 s |
-| q6_k | 0.199% | 0.9181 | 0.9813 | 0.609 | 0.905 | 952,678 | 0.03 s | 100.5 s |
-| q5_k | 0.274% | 0.8839 | 0.9729 | 0.445 | 0.890 | 893,909 | 0.03 s | 96.3 s |
-| q4_k | 0.311% | 0.8331 | 0.9625 | 0.400 | 0.885 | 887,078 | 0.03 s | 95.7 s |
-
-Quantized DiT linears are also faster than F32: Q8_0 and below run the 12-step
-512 pipeline in ~96–101 s versus 135 s for F32 and 143 s for F16, because
-`QMatMul` kernels skip the F32 dequantize pass. (WGPU is the exception: its
-packed q8 matmul shader is ~10x slower than the dense f32 GEMM, so Lux3D
-dequantizes q8 weights once at load on WGPU; `LUX3D_WGPU_DEQUANT_WEIGHTS=0`
-restores the packed path. See the backend coverage note below.) Q8_0/Q6_K are
-the production choices (F@1% ≥ 0.98, normals ≥ 0.90); Q5_K/Q4_K are
-preview-grade. The `1024_cascade` path was verified end-to-end with Q4_K
-quantized weights (2-step run with texture: SS DiT, shape DiTs at 512/1024 and
-texture DiT all load through `QMatMul` and decode).
-
-Backend coverage with real weights (same input, seed 42): the geometry-only
-512 run passes on CPU, CUDA, Vulkan and WGPU; the full `1024_cascade` run with
-texture passes on CUDA in 438 s with a **7.8 GiB peak** on a 12 GiB RTX 3060.
-F16 and Q8_0 GGUF variants run on all four testable backends. K-quants
-(Q4_K/Q5_K/Q6_K) run on CPU, CUDA and Vulkan but fail on WGPU at this model
-size because candle's WGPU Q8K activation-roundtrip dispatch exceeds the
-65,535-workgroup limit for the 8,192-wide MLP; that limit applies to the packed
-path (`LUX3D_WGPU_DEQUANT_WEIGHTS=0`), because by default WGPU dequantizes
-quantized weights at load (see below). Q8_0 is the tested quantized choice on
-WGPU until the candle kernel is fixed. Vulkan additionally needed a
-Lux3D-side workaround for candle's unclamped `index_select` dispatch above
-65,535 rows (the sparse VAE gathers reach ~500k rows at resolution 512); the
-runtime splits those gathers into limit-sized chunks, after which Vulkan
-matches CPU/CUDA geometry and is run-to-run deterministic.
-
-Measured q8_0 512 geometry-only wall time (RTX 3060 12 GiB, release CLI, one
-sampler step): CUDA 22.0 s, Vulkan 55.9 s, WGPU 97.6 s (down from 97 / 129 /
-303 s). WGPU now routes ragged F16 sparse-VAE GEMMs through the register-tiled
-kernel and keeps its GEMM accumulators in registers (Naga had lowered the
-dynamically indexed arrays to local memory), and its 256 MiB large-allocation
-flush threshold lets normal intermediates batch. The remaining WGPU cost is
-~7 ms of WDDM latency per compute pass plus the exact-F32 DiT path (CUDA runs
-q8 GEMMs on int8 kernels). The remaining Vulkan gap is candle-side
-submission/drain latency: sparse VAE and DiT issue tens of thousands of small
-dispatches and blocking drains account for ~32 s while GPU kernels sum to a few
-seconds; larger batches/budgets and disabled drains all regressed. The Vulkan
-SS 3D decoder itself is 0.6–1.8 s after the layout/kernel fixes.
-
-### Run Inference
-
-GPU backends are Cargo features (`cuda` / `vulkan` / `wgpu` / `metal`). Default builds are CPU-only. The CLI `--device` enum exposes `cpu`, `cuda`, `wgpu`, and `vulkan` only: a Metal build cannot be selected from the CLI. The server library builder can select Metal (`with_device_backend`), but Metal inference is untested in this repository (see System Requirements).
-
-```powershell
-# Pi3 -> PLY with an explicit canonical package directory (layout matches 3d/canonical-weights/pi3)
-cargo run -p lux3d-cli --features cuda -- run pi3 --model-path <canonical-pi3-dir> --source <input-sequence> --output <output-file.ply>
-
-# Pi3X core -> PLY with an explicit canonical package directory (layout matches 3d/canonical-weights/pi3x)
-cargo run -p lux3d-cli --features cuda -- run pi3x --model-path <canonical-pi3x-dir> --source <input-sequence> --conditions <conditions-file> --output <output-file.ply>
-
-# Pi3X VO -> PLY with an explicit canonical package directory (layout matches 3d/canonical-weights/pi3x)
-cargo run -p lux3d-cli --features cuda -- run pi3x --model-path <canonical-pi3x-dir> --source <input-video> --vo --chunk-size 8 --overlap 4 --conf-threshold 0.05 --inject-condition pose,depth,ray --output <output-file.ply>
-
-# TripoSR -> GLB with an explicit canonical package directory (layout matches 3d/canonical-weights/triposr)
-cargo run -p lux3d-cli --features cuda -- run triposr --model-path <canonical-triposr-dir> --source <input-image> --mc-resolution 256 --mc-threshold 25.0 --output <output-file.glb>
-
-# VGGT -> PLY (world points filtered by confidence > 1.0 by default)
-cargo run -p lux3d-cli -- run vggt --model-path <canonical-vggt-dir> --source <input-sequence> --output <output-file.ply>
-
-# VGGT canonical package auto-download (oxide-lab/VGGT-1B)
-cargo run -p lux3d-cli -- run vggt --source <input-sequence> --output <output-file.ply>
-
-# VGGT pad preprocessing, f16 weights, sequential 2-frame chunks, COLMAP feedforward
-# export + depth-unprojected point cloud next to the default confidence-filtered PLY
-cargo run -p lux3d-cli -- run vggt --model-path <canonical-vggt-dir> --source <input-sequence> --preprocess-mode pad --vggt-dtype f16 --batch-size 2 --colmap-dir <sparse-dir> --depth-points <depth.ply> --output <output-file.ply>
-
-# VGGT square-1024 preprocessing (the official COLMAP demo path), feedforward COLMAP
-# export with the point-head point source and a seeded random point cap
-cargo run -p lux3d-cli -- run vggt --model-path <canonical-vggt-dir> --source <input-sequence> --preprocess-mode square --colmap-dir <sparse-dir> --colmap-point-source pointmap --colmap-seed 42 --output <output-file.ply>
-
-# VGGT from a single image file (one-frame scene)
-cargo run -p lux3d-cli -- run vggt --source <image.png> --output <output-file.ply>
-
-# VGGT explicit track queries -> tracks JSON
-cargo run -p lux3d-cli -- run vggt --source <input-sequence> --track-queries '[{"frame":0,"x":259,"y":259}]' --track-output tracks.json --output <output-file.ply>
-
-# VGGT automatic stage-A query selection (DINOv2-reg ranking + official
-# ALIKED-n16/SuperPoint keypoints) and a track-based COLMAP export without BA
-# (COLMAP-ready input for external BA)
-cargo run -p lux3d-cli -- run vggt --model-path <canonical-vggt-dir> --source <input-sequence> --track-auto --query-frame-num 8 --max-query-pts 4096 --colmap-dir <sparse-dir> --colmap-mode track --output <output-file.ply>
-
-# Weight-free stage-A opt-out (deterministic FPS grid instead of ALIKED+SuperPoint)
-cargo run -p lux3d-cli -- run vggt --source <input-sequence> --track-auto --track-keypoints fps --output <output-file.ply>
-
-# Same track export + external COLMAP bundle adjustment (colmap from PATH or LUX3D_COLMAP_BIN).
-# On success cameras.bin/images.bin/points3D.bin (plus rigs.bin/frames.bin when that COLMAP
-# release writes them) in <sparse-dir> are replaced in place.
-cargo run -p lux3d-cli -- run vggt --model-path <canonical-vggt-dir> --source <input-sequence> --track-auto --colmap-dir <sparse-dir> --colmap-mode track --colmap-ba --output <output-file.ply>
-
-# Stage-A keypoint checkpoints (one-time): convert the official .pth files to safetensors.
-# ALIKED:    https://github.com/Shiaoming/ALIKED/raw/main/models/aliked-n16.pth
-# SuperPoint: https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/superpoint_v1.pth
-python scripts/convert_keypoint_weights.py --input aliked-n16.pth --output models/aliked-superpoint/aliked-n16.safetensors
-python scripts/convert_keypoint_weights.py --input superpoint_v1.pth --output models/aliked-superpoint/superpoint_v1.safetensors
-
-# VGGT demo-style GLB scene (confidence-filtered point cloud + optional camera cones)
-cargo run -p lux3d-cli -- run vggt --model-path <canonical-vggt-dir> --source <input-sequence> --glb <scene.glb> --glb-conf-percentile 50 --glb-show-cam --output <output-file.ply>
-
-# TripoSG -> GLB (defaults: 50 rectified-flow steps, CFG 7.0, seed 42, flash decoder depth 9)
-cargo run -p lux3d-cli --features cuda -- run triposg --rmbg-model-path <canonical-rmbg-dir> --model-path <canonical-triposg-dir> --source <input-image> --output <output-file.glb>
-# Flash decoder is the reference default; disable it for dense/hierarchical marching cubes:
-cargo run -p lux3d-cli --features cuda -- run triposg --model-path <canonical-triposg-dir> --source <input-image> --flash-decoder false --dense-octree-depth 8 --hierarchical-octree-depth 9 --output <output-file.glb>
-# Faster preview: 2 steps, flash depth 5
-cargo run -p lux3d-cli --features cuda -- run triposg --model-path <canonical-triposg-dir> --source <input-image> --steps 2 --flash-decoder true --flash-octree-depth 5 --output <preview.glb>
-
-# TripoSG canonical package auto-download (oxide-lab/TripoSG); RMBG 1.4 is a separate package
-cargo run -p lux3d-cli --features cuda -- run triposg --source <input-image> --output <output-file.glb>
-
-# Batched TripoSG: repeatable --source (one image per source) and --num-shapes per prompt;
-# total batch = sources * --num-shapes, outputs get _0, _1, ... suffixes
-cargo run -p lux3d-cli --features cuda -- run triposg --model-path <canonical-triposg-dir> --source <image-a.png> --source <image-b.png> --num-shapes 2 --output <output.glb>
-
-# TripoSG reference VAE surface encode (scripts/inference_vae.py): a .npy keyed dict
-# {"surface_points": [N,3], "surface_normals": [N,3]}; skips image/DINO/denoise.
-# N must be at least 204800 points (the reference takes a fixed 204800-point subset;
-# smaller inputs error instead of being resampled).
-cargo run -p lux3d-cli --features cuda -- run triposg --model-path <canonical-triposg-dir> --surface-input <surface.npy> --output <output.glb>
-
-# TripoSG-scribble: CLIP prompt + scribble image dual conditioning. Pass a standalone
-# package (.gguf file or directory containing model.gguf), the raw VAST-AI/TripoSG-scribble
-# checkpoint, or a legacy DiT-only .gguf; --prompt is required, --scribble-conf/--prompt-conf
-# override the reference branch weights (0.4 / 1.0)
-cargo run -p lux3d-cli --features cuda -- run triposg --mode scribble --prompt "a cat with wings" --model-path triposg-scribble-q8_0.gguf --source <scribble.png> --scribble-conf 0.4 --prompt-conf 1.0 --output <output.glb>
-
-# Reference post-process/load knobs: `--faces <n>` (target face count after merge-close +
-# meshopt quadric simplification — a clean-room approximation of upstream pymeshlab; 0 = off,
-# the upstream `-1` equivalent; no-op at/above the current face count), `--timesteps` (explicit
-# schedule override, replaces `--steps`), `--bounds` (SDF query window `min_x,...,max_z` in the
-# normalized model frame; a single scalar `b` means the symmetric cube `[-b, b]`), `--dtype` (`f32`
-# reference; `f16` has load/DINO/VAE smoke coverage;
-# `bf16` is accepted but unverified)
-cargo run -p lux3d-cli --features cuda -- run triposg --model-path <canonical-triposg-dir> --source <input-image> --faces 50000 --timesteps 999,777,500,250,0 --bounds "-1.1,-1.1,-1.1,1.1,1.1,1.1" --dtype f16 --output <output.glb>
-
-# TRELLIS.2 -> textured GLB + PBR sidecar from a canonical package
-# (defaults: 1024_cascade pipeline, 12 steps per sampler, SS/shape guidance 7.5,
-# texture guidance 1.0, seed 42, texture on).
-# RGB inputs need the separate RMBG-2.0 package; a sibling `rmbg-2.0`/`RMBG-2.0`
-# directory next to --model-path is discovered automatically.
-cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <canonical-trellis2-dir> --rmbg-model-path <canonical-rmbg2-dir> --source <input-image> --output <output-file.glb>
-# Textured-GLB bake edge length override (default 2048; the CLI accepts 64..=8192, multiples of 8;
-# `--no-texture-export` skips the UV unwrap + bake entirely, `--no-uv-unwrap` skips just the unwrap):
-cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <canonical-trellis2-dir> --rmbg-model-path <canonical-rmbg2-dir> --source <input-image> --texture-size 2048 --output <output-file.glb>
-# Geometry-only run (no texture SLAT / tex VAE / PBR sidecar):
-cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <canonical-trellis2-dir> --rmbg-model-path <canonical-rmbg2-dir> --source <input-image> --texture false --output <output-file.glb>
-# Faster 512-preview pipeline with overrides:
-cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <canonical-trellis2-dir> --rmbg-model-path <canonical-rmbg2-dir> --source <input-image> --pipeline-type 512 --steps 12 --seed 42 --output <preview.glb>
-# The raw microsoft/TRELLIS.2-4B checkpoint directory (pipeline.json + ckpts/) is accepted as-is:
-cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <raw-TRELLIS.2-4B-dir> --rmbg-model-path <raw-RMBG-2.0-dir> --source <input-image> --output <output-file.glb>
-# Resident stage mode (upstream low_vram=False): keep every loaded stage on the device for the
-# whole run instead of the default per-stage load/drop; same outputs, faster, higher peak VRAM
-cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <canonical-trellis2-dir> --rmbg-model-path <canonical-rmbg2-dir> --source <input-image> --no-low-vram --output <output-file.glb>
-# Restore the pre-remesh cleanup chain, or tune the default narrow-band remesh band/project:
-cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <canonical-trellis2-dir> --rmbg-model-path <canonical-rmbg2-dir> --source <input-image> --no-remesh --output <output-file.glb>
-cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <canonical-trellis2-dir> --rmbg-model-path <canonical-rmbg2-dir> --source <input-image> --remesh-band 1 --remesh-project 0.5 --output <output-file.glb>
-
-# TRELLIS.2 texturing of an existing mesh (upstream Trellis2TexturingPipeline):
-# --source is the condition image, --texture-mesh accepts .glb/.obj/.ply/.stl, output must be .glb.
-# The shape encoder comes from the raw `ckpts/shape_enc_next_dc_f16c32_fp16.safetensors`,
-# from `external/shape_enc/model.safetensors` beside a canonical/GGUF package, or from
-# `shape_enc.*` tensors embedded in a standalone GGUF (`weights quantize --merge-source`).
-# `--texture-resolution` 512|1024|1536 (default 1024; 1536 shares the 1024 conditioning/DiT).
-# A standalone GGUF package with the embedded encoder is fully self-contained:
-cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <standalone-trellis2-gguf-dir> --rmbg-model-path <canonical-rmbg2-dir> --source <condition-image> --texture-mesh <input-mesh.glb> --texture-resolution 512 --output textured.glb
-cargo run -p lux3d-cli --features cuda -- run trellis2 --model-path <raw-TRELLIS.2-4B-dir> --rmbg-model-path <raw-RMBG-2.0-dir> --source <condition-image> --texture-mesh <input-mesh.glb> --texture-resolution 1536 --output textured.glb
-
-# Auto-download canonical packages from Hugging Face into the user cache
-cargo run -p lux3d-cli --features cuda -- run pi3 --source <input-sequence> --output <output-file.ply>
-```
-
-**Output formats:** mesh commands (`triposr`, `triposg`, `trellis2`) select the writer from the output extension: `.glb` (primary/default), `.obj`, `.ply`, `.stl`. `.stl` is binary and cannot carry vertex colors, so colored `trellis2` output loses its per-vertex colors there; the textured-GLB writer is `.glb`-only (`--texture-mesh` requires a `.glb` output). Point-cloud commands (`pi3`, `pi3x`, `vggt`) use `.ply` (primary) or `.xyz`. The HTTP mesh API defaults to GLB and accepts `options.output_format`; the point-cloud API defaults to PLY and accepts `options.output_format` (`ply`/`xyz`). A textured `trellis2` `.glb` CLI run embeds the baked base-color + metallic-roughness PNG textures with UV coordinates and converted normals (upstream `to_glb` textured-GLB parity) and additionally writes a `<stem>.pbrvox.bin` + `<stem>.pbr.json` sidecar pair next to the output: the sparse-voxel PBR vertex attributes (6 channels) live outside the GLB/OBJ/PLY/STL mesh formats, so the sidecar preserves them losslessly. `.obj`/`.ply`/`.stl` `trellis2` outputs never embed textures — they keep the per-vertex-color PLY, positions-only OBJ, or color-less binary STL mesh (the textured GLB writer requires a `.glb` output). The HTTP server maps the TRELLIS.2 postprocess and texture-export fields (`postprocess`, `decimation_target`, `fill_hole_perimeter`, `min_component_area`, `remesh`, `remesh_band`, `remesh_project`, `texture`, `texture_size`): `trellis2` mesh jobs with a `.glb` output write the embedded-texture GLB (plus the PBR sidecars in the job workspace; the sidecars are not served through `/content`). The separate `POST /v1/meshes/texturings` endpoint textures an existing mesh and always writes `trellis2-textured.glb` (no PBR sidecar); `--texture-mesh` on the CLI behaves the same way (and requires a `.glb` output). `--return-latent` and the CLI-only TripoSG surfaces (`--surface-input`, `--mode scribble`, repeatable `--source`, `--num-shapes`) have no HTTP fields.
-
-> **VGGT notes:** `--source` accepts a frame directory (`.png`/`.jpg`/`.jpeg`), a video file (`.mp4`/`.mov`/`.avi`/`.mkv`) or a single image file (`.png`/`.jpg`/`.jpeg`/`.webp`/`.bmp`/`.tif`/`.tiff`, a one-frame scene). `--preprocess-mode` selects `crop` (upstream default: resize to width 518, center-crop rows taller than 518, then white-pad to the batch maximum), `pad` (largest side 518, center-padded white 518x518 square, no pixels discarded — use it when the framing matters) or `square` (official `demo_colmap.py` path: black-pad to a 1024x1024 square, model input is its 518x518 bilinear downsample, and the official `x1/y1/x2/y2/width/height` coordinates drive the original-resolution COLMAP export). `--vggt-dtype f32|f16|bf16` selects the network load dtype (`f32` is the reference mode; public outputs stay f32; separate from the TripoSG `--dtype` flag) — F16/BF16 are wired, but the automated parity suite is F32/CUDA-only and BF16 is unverified. `--batch-size N` splits the frame list into sequential chunks of N frames run as independent B=1 passes: it bounds peak VRAM but is NOT one attention pass over all frames — cross-frame attention only sees frames inside their chunk, so chunked results differ from a single full-scene pass whenever the scene spans multiple chunks (default 1; 0 is rejected; a value >= the frame count is a plain single pass). `--colmap-dir` writes a COLMAP binary sparse model (`cameras.bin`/`images.bin`/`points3D.bin`) plus the sibling `points.ply` cloud. The default `--colmap-mode feedforward` reproduces the upstream `demo_colmap.py` feedforward branch: one PINHOLE camera per image, `--colmap-point-source depth` (default; `depth_conf >= --colmap-conf-threshold`, default 5.0) or `pointmap` (point-head `world_points`), capped at `--colmap-max-points` (default 100000); `--colmap-world-conf-threshold <v>` adds an extra `world_points_conf >= v` gate on top of the depth-confidence gate (unset = off). Without `--colmap-seed` the cap keeps a deterministic evenly-spaced subsample; with a seed it draws randomly (distribution-equivalent to numpy's `randomly_limit_trues`, not bit-identical). Intrinsics are rescaled to the original resolution; directory sources keep their frame file names and video/single-image sources write `image_N`; the run prints the export stats. `--colmap-mode track` writes the track-based `batch_np_matrix_to_pycolmap` reconstruction instead (SIMPLE_PINHOLE cameras, multi-frame tracks, `vis > --vis-thresh` default 0.2, reprojection error `< --max-reproj-error` default 8.0, `--shared-camera`, and the per-frame `--colmap-min-inlier-per-frame` floor default 64); it requires `--colmap-dir` and `--track-auto`, and it does not run bundle adjustment by default (the official `--use_ba` default is false) — the output is COLMAP-ready input for external BA/gsplat. `--colmap-ba` opts into running the external `colmap bundle_adjuster --input_path <dir> --output_path <fresh temp dir>` immediately after the track export (binary from `LUX3D_COLMAP_BIN` or `PATH`; track mode only; `--colmap-dir` required): on success `cameras.bin`/`images.bin`/`points3D.bin` are replaced in place and `points.ply` is preserved; on failure the unadjusted model is left untouched and the error includes the captured stderr tail. `--depth-points <path>` unprojects the depth maps to a world-space PLY/XYZ point cloud (`depth_conf > --depth-conf-threshold`, default 1.0). `--track-queries '<json>'` tracks explicit query points (`{"frame":0,"x":F,"y":F}` objects or `[0,x,y]` arrays; pixel coordinates in the model input resolution with x/y in [0, 518); the query frame must be 0 — rotate the clip so the desired query frame comes first) and writes `{"coords": [[[x,y],...],...], "visibility": [[...],...], "confidence": [[...],...]|null}` to `--track-output` (default `<source-stem>_tracks.json`) plus `"query_frames"` for auto mode, using `--track-iters` refinement iterations (default 4; 0 is rejected). `--track-auto` replaces explicit queries with tracking stage A: DINOv2 ViT-B/14-with-registers CLS similarity + FPS ranks `--query-frame-num` frames (default 8, frame 0 prepended when missing), then per-frame query points come from the official ALIKED-n16 + SuperPoint extractors by default (`--track-keypoints aliked-sp`, matching `keypoint_extractor="aliked+sp"`: ALIKED keypoints followed by SuperPoint, per-detector `max_num_keypoints = --max-query-pts` default 4096, `det_thres = 0.005`), and the concatenated points are confidence-gated like `track_predict.py` (conf > 1.2 when more than 512 survive). `--track-keypoints fps` selects the deterministic weight-free FPS grid instead. ALIKED+SuperPoint need converted safetensors at `models/aliked-superpoint/aliked-n16.safetensors` and `superpoint_v1.safetensors` (override with `LUX3D_ALIKED_WEIGHTS` / `LUX3D_SUPERPOINT_WEIGHTS`; download the official `.pth` files and run `python scripts/convert_keypoint_weights.py --input <file.pth> --output <file.safetensors>`); missing checkpoints are an error, never a silent FPS fallback. DINOv2-reg is still required at `models/dinov2_reg4/model.safetensors` or `LUX3D_DINOV2_REG_MODEL_PATH`. Detection runs on the prepared model-resolution frame (the official demo detects on its 1024 px loaded images because its tracker is separate) and points are scaled back before the track head; the official `torch.randperm` query shuffle is not reproduced, so query order is deterministic. Fine tracker stages B/C (LightGlue matching/refinement) are not included, so auto tracks are coarser than the official VGGSfM input. `--track-queries` and `--track-auto` are mutually exclusive, and `--batch-size` chunking > 1 is rejected together with any tracking (the track pass runs over all frames at once). `--track-points-ply <path>` writes one colored vertex per query (frame-0 world point at the query pixel). `--glb <scene.glb>` writes the demo-gradio GLB scene from `predictions_to_glb`: confidence-filtered colored points (drop `--glb-conf-percentile` percent of the lowest-confidence points, default 50; 0 disables the percentile gate and keeps every `conf > 1e-5` point) from `--glb-point-source depth` (default) or `pointmap`, plus per-frame camera cones with `--glb-show-cam`; the scene is aligned to the first camera with the official OpenGL ±y/z convention. `--dump-npz` keeps the raw inference tensors: the historical keys (`world_points`, `world_points_conf`, `depth`, `depth_conf`, `extrinsics`, `intrinsics`, `pose_enc`, `pose_enc_list` `[K, S, 9]` one entry per camera refinement iteration) plus the official demo keys `images`, `extrinsic`, `intrinsic` and `world_points_from_depth`; it works with the track/COLMAP/depth/GLB flags.
-
-> **TRELLIS.2 notes:** `--pipeline-type` accepts `512`, `1024`, `1024_cascade` (reference default), or `1536_cascade` (cascade targeting the 1536 grid with the hardcoded 1024 token-budget stop; the 1024 cascade always decodes at 1024). Variant dispatch and the 1536→…→1024 token-budget loop are covered by tests, but no real-weight end-to-end `1536_cascade` parity run is recorded in this tree. The `--steps` flag feeds all three samplers; per-stage overrides (`--ss-steps/--shape-steps/--tex-steps`, `--ss-guidance/--shape-guidance/--tex-guidance`, `--ss-rescale/--shape-rescale/--tex-rescale`, `--ss-interval/--shape-interval/--tex-interval` as `lo,hi`) replace the per-stage defaults when set (`resolve_stage_params`: a stage `steps` override wins over `--steps`). `--num-samples N` follows the upstream `run(num_samples)` draw structure (`trellis2_image_to_3d.py:208, 253`): ONE joint `[N, 8, R, R, R]` sparse-structure noise draw and ONE joint SLAT noise draw per stage over all samples' concatenated coords (both from `--seed`), one shared conditioning pass, and per-sample SLAT sampling/decode/export; outputs and latent files are suffixed `_0`, `_1`, ... (`N = 1` keeps the single-run path bit-identically). The Lux3D RNG is not bit-identical to `torch.randn`, so the draws are distribution-equivalent, not value-identical, to the reference; `--return-latent <path>` writes `shape_latent`/`tex_latent`/`coords`/`resolution`/`lr_shape_latent`/`meta` as `.npz` (upstream `return_latent` surface). The reference preprocessing is reproduced exactly: LANCZOS max-side downscale, alpha path when RGBA carries non-opaque alpha, otherwise RMBG-2.0/BiRefNet produces the mask (missing RMBG weights is an error — never an opaque fallback), then the alpha>0.8 bbox, Pillow-rounded square crop, premultiply and resize. Mesh post-processing runs by default and mirrors the shipped `to_glb` entry points (`example.py:43`, `app.py:503`): the shared hole fill (`--fill-hole-perimeter`, default 3e-2; 0 = off), then the narrow-band dual-contouring remesh on the canonical `[-0.5, 0.5]^3` frame with `scale = (resolution + 3 * band) / resolution` (`--remesh-band`, default 1 grid cell; `--remesh-project`, default 0 = off) and a single simplify pass toward `--decimation-target` (default 1000000; 0 = keep the remeshed topology). `--no-remesh` restores the previous cleanup chain (aggressive 3x simplify, duplicate-face/non-manifold repair, small-component removal via `--min-component-area`, default 1e-5; 0 = keep all, orientation unification, final simplify) byte-for-byte; `--no-postprocess` disables the whole pass. Remeshed textured GLBs set `doubleSided = false` (upstream `postprocess.py:303`), the non-remeshed/pass-through meshes keep `true`. The remesh branch is a direct port of the official CuMesh narrow-band dual-contouring algorithm (UDF−eps level set, base resolution halved to 32 then adaptive octree expansion, mean edge intersections without QEF, official adaptive diagonal and triangle topology; validated against official CuMesh golden meshes at resolutions 32/64), while hole fill/cleanup/decimation remain clean-room ports on the meshopt simplifier, so the post-remesh simplification can still differ from the reference cumesh pipeline. When `--texture` is on (the default), the textured-GLB export stage reproduces the upstream `to_glb` UV unwrap + PBR bake: `--texture-size <n>` sets the bake edge length (default 2048; the CLI accepts any value in 64..=8192 — the upstream reference only allows 1024..4096 in steps of 1024, and the core adds an nvdiffrast-parity multiple-of-8 rule) and the `.glb` output embeds the baked base-color + metallic-roughness PNGs with TEXCOORD UVs, area-weighted normals and the upstream glTF axis conversion `(x, y, z) -> (x, z, -y)`. `--no-texture-export` skips the whole stage and `--no-uv-unwrap` skips just the xatlas unwrap (both fall back to the vertex-color mesh; `.obj`/`.ply`/`.stl` outputs never embed textures). The xatlas unwrap + bake run on the CPU — measured ~42 s unwrap + ~9 s bake for an 80k-triangle sphere at 2048 (release build, this tree), scaling with `--texture-size` squared. Uncovered atlas texels are filled with a TELEA-approximation inpaint (iterative nearest-valid onion-peel), not the reference `cv2.inpaint`; the run prints `[bake]` stats (charts, atlases, atlas size, texture size, valid/inpainted texel counts). The mesh stays the O-Voxel dual-grid surface and the `<stem>.pbrvox.bin` + `<stem>.pbr.json` sidecar pair remains the lossless per-voxel PBR record. Weight stages load sequentially (~7.8 GiB measured peak on `1024_cascade` with the texture stages resident); CPU inference works but is slow. `--no-low-vram` maps to the upstream `low_vram=False` mode and keeps every stage the run loads resident on the device (one up-front load set, no per-stage drop); the outputs are identical to the default for the same seed, peak VRAM is higher, and a resident set that does not fit fails with an error naming the flag, the stage and the device memory limit instead of silently falling back. Auto-download from `oxide-lab/TRELLIS.2-4B` is reserved but not yet published, so pass an explicit `--model-path` (canonical package or raw checkpoint directory).
-
-> **TRELLIS.2 texturing mode:** `--texture-mesh <file>` textures an existing `.glb`/`.obj`/`.ply`/`.stl` mesh from the `--source` condition image (upstream `Trellis2TexturingPipeline`) instead of running image-to-3D. It preprocesses the mesh into `[-0.5, 0.5]^3` (center/scale to 0.99999 + y/z swap; `--no-preprocess-mesh` requires the input already in that frame), voxelizes to the flexible dual grid at `--texture-resolution` (512, 1024 or 1536, default 1024; 1536 voxelizes/encodes at the full 1536 grid but shares the 1024 conditioning and `tex_dit_1024`), encodes a raw shape SLAT with `shape_enc_next_dc_f16c32_fp16`, samples `tex_dit_512`/`tex_dit_1024` with the `--tex-*` overrides, decodes with synthesized occupancy guides, and bakes the UV atlas. The core `texture_mesh` API bakes directly on caller-supplied per-corner UVs (the reference `postprocess_mesh` UV-reuse branch, no xatlas run), and the CLI `--texture-mesh` path and the HTTP texturing job pass the imported mesh's per-corner UVs through, so an input that carries UVs keeps them (no xatlas) while a mesh without UVs still unwraps; cleanup/decimation/remeshing are not run (UV seams duplicate vertices and zero-area faces are dropped). `--texture-mesh` requires a `.glb` output, rejects `--pipeline-type`/`--max-num-tokens`/`--num-samples`/`--return-latent`/`--no-postprocess`/`--decimation-target`/`--no-texture-export`/`--no-uv-unwrap`/`--texture false`, and writes only the textured GLB (no PBR sidecar). Only `--tex-*`, `--seed`, `--texture-size`, `--texture-resolution` and `--no-preprocess-image`/`--no-preprocess-mesh` apply; `--steps`/`--ss-*`/`--shape-*` are not rejected but have no effect in this mode. The shape encoder is resolved from `<model-dir>/ckpts/shape_enc_next_dc_f16c32_fp16.safetensors` (raw checkpoint layout), `<model-dir>/external/shape_enc/model.safetensors` (sidecar next to a merged canonical/GGUF package), `shape_enc.*` keys in a merged safetensors package, or `shape_enc.*` tensors embedded in a standalone GGUF by `weights quantize --merge-source`; the raw `TRELLIS.2-4B` directory, a canonical `model.gguf` + external encoder/`external/dinov3` layout, and a self-contained standalone TRELLIS.2 GGUF all work. Quantized q8\_0 texturing was smoke-tested on CUDA with `--texture-resolution 512 --texture-size 512` on the q8 512 shape output (507,540 vertices / 1,000,200 faces): 3,241 charts, 2 atlases, 110,789 valid texels, 30 MB PBR GLB with base-color + metallic-roughness PNGs. UV charting welds duplicate-position vertices first, so topology-repair vertex splits do not multiply chart count; chart count tracks connected surface components. `--no-preprocess-image` skips RMBG/crop and feeds the square source image directly (it no longer requires an RMBG model).
-
-> **Experimental backends (Vulkan / WGPU):** select a non-CUDA device with `--device`:
->
-> ```powershell
-> cargo run -p lux3d-cli --features vulkan -- run triposr --device vulkan --source <input-image> --output <output-file.glb>
-> cargo run -p lux3d-cli --features wgpu -- run pi3 --device wgpu --source <input-sequence> --output <output-file.ply>
-> cargo run -p lux3d-cli --features vulkan -- run triposg --device vulkan --source <input-image> --steps 2 --num-tokens 1024 --flash-octree-depth 5 --output <preview.glb>
-> ```
->
-> These paths are experimental and not verified in CI. Inference may be unstable, produce incorrect output, or fail entirely depending on your GPU, driver, and OS. Use CUDA for production workloads.
->
-> Real-weight coverage: all 18 e2e scenarios pass on CUDA, Vulkan and WGPU (RTX 3060 12 GiB) — see [`E2E-RESULTS.md`](E2E-RESULTS.md). For whole-model TripoSG on WGPU keep packed Q8 weights (`LUX3D_WGPU_DEQUANT_WEIGHTS=0`): the default dense-F32 dequant OOMs a 12 GiB card, and dense F16 (`=f16`) mishandles batched DiT denoise (one noisy + one empty mesh for `--num-shapes 2`). The TripoSG VAE decode always runs dense F32 on WGPU, which also avoids a candle hot-ring alias at 512 latent tokens.
-
-### O-Voxel Volume Commands
-
-The `ovox` subcommand group converts between textured meshes and the sparse PBR O-Voxel volume used by TRELLIS.2 (the upstream `o-voxel` examples). It is CLI-only (no HTTP route) and prints a JSON stats report per run.
-
-```powershell
-# Textured mesh -> sparse PBR .vxz (512^3 default; .npz/.ply are also accepted as outputs)
-cargo run -p lux3d-cli -- ovox mesh2ovox <input.glb> <output.vxz>
-
-# .vxz/.npz/.ply -> reconstructed .ply with base-color vertex colors
-cargo run -p lux3d-cli -- ovox ovox2mesh <input.vxz> <output.ply> --grid-size 512 --aabb -0.5,-0.5,-0.5,0.5,0.5,0.5
-
-# .vxz/.npz/.ply -> cleaned, UV-unwrapped, textured .glb (official example defaults:
-# decimation 100000, texture 2048)
-cargo run -p lux3d-cli -- ovox ovox2glb <input.vxz> <output.glb> --grid-size 512 --texture-size 2048
-```
-
-`mesh2ovox` flags: `--grid-size N[,N,N]` (default 512), `--voxel-size S[,S,S]`, `--aabb MINX,...,MAXZ`, `--no-normalize` (skip the official center + `0.99999/max_extent` unit-cube normalization), `--mip-level-offset` (0.0), `--face-weight` (1.0), `--boundary-weight` (0.2), `--regularization-weight` (1e-2), and `--compression none|deflate` (default `deflate`). `.vxz` is written with `none` or `deflate` only: LZMA files can be read (the official writer defaults to LZMA), but LZMA writing is not supported, and zstd-compressed files are rejected with a clear error because this build has no zstd decoder. `ovox2mesh`/`ovox2glb` need `--grid-size` and `--aabb` because `.vxz` does not store the grid size or bounds (defaults 512 and `[-0.5, 0.5]^3`). `ovox2glb` additionally accepts `--decimation-target` (100000), `--texture-size` (2048), `--fill-hole-perimeter` (3e-2) and `--min-component-area` (1e-5).
-
-### Run the HTTP Server
-
-```powershell
-cargo run -p lux3d-server --features cuda -- --host 127.0.0.1 --port 8080
-curl http://127.0.0.1:8080/health
-curl http://127.0.0.1:8080/v1/models
-```
-
-TRELLIS.2 RGB requests need the separate RMBG-2.0 package. Pass it with
-`--trellis2-rmbg-model-path <dir>` / `LUX3D_TRELLIS2_RMBG_MODEL_PATH`, or place
-`rmbg-2.0` (or raw `RMBG-2.0`) next to the explicit `--model-path`. TripoSG's
-`--rmbg-model-path` / `LUX3D_RMBG_MODEL_PATH` remains the separate RMBG-1.4
-package; the two families deliberately do not share weights.
-
-Server binary flags (`crates/lux3d-server/src/main.rs`): `--host` / `--port`
-(`127.0.0.1:8080` default), `--model-path` (`LUX3D_MODEL_PATH`), `--cache-dir`
-(`LUX3D_CACHE_DIR`), `--rmbg-model-path` (`LUX3D_RMBG_MODEL_PATH`),
-`--trellis2-rmbg-model-path` (`LUX3D_TRELLIS2_RMBG_MODEL_PATH`),
-`--cuda-device` (0), `--upload-dir`, `--allow-private-urls`
-(`LUX3D_ALLOW_PRIVATE_URLS`), `--cors-origin` (repeatable),
-`--job-ttl-secs` (86400), `--cleanup-interval-secs` (300), `--access-log`
-(true), `--access-log-health` (false), `--access-log-format text|json`,
-`--request-id-header` (true), and `--metrics` (true). The binary always builds
-with the platform-default device (CUDA off macOS, Metal on macOS metal builds);
-Vulkan/WGPU (and an explicit Metal choice) are reachable only through the
-embeddable router builder's `with_device_backend`.
-
-`source_url` / `mesh_url` fetches are SSRF-hardened: only `http`/`https`
-(no embedded credentials), loopback/RFC1918/link-local/ULA/unspecified/
-multicast/broadcast/CGNAT and IPv4-mapped IPv6 addresses are rejected, DNS
-answers are validated as returned to the connector (no rebinding window),
-redirects are revalidated per hop (max 5, no `https`→`http` downgrade), and the
-fetch uses a 10 s connect / 30 s total timeout with a 64 MiB streaming cap.
-Media fetches ignore proxy environment variables (a proxy would bypass the
-address policy) and reject responses that are still redirects after the policy.
-`--allow-private-urls` (or `LUX3D_ALLOW_PRIVATE_URLS=1`) disables only the
-non-public address filter for LAN deployments; every other rule still applies.
-`source_file_id` / `source_base64` inputs are not affected.
-
-Prebuilt releases (`.github/workflows/release.yml`): Windows + Ubuntu × cpu/cuda/vulkan.
-Names follow llama.cpp (`lux3d-<tag>-bin-…`). CUDA builds do not bundle NVIDIA libraries:
-download the matching `cudart-lux3d-<tag>-…` archive and extract it next to the binaries
-(same directory as the `.exe`; `$ORIGIN` on Linux). The host only needs the NVIDIA driver.
-
-Generation endpoints accept `multipart/form-data` (or JSON) and return `202 Accepted` with an async job object:
-
-| Endpoint | Models | Output |
-|----------|--------|--------|
-| `POST /v1/point-clouds/generations` | `pi3`, `pi3x`, `vggt` | PLY |
-| `POST /v1/meshes/generations` | `triposr`, `triposg`, `trellis2` | GLB |
-| `POST /v1/meshes/texturings` | `trellis2` | GLB (embedded textures) |
-
-`POST /v1/meshes/texturings` textures an existing mesh from one condition image (TRELLIS.2 only). Multipart fields: `source` (condition image), `mesh` (`.glb`/`.obj`/`.ply`/`.stl`), optional `model` (default `trellis2`) and `options`. JSON fields: `source_url`/`source_file_id`/`source_base64`/`source_filename`, `mesh_url`/`mesh_file_id`/`mesh_base64`/`mesh_filename`, optional `model`, `options`, `webhook_url`; at least one of the `source*` variants and one of the `mesh*` variants is required. `options` accepts `output_format` (must be `glb`; default `glb`), `seed` (42), `texture_resolution` (512/1024/1536; default 1024), `texture_size` (2048), `tex_steps`, `tex_guidance_strength`, `tex_guidance_rescale`, `tex_guidance_interval` (`[lo, hi]`), `tex_rescale_t`, `preprocess_image` and `preprocess_mesh` (both default true). The job writes exactly one `trellis2-textured.glb` (baked PBR atlas embedded, no PBR sidecar). Request budgets are enforced before job insertion (HTTP 400 when exceeded): `num_samples <= 64` (TRELLIS.2), `timesteps` length `<= 1000` (TripoSG), and `steps`/`ss_steps`/`shape_steps`/`tex_steps` `<= 1000` per stage. Mesh payloads must carry a supported extension (`.glb`/`.obj`/`.ply`/`.stl`), and texturing JSON validates model/options before resolving media.
-
-Other wired endpoints: `GET /` and `GET /health`; `GET /metrics` (Prometheus; enabled by default with `--metrics`, and the route returns 503 when it is disabled); `GET`/`POST /v1/files`, `GET`/`DELETE /v1/files/{id}`, and `GET /v1/files/{id}/content` (upload once and pass `source_file_id`/`mesh_file_id`); `GET /v1/generations`, `GET`/`DELETE /v1/generations/{id}`, `POST /v1/generations/{id}/cancel`, and `GET /v1/generations/{id}/stream` (SSE status updates); `POST /v1/models/reload`, `POST /v1/models/unload`, and `POST /v1/models/status`; `GET /v1/system/info` and `POST /v1/system/doctor`. Swagger UI is served at `/docs` and the schema at `/api-doc/openapi.json` (the `swagger-ui` feature is on by default).
-
-Common fields:
-
-- `model` — required for point clouds (`pi3`, `pi3x`, or `vggt`), optional for meshes (`triposr` default; set `triposg` for TripoSG or `trellis2` for TRELLIS.2)
-- `source` — required upload (`.zip` frame archive, a video file (`.mp4`/`.mov`/`.avi`/`.mkv`), an image (`.png`/`.jpg`/`.jpeg`/`.webp`), or an already-extracted frame directory)
-- `conditions` — optional Pi3X conditions file
-- `options` — optional JSON string (or JSON object in a JSON request) with family-specific parameters.
-  - TripoSG: `steps`, `guidance_scale`, `seed`, `num_tokens`, `use_flash_decoder`, `flash_octree_depth`, `dense_octree_depth`, `hierarchical_octree_depth`, `query_chunk_size`, `timesteps`, `bounds` (`[min_x,min_y,min_z,max_x,max_y,max_z]`), `faces`, `output_format` (`glb` default, `obj`, `ply`, `stl`). The CLI-only TripoSG surfaces (`--surface-input`, `--mode scribble`, repeatable `--source`, `--num-shapes`) have no request fields.
-  - TRELLIS.2: `steps` (all three Euler samplers), `seed`, `pipeline_type` (`512`/`1024`/`1024_cascade`/`1536_cascade`), `max_num_tokens`, `texture`, `output_format` (`glb` default, `obj`, `ply`), `num_samples` (values > 1 use the same joint-draw structure as the CLI and write `_0`, `_1`, ... outputs; `/content` serves sample 0), `texture_size`, the postprocess fields (`postprocess`, `decimation_target`, `fill_hole_perimeter`, `min_component_area`, `remesh`, `remesh_band`, `remesh_project`), and the per-stage overrides `ss_steps`/`ss_guidance_strength`/`ss_guidance_rescale`/`ss_guidance_interval`/`ss_rescale_t` and the matching `shape_*`/`tex_*` fields. `--return-latent` stays CLI-only; existing-mesh texturing uses `POST /v1/meshes/texturings`.
-  - Point clouds: `output_format` (`ply` default, `xyz`), plus `interval`, `vo`, `chunk_size`, `overlap`, `conf_threshold`, `inject_condition`. The VGGT `--preprocess-mode`/`--batch-size`/`--colmap-dir`/`--depth-points`/`--track-queries`/`--track-auto`/`--glb` surface is CLI-only.
-
-Workflow:
-
-```powershell
-# 1. Create a mesh generation job
-curl -X POST http://127.0.0.1:8080/v1/meshes/generations `
-  -F "model=triposr" `
-  -F "source=@input.png" `
-  -F "options={\"mc_resolution\":256,\"mc_threshold\":25.0}"
-
-# TripoSG job (completed downloads as triposg.glb)
-curl -X POST http://127.0.0.1:8080/v1/meshes/generations `
-  -F "model=triposg" `
-  -F "source=@input.png" `
-  -F "options={\"steps\":50,\"use_flash_decoder\":true,\"flash_octree_depth\":9}"
-
-# TRELLIS.2 job (completed downloads as trellis2.glb)
-curl -X POST http://127.0.0.1:8080/v1/meshes/generations `
-  -F "model=trellis2" `
-  -F "source=@input.png" `
-  -F "options={\"steps\":12,\"seed\":42,\"pipeline_type\":\"1024_cascade\",\"texture\":true}"
-
-# Texture an existing mesh (completed downloads as trellis2-textured.glb):
-# source = condition image, mesh = the .glb/.obj/.ply/.stl to texture
-curl -X POST http://127.0.0.1:8080/v1/meshes/texturings `
-  -F "model=trellis2" `
-  -F "source=@condition.png" `
-  -F "mesh=@input.glb" `
-  -F "options={\"texture_resolution\":1024,\"texture_size\":2048,\"tex_steps\":12}"
-
-# 2. Poll job status
-curl http://127.0.0.1:8080/v1/generations/gen_...
-
-# 3. Download completed asset
-curl http://127.0.0.1:8080/v1/generations/gen_.../content --output mesh.glb
-```
-
-Embed the router in another Axum app:
-
-```rust
-use lux3d_server_core::{
-    lux3d_for_server_builder::Lux3dForServerBuilder,
-    lux3d_server_router_builder::Lux3dServerRouterBuilder,
-};
-
-let lux3d = Lux3dForServerBuilder::new().build()?;
-let routes = Lux3dServerRouterBuilder::new()
-    .with_lux3d(lux3d)
-    .build()
-    .await?;
-let app = axum::Router::new().nest("/api/lux3d", routes);
-```
-
-## Performance
-
-Measured inference time (`[stage] infer`: preprocessing + neural pass, single iteration per process, weights excluded) on an NVIDIA GeForce RTX 3060 12 GiB, Windows (WDDM), candle `wgpu/vulkan` fork rev `efb506c9`, candle-3d (2026-09-06):
-
-| model | CUDA | Vulkan | WGPU | Vulkan/CUDA | WGPU/CUDA |
-|---|---:|---:|---:|---:|---:|
-| pi3 (5 frames, 518×518) | **4.82 s** | 7.83 s | 13.96 s | 1.62× | 2.90× |
-| pi3x (6 frames, 518×518) | **7.00 s** | 11.10 s | 31.84 s | 1.59× | 4.55× |
-| triposr (single image) | **1.23 s** | 3.36 s | 4.89 s | 2.73× | 3.98× |
-
-VGGT-1B was added later and is measured separately (fork rev `f94d26eb`, 2026-11-11): 3 frames at
-518×518, including camera, DPT depth, and DPT point heads. RTX 3060 12 GiB: CUDA **6.76 s**,
-Vulkan 10.96 s (1.62×), WGPU 19.34 s, CPU 107.66 s. The CUDA peak is 6.52 GiB at 3 frames
-(Vulkan 6.1–7.4 GiB and WGPU 6.8 GiB across repeated runs); on an NVIDIA L4 23 GiB
-the peak is 7.98 GiB at 3 frames (4.19 s infer) and 8.30 GiB at 12 frames (26.21 s infer).
-
-TripoSG is measured per stage on an RTX 3060 12 GiB (Windows/WDDM, release build, single image
-`test-assets/mesh-input.png`):
-
-| Stage | CUDA | Vulkan | WGPU |
-|---|---:|---:|---:|
-| load | 7.12 s | 6.68 s | 6.60 s |
-| infer (preprocess + DINO + denoise) | 6.84 s | 8.56 s | 13.13 s |
-| mesh (flash SDF + DiffDMC + trimesh processing) | 0.73 s | 0.26 s | 0.45 s |
-| export | 0.00 s | 0.00 s | 0.01 s |
-| peak VRAM | 8.29 GiB | 8.36 GiB | 8.65 GiB |
-
-All three columns use the same command (`--steps 2 --num-tokens 1024 --flash-octree-depth 5`).
-TripoSG keeps all three submodels (DINOv2, DiT, VAE) resident — 7.4 GiB of weights — so memory is
-dominated by the checkpoint. After the memory-default fixes (Vulkan transient pool 0 / inflight
-grace 2, WGPU 2 MiB allocator blocks) Vulkan peaks within 0.1 GiB of CUDA and WGPU within ~0.4 GiB
-(occasional ±0.5 GiB run-to-run variance from async staging).
-12 GiB is enough for the 2048-token preview (Vulkan: load 6.56 s, infer 12.86 s, peak 9.13 GiB),
-but 16 GiB is still recommended for the 50-step / depth-9 reference run.
-
-Warm-loop criterion (10 samples, steady state — the candle-bench protocol, one back-to-back window): vulkan 3.14 s / 4.90 s per iter (1.16×/1.20× of CUDA 2.72 s / 4.09 s), wgpu 8.21 s / 24.0 s (3.0×/5.9×). The biggest single lever was a fused LayerNorm+RoPE kernel (`rope_layernorm.comp`/`.wgsl` in the fork): one dispatch per q/k replaces the slow-path LayerNorm, both surrounding copies, and the 8-op rope chain at every rope site, cutting wgpu pi3 from 54.9 s to 8.21 s warm.
-
-Correctness: outputs of every backend × model combination were verified against the CUDA reference meshes (bounding box / center / mean delta within 1% of max extent, vertex/face counts within 0.5% — all PASS); the fused kernel is additionally unit-tested exact to 0.0 diff against the composed form on both backends.
-
-Tracking stage-A detectors are tested on all four backends: the official ALIKED-n16 golden matches 735/735 keypoints and SuperPoint matches 415/415 (resize 882/882) on CPU, CUDA, Vulkan and WGPU, with worst keypoint drift 1.5e-5, score error ≤7.7e-6 and descriptor cosine ≥0.999999; the ALIKED+SuperPoint composition test passes on all four. Set `LUX3D_KEYPOINT_TEST_DEVICE=cpu|cuda|vulkan|wgpu` (default `cpu`) and enable the matching cargo feature; an unavailable requested backend is a hard test error, never a silent CPU pass. Remesh, O-Voxel export/fixtures, the server URL policy and the external-COLMAP BA path are host-side code independent of the candle device; their tests also pass in the `vulkan` and `wgpu` feature builds.
-
-Memory behavior under repeated inference (10-iteration loop, same process):
-
-- **CUDA** — flat; the decoder attention scores buffer is bounded to 768 MiB by query-axis chunking (`LUX3D_MAX_SDPA_SCORES_BYTES`), which removes a ~4 GiB transient that previously fragmented the CUDA memory pool and stalled a 12 GiB card ~100×. VGGT peaks at 6.5 GiB for 3 frames on the 12 GiB card, with DPT frames processed one at a time (`LUX3D_VGGT_DPT_CHUNK`, default 1).
-- **Vulkan** — flat; retention is bounded by the inflight byte budget (256 MiB × grace band 2) and transients are not pooled by default (`CANDLE_VK_INFLIGHT_GRACE`, `CANDLE_VK_POOL_MAX_BYTES=0`); the pool can be re-enabled for latency-first runs. Batch caps are tuned from flush-reason profiling: transfer bytes 512 MiB (`CANDLE_VK_MAX_BATCH_TRANSFER_BYTES`), descriptor sets 8× dispatches — closing the batch per big activation copy cost ~4-9 ms of WDDM fence-signal latency per submission.
-- **WGPU** — 10-iteration pi3x benchmark completes with a 10.4 GiB VRAM peak and zero errors (previously OOM'd by iteration ~3); free pool / recycle backlog / in-flight retention are each byte-capped (`CANDLE_WGPU_POOL_MAX_BYTES`, `CANDLE_WGPU_INFLIGHT_MAX_BYTES`) and 2 MiB allocator blocks remove most checkpoint slack (`CANDLE_WGPU_BLOCK_BYTES`).
-
-Known gaps: the remaining Vulkan/CUDA warm gap (1.16–1.20×) is the structural WDDM submit tax (~4-9 ms per submission on a strictly dependent op chain) — a platform property code cannot reach; Linux without WDDM would close it. WGPU remains 3.0–5.9× behind warm (down from 13.9–19.5×), dominated by WGSL GEMM quality plus the same inter-pass WDDM gaps. A criterion harness for whole-model benches lives in `crates/lux3d-core/benches/` (run one `(backend, model)` pair per process: `LUX3D_BENCH_DEVICE=… LUX3D_BENCH_MODEL=… cargo bench -p lux3d-core --bench bench_main --features vulkan,wgpu`).
-
-## System Requirements
-
-- Rust 1.85 or newer
-- Cargo with support for `edition = "2024"`
-- Python 3.x for baseline tooling and normalization
-- CUDA-capable NVIDIA hardware for verified runtime inference
-- **Vulkan and WGPU backends** (via [FerrisMind/candle](https://github.com/FerrisMind/candle) `wgpu/vulkan` fork): verified for correctness and memory stability on RTX 3060 (see [Performance](#performance)); slower than CUDA, WGPU substantially so. TripoSG peaks within ~0.4 GiB of CUDA on both backends, so the 7.9 GB weight set leaves ~3 GiB of headroom on a 12 GiB card.
-- Metal backend on macOS is build-checked in CI (`.github/workflows/metal.yml` builds and runs the lib/quant-probe checks); no model inference parity is validated in this repository.
-- Canonical model package directories supplied with `--model-path`, or downloadable from Hugging Face into the user cache
-- TripoSG needs roughly 8.3–8.7 GiB at the 1024-token preview (9.1 GiB at 2048 tokens) on all three backends; 16 GiB+ is recommended for the 50-step reference run.
-- TRELLIS.2 loads its stage checkpoints sequentially and peaks at ~7.8 GiB with the texture stages resident on the `1024_cascade` run (geometry-only runs are lighter); a 12 GiB GPU fits with ~4 GiB headroom, and CPU inference works but is slow. `--no-low-vram` keeps every stage resident instead and therefore needs more peak VRAM (it fails with an explicit memory-limit error rather than silently falling back). The server loads the canonical package only; the raw `microsoft/TRELLIS.2-4B` checkpoint directory is a CLI-only loader. `--texture-mesh` loads the shape encoder from the raw checkpoint, from `external/shape_enc/model.safetensors` beside a canonical/GGUF package, or from `shape_enc.*` tensors embedded in a standalone GGUF, and runs the xatlas unwrap + PBR bake on the CPU (cost scales with face count, chart count and `texture_size²`; duplicate-position vertices are welded before charting so topology-repair splits do not turn every split sheet into its own chart).
+## System requirements
+
+- Rust 1.85 or newer; Cargo with `edition = "2024"` support.
+- Python 3.x for baseline tooling and normalization.
+- CUDA-capable NVIDIA hardware for verified runtime inference. The 12 GiB
+  RTX 3060 is the reference test card.
+- Vulkan and WGPU backends via the [FerrisMind/candle](https://github.com/FerrisMind/candle)
+  fork; verified for correctness and memory stability but slower than CUDA.
+- Metal is build-checked in CI; no model inference parity is validated.
+- 16 GiB+ VRAM is recommended for the full TripoSG 50-step reference run.
+  TRELLIS.2 peaks at ~7.8 GiB on `1024_cascade` with texture stages resident.
 
 ## License
 
-The code and documentation in this repository are licensed under Apache 2.0. See [LICENSE](https://github.com/oxide-lab/Lux3d/blob/main/LICENSE).
+The code and documentation in this repository are Apache-2.0. Upstream model
+assets and canonicalized artifacts keep their original licenses and usage
+restrictions; review [docs/models.md](docs/models.md#licensing) before
+redistribution.
 
-Upstream model assets and canonicalized model artifacts keep their original licenses and usage restrictions. Review model-family-specific terms before redistribution.
+## Acknowledgements
 
-**VGGT-1B:** the original code and `facebook/VGGT-1B` checkpoint are CC-BY-NC-4.0 (non-commercial). Commercial use requires the separately distributed `facebook/VGGT-1B-Commercial` checkpoint. The canonical package used by `--model-path`/auto-download is published as `oxide-lab/VGGT-1B`; the raw upstream checkpoint stays at `facebook/VGGT-1B`. The native track head supports explicit query points and automatic stage-A query selection (DINOv2-reg frame ranking + ALIKED-n16/SuperPoint keypoints); the official fine tracker stages B/C (LightGlue matching/refinement) are not included (see the VGGT notes under Run Inference). ALIKED and SuperPoint are separate third-party checkpoints, not part of the VGGT canonical package: the LightGlue reference implementation is Apache-2.0, while the downloaded ALIKED/SuperPoint weights retain their upstream licenses and terms.
-
-**TripoSG:** the upstream code and weights are MIT licensed. The raw checkpoint lives at `VAST-AI/TripoSG`; the canonical package used by `--model-path`/auto-download is published as `oxide-lab/TripoSG`. Upstream `load_image` uses BriaRMBG 1.4 when a valid alpha channel is missing; Lux3D implements that fallback fully. The RMBG weights do not join the MIT TripoSG package: they are normalized into the separate `rmbg-1.4` canonical package under the BRIA source-available/non-commercial license (commercial use requires a BRIA license), resolved via `--rmbg-model-path` or a sibling `rmbg-1.4` directory. Upstream's pipeline defaults to the flash decoder (`use_flash_decoder=True`, `flash_octree_depth=9`); Lux3D implements the same flash SDF schedule plus a clean-room Rust DiffDMC. Diso (CC BY-NC 4.0) source and tables are not copied, so ambiguous checkerboard cells may resolve differently; the non-flash dense/hierarchical path remains available via `--flash-decoder false`. The full VAE encode API (FPS sampling, `vae.quant`, mean/logvar/std distribution) is also implemented even though the image-to-3D pipeline only calls `vae.decode`.
-
-**TRELLIS.2:** the upstream code (`microsoft/TRELLIS.2`) and the `microsoft/TRELLIS.2-4B` model card are MIT licensed, and the reference is mirrored under `candle-3d-refs/TRELLIS.2`. Obtain the weights from the upstream repository and normalize them with `weights normalize ... trellis2` before running. The bundled DINOv3 ViT-L/16 encoder is a separately licensed gated Meta model — verify its terms independently; DINOv3 access may be required separately from TRELLIS.2. The reference background remover, RMBG-2.0 (BiRefNet/Swin-L), is implemented and used for RGB inputs; its weights do not join the MIT TRELLIS.2 package. Normalize them under the `rmbg2` auxiliary family and pass `--rmbg-model-path` (or place `rmbg-2.0` next to `--model-path`). RMBG-2.0 is licensed CC-BY-NC-4.0 (non-commercial), with commercial use subject to BRIA's terms.
+Built on [FerrisMind/candle](https://github.com/FerrisMind/candle). Model
+implementations follow [Pi3](https://github.com/yyfz/Pi3),
+[TripoSR](https://github.com/VAST-AI-Research/TripoSR),
+[VGGT](https://github.com/facebookresearch/vggt),
+[TripoSG](https://github.com/VAST-AI-Research/TripoSG), and
+[TRELLIS.2](https://github.com/microsoft/TRELLIS.2).
