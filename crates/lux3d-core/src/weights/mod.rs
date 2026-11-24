@@ -13,6 +13,7 @@ pub use quantize::{
 use std::{
     collections::BTreeMap,
     fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -974,11 +975,27 @@ pub(crate) fn normalize_manifest_path(path: &str) -> String {
 }
 
 pub(crate) fn sha256_file(path: &Path) -> Result<String> {
-    let mut digest = Sha256::new();
-    let bytes = fs::read(path).map_err(|source| Lux3dError::CanonicalChecksumsIo {
+    // Stream the digest: canonical packages include a single ~16 GB
+    // `model.safetensors`, and reading it whole would require the same amount
+    // of resident host RAM just to verify it (the Colab T4 runtime has 12.9 GB
+    // and gets OOM-killed before the mmap-based loader ever runs).
+    let mut file = fs::File::open(path).map_err(|source| Lux3dError::CanonicalChecksumsIo {
         path: path.to_path_buf(),
         source,
     })?;
-    digest.update(bytes);
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0u8; 8 * 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|source| Lux3dError::CanonicalChecksumsIo {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
     Ok(format!("{:x}", digest.finalize()))
 }
