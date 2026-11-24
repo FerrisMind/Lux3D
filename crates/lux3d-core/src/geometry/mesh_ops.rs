@@ -271,7 +271,311 @@ pub fn fill_holes_with_centroids(
         }
     }
 
+    // Second pass: geometric (position-welded) pinholes. The directed walk
+    // above only closes loops whose boundary uses ONE vertex copy per
+    // position and keeps a consistent winding. Decoded dual-grid meshes are
+    // non-manifold: `repair_non_manifold_edges` splits sheets into separate
+    // index spaces at identical positions and the winding can break at
+    // non-manifold edges, so many tiny geometric holes never form a directed
+    // loop even though their boundary is closed in space. Fill those by
+    // welding positions for the cycle search; the emitted triangles reference
+    // one representative index per welded position.
+    fill_welded_boundary_cycles(&mut new_vertices, &mut new_faces, max_hole_perimeter);
+
     (new_vertices, new_faces)
+}
+
+/// Fill closed boundary cycles in POSITION-WELDED topology (the geometric
+/// pinholes the directed walk misses on non-manifold / split-sheet meshes).
+///
+/// Boundary edges are the undirected vertex pairs used by exactly one face of
+/// `faces`; vertices at identical `f32` positions are welded for the graph.
+/// Every connected component whose nodes all have degree 2 is a simple cycle;
+/// cycles with at least 3 positions and `perimeter < max_hole_perimeter` are
+/// closed exactly like the directed pass (one triangle for a 3-cycle, a
+/// centroid fan otherwise). Winding follows the owning face's direction when
+/// it is available (the walk is reversed if needed); components with pinched
+/// boundaries (degree > 2) are left untouched.
+fn fill_welded_boundary_cycles(
+    vertices: &mut Vec<f32>,
+    faces: &mut Vec<u32>,
+    max_hole_perimeter: f32,
+) {
+    if faces.len() < 3 {
+        return;
+    }
+    let vertex_count = vertices.len() / 3;
+    // Position weld: exact float bits. Faces are remapped to welded ids and
+    // edge counts are taken in WELDED space, so the many index-space boundary
+    // edges produced by split sheets (same position, different copies) do not
+    // pollute the geometric boundary.
+    let mut weld_positions: Vec<[f32; 3]> = Vec::new();
+    let mut weld_representative: Vec<u32> = Vec::new();
+    let mut position_to_weld: HashMap<[u32; 3], u32> = HashMap::new();
+    // Undirected welded edge -> (count, one owning face direction, normal).
+    let mut edge_count: HashMap<[u32; 2], (u32, (u32, u32), [f32; 3])> = HashMap::new();
+    let mut weld_of: Vec<u32> = vec![u32::MAX; vertex_count];
+    fn welded_of(
+        index: u32,
+        vertices: &[f32],
+        weld_of: &mut [u32],
+        position_to_weld: &mut HashMap<[u32; 3], u32>,
+        weld_positions: &mut Vec<[f32; 3]>,
+        weld_representative: &mut Vec<u32>,
+    ) -> u32 {
+        if weld_of[index as usize] != u32::MAX {
+            return weld_of[index as usize];
+        }
+        let base = index as usize * 3;
+        let key = [
+            vertices[base].to_bits(),
+            vertices[base + 1].to_bits(),
+            vertices[base + 2].to_bits(),
+        ];
+        if let Some(&id) = position_to_weld.get(&key) {
+            weld_of[index as usize] = id;
+            return id;
+        }
+        let id = weld_positions.len() as u32;
+        weld_positions.push([vertices[base], vertices[base + 1], vertices[base + 2]]);
+        weld_representative.push(index);
+        position_to_weld.insert(key, id);
+        weld_of[index as usize] = id;
+        id
+    }
+    for face in faces.chunks_exact(3) {
+        let (a, b, c) = (face[0] as usize, face[1] as usize, face[2] as usize);
+        if a >= vertex_count || b >= vertex_count || c >= vertex_count {
+            continue;
+        }
+        if a == b || b == c || a == c {
+            continue;
+        }
+        let wa = welded_of(
+            face[0],
+            vertices,
+            &mut weld_of,
+            &mut position_to_weld,
+            &mut weld_positions,
+            &mut weld_representative,
+        );
+        let wb = welded_of(
+            face[1],
+            vertices,
+            &mut weld_of,
+            &mut position_to_weld,
+            &mut weld_positions,
+            &mut weld_representative,
+        );
+        let wc = welded_of(
+            face[2],
+            vertices,
+            &mut weld_of,
+            &mut position_to_weld,
+            &mut weld_positions,
+            &mut weld_representative,
+        );
+        if wa == wb || wb == wc || wa == wc {
+            continue;
+        }
+        let pa = weld_positions[wa as usize];
+        let pb = weld_positions[wb as usize];
+        let pc = weld_positions[wc as usize];
+        let face_normal = cross(sub(pb, pa), sub(pc, pa));
+        for (u, v) in [(wa, wb), (wb, wc), (wc, wa)] {
+            let key = if u <= v { [u, v] } else { [v, u] };
+            let entry = edge_count.entry(key).or_insert((0, (u, v), face_normal));
+            entry.0 += 1;
+        }
+    }
+
+    let mut boundary_edges: Vec<(u32, u32, (u32, u32), [f32; 3])> = Vec::new();
+    for (&edge, &(count, direction, face_normal)) in edge_count.iter() {
+        if count == 1 {
+            boundary_edges.push((edge[0], edge[1], direction, face_normal));
+        }
+    }
+    // HashMap iteration order must not leak: sort the boundary edges by their
+    // welded endpoints (deterministic, and a stable seed order for the walk).
+    boundary_edges.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+
+    let mut adjacency: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut edge_direction: HashMap<[u32; 2], (u32, u32, [f32; 3])> = HashMap::new();
+    for &(a, b, direction, face_normal) in &boundary_edges {
+        adjacency.entry(a).or_default().push(b);
+        adjacency.entry(b).or_default().push(a);
+        let key = if a <= b { [a, b] } else { [b, a] };
+        edge_direction
+            .entry(key)
+            .or_insert((direction.0, direction.1, face_normal));
+    }
+
+    let mut visited: HashSet<u32> = HashSet::new();
+    for &(seed, _, _, _) in &boundary_edges {
+        if visited.contains(&seed) {
+            continue;
+        }
+        // Collect the connected component (welded ids).
+        let mut component: Vec<u32> = Vec::new();
+        let mut stack = vec![seed];
+        while let Some(node) = stack.pop() {
+            if !visited.insert(node) {
+                continue;
+            }
+            component.push(node);
+            if let Some(neighbours) = adjacency.get(&node) {
+                for &next in neighbours {
+                    if !visited.contains(&next) {
+                        stack.push(next);
+                    }
+                }
+            }
+        }
+        let simple_cycle = component
+            .iter()
+            .all(|node| adjacency.get(node).map_or(0, Vec::len) == 2);
+        if !simple_cycle || component.len() < 3 {
+            continue;
+        }
+        // Walk the cycle from the smallest welded id.
+        component.sort_unstable();
+        let start = component[0];
+        let mut loop_welded: Vec<u32> = vec![start];
+        let mut previous = u32::MAX;
+        let mut current = start;
+        loop {
+            let neighbours = &adjacency[&current];
+            let next = if neighbours[0] == previous {
+                neighbours[1]
+            } else {
+                neighbours[0]
+            };
+            if next == start {
+                break;
+            }
+            loop_welded.push(next);
+            previous = current;
+            current = next;
+            if loop_welded.len() > component.len() {
+                break;
+            }
+        }
+        if loop_welded.len() != component.len() {
+            continue;
+        }
+        let n = loop_welded.len();
+        let mut perimeter = 0.0_f32;
+        for i in 0..n {
+            let a = weld_positions[loop_welded[i] as usize];
+            let b = weld_positions[loop_welded[(i + 1) % n] as usize];
+            perimeter += dist(a, b);
+        }
+        if perimeter.is_nan() || perimeter >= max_hole_perimeter {
+            continue;
+        }
+        // Follow the owning face's direction: the fill must traverse every
+        // shared boundary edge opposite to the existing face.
+        let key = {
+            let (a, b) = (loop_welded[0], loop_welded[1]);
+            if a <= b {
+                [a, b]
+            } else {
+                [b, a]
+            }
+        };
+        if let Some(&(u, v, _)) = edge_direction.get(&key) {
+            let walk_is_forward = loop_welded[0] == u && loop_welded[1] == v;
+            if !walk_is_forward {
+                loop_welded.reverse();
+            }
+        }
+        let representative = |welded: u32| weld_representative[welded as usize];
+        // A geometric cycle whose cap disagrees with the adjacent face
+        // normals is a fold/self-intersection, not a hole (e.g. two triangles
+        // sharing an edge in the same direction). Filling it would add a
+        // spurious surface over the fold.
+        let cap_disagrees = |cap_normal: [f32; 3]| {
+            for i in 0..n {
+                let cur = loop_welded[i];
+                let next = loop_welded[(i + 1) % n];
+                let key = if cur <= next {
+                    [cur, next]
+                } else {
+                    [next, cur]
+                };
+                if let Some(&(_, _, face_normal)) = edge_direction.get(&key) {
+                    let dot = cap_normal[0] * face_normal[0]
+                        + cap_normal[1] * face_normal[1]
+                        + cap_normal[2] * face_normal[2];
+                    if dot < 0.0 {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+        if n == 3 {
+            let p0 = weld_positions[loop_welded[0] as usize];
+            let p1 = weld_positions[loop_welded[1] as usize];
+            let p2 = weld_positions[loop_welded[2] as usize];
+            // Emitted triangle is (loop_0, loop_2, loop_1).
+            let cap_normal = cross(sub(p2, p0), sub(p1, p0));
+            if cap_disagrees(cap_normal) {
+                continue;
+            }
+            faces.extend_from_slice(&[
+                representative(loop_welded[0]),
+                representative(loop_welded[2]),
+                representative(loop_welded[1]),
+            ]);
+            continue;
+        }
+        let mut centroid = [0.0_f32; 3];
+        for &welded in &loop_welded {
+            let p = weld_positions[welded as usize];
+            centroid[0] += p[0];
+            centroid[1] += p[1];
+            centroid[2] += p[2];
+        }
+        let centroid = [
+            centroid[0] / n as f32,
+            centroid[1] / n as f32,
+            centroid[2] / n as f32,
+        ];
+        let mut fan_disagrees = false;
+        for i in 0..n {
+            let cur = loop_welded[i];
+            let next = loop_welded[(i + 1) % n];
+            let p_cur = weld_positions[cur as usize];
+            let p_next = weld_positions[next as usize];
+            // Emitted triangle is (next, cur, centroid).
+            let cap_normal = cross(sub(p_cur, p_next), sub(centroid, p_next));
+            let key = if cur <= next {
+                [cur, next]
+            } else {
+                [next, cur]
+            };
+            if let Some(&(_, _, face_normal)) = edge_direction.get(&key) {
+                let dot = cap_normal[0] * face_normal[0]
+                    + cap_normal[1] * face_normal[1]
+                    + cap_normal[2] * face_normal[2];
+                if dot < 0.0 {
+                    fan_disagrees = true;
+                    break;
+                }
+            }
+        }
+        if fan_disagrees {
+            continue;
+        }
+        let centroid_index = (vertices.len() / 3) as u32;
+        vertices.extend_from_slice(&centroid);
+        for i in 0..n {
+            let cur = representative(loop_welded[i]);
+            let next = representative(loop_welded[(i + 1) % n]);
+            faces.extend_from_slice(&[next, cur, centroid_index]);
+        }
+    }
 }
 
 /// Drop connected components whose total triangle area is `<= min_area`.
@@ -791,6 +1095,11 @@ pub fn simplify_mesh(vertices: &[f32], faces: &[u32], target_faces: usize) -> Me
 /// is the reference aggressive pass at `decimation_target * 3` triangles; the
 /// second targets `decimation_target`:
 ///
+/// 0. for AGGRESSIVE targets (`decimation_target * 4 < input faces`): a
+///    pre-simplify `remove_duplicate_faces` + `repair_non_manifold_edges` +
+///    `remove_small_connected_components` + `fill_holes` clean-up (deliberate
+///    deviation: meshopt collapses the raw sheet soup into hub vertices
+///    otherwise; see the inline comment),
 /// 1. `fill_holes(fill_hole_perimeter)`
 /// 2. `simplify(decimation_target * 3)` — skipped when `decimation_target == 0`
 /// 3. `remove_duplicate_faces`
@@ -813,7 +1122,26 @@ pub fn postprocess_mesh(
     decimation_target: usize,
     min_component_area: f32,
 ) -> MeshEditResult {
-    let (vertices, faces) = fill_holes_with_centroids(vertices, faces, fill_hole_perimeter);
+    let (mut vertices, mut faces) = fill_holes_with_centroids(vertices, faces, fill_hole_perimeter);
+    // Aggressive decimation (the target is well below the input size) on the
+    // raw dual-grid mesh: repair the non-manifold topology FIRST. meshopt's
+    // quadric collapser only removes vertices (it never repositions them); on
+    // a pinched, sheet-soup input it merges sheets into a few high-valence
+    // hub vertices and leaves long fan triangles (the 50k textured export
+    // rendered as shredded blobs). Splitting the sheets into manifold pieces
+    // before the pass keeps the collapse local and the output stays clean.
+    // Mild reductions (the upstream default `decimation_target = 1e6` on a
+    // ~1-4M-face decode) keep the reference order unchanged.
+    if decimation_target > 0 && decimation_target.saturating_mul(4) < faces.len() / 3 {
+        faces = remove_duplicate_faces(vertices.len() / 3, &faces);
+        let repaired = repair_non_manifold_edges(&vertices, &faces);
+        vertices = repaired.vertices;
+        faces = repaired.faces;
+        faces = remove_small_connected_components(&vertices, &faces, min_component_area);
+        let filled = fill_holes_with_centroids(&vertices, &faces, fill_hole_perimeter);
+        vertices = filled.0;
+        faces = filled.1;
+    }
     let result = if decimation_target > 0 {
         // Upstream step 1: aggressive simplification to 3x the final target.
         simplify_mesh(&vertices, &faces, decimation_target.saturating_mul(3))
@@ -842,6 +1170,10 @@ pub fn postprocess_mesh(
 
     let (vertices, faces) = fill_holes_with_centroids(&vertices, &faces, fill_hole_perimeter);
     let faces = unify_face_orientations(&vertices, &faces);
+    // Final geometric fill AFTER orientation unify: the welded cycle walk can
+    // only trust the adjacent face normals once the winding is consistent, so
+    // the pre-unify fills leave tiny pinholes behind on non-manifold meshes.
+    let (vertices, faces) = fill_holes_with_centroids(&vertices, &faces, fill_hole_perimeter);
     compact_mesh(&vertices, &faces)
 }
 
@@ -1129,6 +1461,99 @@ mod tests {
         let filled = fill_holes(&vertices, &broken, 100.0);
         assert!(filled.chunks_exact(3).all(|f| f.iter().all(|&i| i < 9)));
         assert!(filled.starts_with(&faces));
+    }
+
+    /// Count undirected boundary edges after welding positions to exact
+    /// float bits (what a renderer sees geometrically).
+    fn welded_boundary_edges(vertices: &[f32], faces: &[u32]) -> usize {
+        let mut position_to_weld: HashMap<[u32; 3], u32> = HashMap::new();
+        let mut weld = |index: u32| -> u32 {
+            let b = index as usize * 3;
+            let key = [
+                vertices[b].to_bits(),
+                vertices[b + 1].to_bits(),
+                vertices[b + 2].to_bits(),
+            ];
+            let next = position_to_weld.len() as u32;
+            *position_to_weld.entry(key).or_insert(next)
+        };
+        let mut counts: HashMap<[u32; 2], u32> = HashMap::new();
+        for face in faces.chunks_exact(3) {
+            let welded = [weld(face[0]), weld(face[1]), weld(face[2])];
+            for (u, v) in [
+                (welded[0], welded[1]),
+                (welded[1], welded[2]),
+                (welded[2], welded[0]),
+            ] {
+                let edge = if u <= v { [u, v] } else { [v, u] };
+                *counts.entry(edge).or_insert(0) += 1;
+            }
+        }
+        counts.values().filter(|&&count| count == 1).count()
+    }
+
+    #[test]
+    fn fill_holes_closes_welded_cycle_across_split_vertex_copies() {
+        // Open pyramid (square base hole). The rim vertex (0, 0, 0) is
+        // SPLIT into two index copies at the same position (0 and 4), so the
+        // directed boundary walk sees two open chains and cannot fill, while
+        // the geometric (position-welded) boundary is one closed 4-cycle.
+        let vertices: Vec<f32> = [
+            0.0, 0.0, 0.0, // 0: rim copy A
+            1.0, 0.0, 0.0, // 1
+            0.5, 0.0, 1.0, // 2
+            0.5, 1.0, 0.5, // 3: apex
+            0.0, 0.0, 0.0, // 4: rim copy B (same position as 0)
+        ]
+        .to_vec();
+        let faces: Vec<u32> = [
+            0, 1, 3, // side A
+            1, 2, 3, // side B
+            2, 4, 3, // side C (uses copy B)
+        ]
+        .to_vec();
+        assert_eq!(3, welded_boundary_edges(&vertices, &faces));
+
+        let (filled_vertices, filled_faces) = fill_holes_with_centroids(&vertices, &faces, 10.0);
+        assert!(filled_faces.len() > faces.len(), "hole must be filled");
+        assert_eq!(
+            0,
+            welded_boundary_edges(&filled_vertices, &filled_faces),
+            "the welded rim must be closed after filling"
+        );
+    }
+
+    #[test]
+    fn fill_holes_welded_cycle_respects_perimeter_limit() {
+        // Cube with the bottom face removed: one square rim (perimeter 4).
+        // Split one rim vertex into a duplicate index at the same position so
+        // only the welded pass can close it.
+        let (mut vertices, faces) = cube();
+        let mut open: Vec<u32> = faces
+            .chunks_exact(3)
+            .filter(|face| !matches!((face[0], face[1]), (0, 2) | (0, 3)))
+            .flatten()
+            .copied()
+            .collect();
+        vertices.extend_from_slice(&[0.0, 0.0, 0.0]);
+        let split = (vertices.len() / 3 - 1) as u32;
+        // Two rim-adjacent faces use a COPY of vertex 0 at the same position:
+        // the index-space rim is no longer a closed directed loop, while the
+        // welded rim still is.
+        for face in open.chunks_exact_mut(3) {
+            if face == [0, 1, 5] || face == [0, 5, 4] {
+                face[0] = split;
+            }
+        }
+        let (_, too_small) = fill_holes_with_centroids(&vertices, &open, 1.0);
+        assert_eq!(too_small, open, "perimeter above the limit stays open");
+        let (filled_vertices, filled) = fill_holes_with_centroids(&vertices, &open, 10.0);
+        assert!(filled.len() > open.len(), "perimeter below the limit fills");
+        assert_eq!(
+            0,
+            welded_boundary_edges(&filled_vertices, &filled),
+            "the rim is closed after filling"
+        );
     }
 
     #[test]
