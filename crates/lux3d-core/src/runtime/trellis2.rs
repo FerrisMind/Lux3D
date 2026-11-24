@@ -186,8 +186,8 @@ use crate::contracts::Trellis2PipelineType;
 use crate::error::Lux3dError;
 use crate::export::Trellis2ExportStage;
 use crate::geometry::{
-    area_weighted_vertex_normals, bake_pbr_texture, bake_pbr_texture_with_snap,
-    fill_holes_with_centroids, uv_unwrap, MeshBvh, Trellis2GeometryStage,
+    bake_pbr_texture, bake_pbr_texture_with_snap, fill_holes_with_centroids, uv_unwrap,
+    welded_vertex_normals, MeshBvh, Trellis2GeometryStage,
 };
 use crate::preprocess::{Trellis2BackgroundRemover, Trellis2Preprocess};
 use crate::runtime::Rmbg2Model;
@@ -1268,7 +1268,13 @@ fn build_trellis2_textured_mesh_impl(
     // vertices/faces, then gather through the atlas `vmapping`. Recomputing
     // on atlas vertices would give duplicated seam vertices chart-local
     // normals, unlike the reference's `vmaps` gather (`postprocess.py:208-216`).
-    let base_normals = area_weighted_vertex_normals(&vertices, &faces);
+    //
+    // The normals are computed on POSITION-WELDED topology: the atlas welds
+    // identical positions for charting, and `repair_non_manifold_edges` can
+    // leave several index copies per position. A per-copy normal would attach
+    // an arbitrary sheet's normal to every chart vertex at that position
+    // (measured ~70 deg off the local surface on decoded meshes).
+    let base_normals = welded_vertex_normals(&vertices, &faces);
     let normals: Vec<[f32; 3]> = atlas
         .vmapping
         .iter()

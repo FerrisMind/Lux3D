@@ -66,6 +66,8 @@
 //! stay aligned with the input faces; [`UvAtlas::indices`] can therefore be
 //! slightly shorter than `3 * input faces`.
 
+use std::collections::HashMap;
+
 use super::mesh_ops::merge_close_vertices;
 use crate::Result;
 use crate::error::Lux3dError;
@@ -389,6 +391,73 @@ pub fn area_weighted_vertex_normals(vertices: &[[f32; 3]], indices: &[u32]) -> V
     normals
 }
 
+/// Area-weighted vertex normals computed on POSITION-WELDED topology, then
+/// scattered back to every input vertex copy.
+///
+/// `area_weighted_vertex_normals` averages per input index. After
+/// `repair_non_manifold_edges` the same position can exist as several index
+/// copies belonging to different sheets; the atlas re-welds those positions
+/// for charting (`UvAtlas::vmapping` maps every copy onto one representative),
+/// so a per-copy normal would attach the representative copy's sheet normal
+/// to every chart at that position. Welding first makes the normal a property
+/// of the position, which is what the unwrapped atlas actually samples.
+pub fn welded_vertex_normals(vertices: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
+    let mut position_to_weld: HashMap<[u32; 3], u32> = HashMap::new();
+    let mut weld_of: Vec<u32> = Vec::with_capacity(vertices.len());
+    let mut weld_positions: Vec<[f32; 3]> = Vec::new();
+    for &vertex in vertices {
+        let key = [
+            vertex[0].to_bits(),
+            vertex[1].to_bits(),
+            vertex[2].to_bits(),
+        ];
+        let id = *position_to_weld.entry(key).or_insert_with(|| {
+            let id = weld_positions.len() as u32;
+            weld_positions.push(vertex);
+            id
+        });
+        weld_of.push(id);
+    }
+    let mut weld_normals = vec![[0.0_f32; 3]; weld_positions.len()];
+    for face in indices.chunks_exact(3) {
+        let (a, b, c) = (face[0] as usize, face[1] as usize, face[2] as usize);
+        if a >= vertices.len() || b >= vertices.len() || c >= vertices.len() {
+            continue;
+        }
+        let wa = weld_of[a] as usize;
+        let wb = weld_of[b] as usize;
+        let wc = weld_of[c] as usize;
+        let pa = weld_positions[wa];
+        let pb = weld_positions[wb];
+        let pc = weld_positions[wc];
+        let ab = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
+        let ac = [pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]];
+        let cross = [
+            ab[1] * ac[2] - ab[2] * ac[1],
+            ab[2] * ac[0] - ab[0] * ac[2],
+            ab[0] * ac[1] - ab[1] * ac[0],
+        ];
+        for welded in [wa, wb, wc] {
+            let normal = &mut weld_normals[welded];
+            normal[0] += cross[0];
+            normal[1] += cross[1];
+            normal[2] += cross[2];
+        }
+    }
+    for normal in &mut weld_normals {
+        let length = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+        if length > 0.0 && length.is_finite() {
+            *normal = [normal[0] / length, normal[1] / length, normal[2] / length];
+        } else {
+            *normal = [0.0; 3];
+        }
+    }
+    weld_of
+        .iter()
+        .map(|&id| weld_normals[id as usize])
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,6 +495,42 @@ mod tests {
         .copied()
         .collect();
         (vertices, faces)
+    }
+
+    #[test]
+    fn welded_vertex_normals_share_one_normal_per_position() {
+        // Two sheets meeting at the same position (duplicate index copies):
+        // one triangle in the XY plane (normal +Z), one in the XZ plane
+        // (normal -Y). Every copy at the shared position must receive the
+        // SAME welded (normalized sum) normal.
+        let vertices = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            // copies of the shared origin and of (1, 0, 0), plus a new point
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let indices = vec![0, 1, 2, 3, 4, 5];
+        let normals = welded_vertex_normals(&vertices, &indices);
+        assert_eq!(normals.len(), vertices.len());
+        let expected = {
+            let sum = [0.0_f32, -1.0, 1.0];
+            let len = (sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2]).sqrt();
+            [sum[0] / len, sum[1] / len, sum[2] / len]
+        };
+        for &(a, b) in &[(0, 3), (1, 4)] {
+            assert!((normals[a][0] - expected[0]).abs() < 1e-6);
+            assert!((normals[a][1] - expected[1]).abs() < 1e-6);
+            assert!((normals[a][2] - expected[2]).abs() < 1e-6);
+            assert_eq!(normals[a], normals[b]);
+        }
+        for normal in &normals {
+            let length = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2])
+                .sqrt();
+            assert!((length - 1.0).abs() < 1e-6);
+        }
     }
 
     #[test]

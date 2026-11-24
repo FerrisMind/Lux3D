@@ -29,7 +29,9 @@ pub use remesh_dc::{narrow_band_grid_scale, remesh_narrow_band_dc, RemeshDcMesh,
 pub use trellis2::{Trellis2GeometryStage, Trellis2MeshBuffers};
 pub use triposg::{TripoSgGeometryStage, TripoSgMeshCpu};
 pub use triposr::{TripoGeometryStage, TripoMeshCpu};
-pub use uv_atlas::{area_weighted_vertex_normals, uv_unwrap, UvAtlas};
+pub use uv_atlas::{
+    area_weighted_vertex_normals, uv_unwrap, welded_vertex_normals, UvAtlas,
+};
 pub use vggt::{
     rescale_intrinsics_to_original, shift_point2d_to_original, unproject_depth_to_world,
     VggtGeometryStage, VggtPointCloudCpu,
