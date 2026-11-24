@@ -1784,6 +1784,18 @@ pub fn run_model(args: RunArgs) -> anyhow::Result<PathBuf> {
                     }
                 }
             }
+            if let Some((pending_peak, deferred_entries, deferred_bytes, pool_bytes)) =
+                candle_core::vulkan_memory_report()
+            {
+                eprintln!(
+                    "[cpu-profile] memory peaks: pending_submissions={pending_peak} \
+                     deferred_entries={deferred_entries} \
+                     deferred_bytes={:.1}MiB pool_bytes={:.1}MiB deferred_total={:.1}GiB",
+                    deferred_bytes as f64 / (1024.0 * 1024.0),
+                    pool_bytes as f64 / (1024.0 * 1024.0),
+                    candle_core::vulkan_deferred_total_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
+                );
+            }
             if let Some(rows) = candle_core::vulkan_flush_reason_report() {
                 eprintln!("[cpu-profile] vulkan flush reasons:");
                 for (name, count) in rows {
