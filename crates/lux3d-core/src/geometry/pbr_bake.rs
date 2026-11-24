@@ -56,7 +56,7 @@
 //! 2048 atlas that is ~40 MiB steady state, no per-pixel allocations.
 
 use crate::error::Lux3dError;
-use crate::runtime::{query_vertex_attrs_in_aabb, Trellis2PbrLayout};
+use crate::runtime::{PbrAttrSampler, Trellis2PbrLayout};
 use crate::Result;
 
 use super::mesh_bvh::MeshBvh;
@@ -335,6 +335,19 @@ fn bake_pbr_texture_impl(
         }
     }
 
+    // Build the voxel -> attribute-row map once: the texel loop samples in
+    // 64k chunks and a per-chunk map rebuild dominates the bake otherwise.
+    let sampler = PbrAttrSampler::new(
+        voxel_coords,
+        voxel_attrs,
+        channels,
+        grid.aabb,
+        grid.grid_size,
+    )
+    .map_err(|source| Lux3dError::CanonicalWeightsValidation {
+        message: format!("Trellis2 PBR texel sampler setup failed: {source}"),
+    })?;
+
     let texel_count = texture_size * texture_size;
     let mut face_ids = vec![-1_i32; texel_count];
     rasterize_uv_triangles(uvs, indices, texture_size, &mut face_ids);
@@ -392,27 +405,13 @@ fn bake_pbr_texture_impl(
         chunk_positions.push(position);
         chunk_texels.push(texel);
         if chunk_positions.len() == SAMPLE_CHUNK_TEXELS {
-            sample_chunk_into_textures(
-                &chunk_positions,
-                &chunk_texels,
-                voxel_coords,
-                voxel_attrs,
-                grid,
-                &mut baked,
-            )?;
+            sample_chunk_into_textures(&chunk_positions, &chunk_texels, &sampler, &mut baked)?;
             chunk_positions.clear();
             chunk_texels.clear();
         }
     }
     if !chunk_positions.is_empty() {
-        sample_chunk_into_textures(
-            &chunk_positions,
-            &chunk_texels,
-            voxel_coords,
-            voxel_attrs,
-            grid,
-            &mut baked,
-        )?;
+        sample_chunk_into_textures(&chunk_positions, &chunk_texels, &sampler, &mut baked)?;
     }
 
     // The valid mask reflects the pre-inpaint coverage (the upstream `mask`).
@@ -569,23 +568,15 @@ fn interpolate_texel_position(
 fn sample_chunk_into_textures(
     positions: &[[f32; 3]],
     texels: &[usize],
-    voxel_coords: &[[i32; 3]],
-    voxel_attrs: &[f32],
-    grid: PbrSampleGrid,
+    sampler: &PbrAttrSampler<'_>,
     baked: &mut BakedPbrTexture,
 ) -> Result<()> {
     let channels = Trellis2PbrLayout::CHANNELS;
-    let sampled = query_vertex_attrs_in_aabb(
-        positions,
-        voxel_coords,
-        voxel_attrs,
-        channels,
-        grid.aabb,
-        grid.grid_size,
-    )
-    .map_err(|error| Lux3dError::CanonicalWeightsValidation {
-        message: format!("Trellis2 PBR texel sampling failed: {error}"),
-    })?;
+    let sampled = sampler
+        .sample(positions)
+        .map_err(|error| Lux3dError::CanonicalWeightsValidation {
+            message: format!("Trellis2 PBR texel sampling failed: {error}"),
+        })?;
     for (row, &texel) in texels.iter().enumerate() {
         let base = row * channels;
         let dst = texel * 4;

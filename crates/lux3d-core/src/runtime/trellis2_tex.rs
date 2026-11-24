@@ -381,101 +381,141 @@ pub fn query_vertex_attrs_in_aabb(
     aabb: [[f32; 3]; 2],
     grid_size: [u32; 3],
 ) -> CandleResult<Vec<f32>> {
-    if channels == 0 {
-        candle_core::bail!("trilinear sampling needs at least one attribute channel");
-    }
-    if attrs.len() % channels != 0 {
-        candle_core::bail!(
-            "attribute buffer length {} is not a multiple of {channels}",
-            attrs.len()
-        );
-    }
-    let rows = attrs.len() / channels;
-    if rows != coords.len() {
-        candle_core::bail!(
-            "trilinear coords/attrs mismatch: {} coords vs {rows} rows",
-            coords.len()
-        );
-    }
-    for axis in 0..3 {
-        if grid_size[axis] == 0 {
-            candle_core::bail!("trilinear sampling grid size must be positive on every axis");
+    PbrAttrSampler::new(coords, attrs, channels, aabb, grid_size)?.sample(vertices)
+}
+
+/// Reusable trilinear sampler over a sparse attribute volume.
+///
+/// The `coords -> row` hash map and the grid arithmetic are built once in
+/// [`Self::new`]; [`Self::sample`] can then be called repeatedly (the PBR
+/// bake asks for 64k texel positions per chunk and would otherwise rebuild
+/// the whole 1.8M-entry voxel map for every chunk).
+pub struct PbrAttrSampler<'a> {
+    attrs: &'a [f32],
+    channels: usize,
+    aabb: [[f32; 3]; 2],
+    grid_size: [u32; 3],
+    voxel_size: [f32; 3],
+    map: HashMap<[i32; 3], u32>,
+}
+
+impl<'a> PbrAttrSampler<'a> {
+    /// Validate the volume/attribute contract and build the voxel map.
+    pub fn new(
+        coords: &[[i32; 3]],
+        attrs: &'a [f32],
+        channels: usize,
+        aabb: [[f32; 3]; 2],
+        grid_size: [u32; 3],
+    ) -> CandleResult<Self> {
+        if channels == 0 {
+            candle_core::bail!("trilinear sampling needs at least one attribute channel");
         }
-        if !aabb[0][axis].is_finite() || !aabb[1][axis].is_finite() {
-            candle_core::bail!("trilinear sampling aabb must be finite");
+        if attrs.len() % channels != 0 {
+            candle_core::bail!(
+                "attribute buffer length {} is not a multiple of {channels}",
+                attrs.len()
+            );
         }
-    }
-    let voxel_size = [
-        (aabb[1][0] - aabb[0][0]) / grid_size[0] as f32,
-        (aabb[1][1] - aabb[0][1]) / grid_size[1] as f32,
-        (aabb[1][2] - aabb[0][2]) / grid_size[2] as f32,
-    ];
-    for axis in 0..3 {
-        if !voxel_size[axis].is_finite() || voxel_size[axis] <= 0.0 {
-            candle_core::bail!("trilinear sampling aabb is degenerate along axis {axis}");
+        let rows = attrs.len() / channels;
+        if rows != coords.len() {
+            candle_core::bail!(
+                "trilinear coords/attrs mismatch: {} coords vs {rows} rows",
+                coords.len()
+            );
         }
-    }
-    let map: HashMap<[i32; 3], u32> = coords
-        .iter()
-        .enumerate()
-        .map(|(index, coord)| (*coord, index as u32))
-        .collect();
-    let mut out = vec![0.0_f32; vertices.len() * channels];
-    // Corner subidx order dx + 2*dy + 4*dz matches the CUDA kernel's
-    // `base + (i & 1, (i >> 1) & 1, (i >> 2) & 1)`.
-    for (vertex_index, vertex) in vertices.iter().enumerate() {
-        // grid = (vertex - origin) / voxel_size.
-        let q = [
-            (vertex[0] - aabb[0][0]) / voxel_size[0],
-            (vertex[1] - aabb[0][1]) / voxel_size[1],
-            (vertex[2] - aabb[0][2]) / voxel_size[2],
+        for axis in 0..3 {
+            if grid_size[axis] == 0 {
+                candle_core::bail!("trilinear sampling grid size must be positive on every axis");
+            }
+            if !aabb[0][axis].is_finite() || !aabb[1][axis].is_finite() {
+                candle_core::bail!("trilinear sampling aabb must be finite");
+            }
+        }
+        let voxel_size = [
+            (aabb[1][0] - aabb[0][0]) / grid_size[0] as f32,
+            (aabb[1][1] - aabb[0][1]) / grid_size[1] as f32,
+            (aabb[1][2] - aabb[0][2]) / grid_size[2] as f32,
         ];
-        let base = [
-            (q[0] - 0.5).floor() as i64,
-            (q[1] - 0.5).floor() as i64,
-            (q[2] - 0.5).floor() as i64,
-        ];
-        let mut acc = vec![0.0_f64; channels];
-        let mut weight_sum = 0.0_f64;
-        for subidx in 0..8usize {
-            let dx = (subidx & 1) as i64;
-            let dy = ((subidx >> 1) & 1) as i64;
-            let dz = ((subidx >> 2) & 1) as i64;
-            let cell = [base[0] + dx, base[1] + dy, base[2] + dz];
-            // Grid bounds (0..grid_size per axis) and hashmap occupancy:
-            // cells outside the grid cannot be occupied, so both checks
-            // drop the same neighbors (the reference bounds-checks first).
-            if cell
-                .iter()
-                .enumerate()
-                .any(|(axis, &c)| c < 0 || c >= grid_size[axis] as i64)
-            {
-                continue;
-            }
-            let cell_i = [cell[0] as i32, cell[1] as i32, cell[2] as i32];
-            let Some(&row) = map.get(&cell_i) else {
-                continue;
-            };
-            let mut weight = 1.0_f64;
-            for axis in 0..3 {
-                let center = cell[axis] as f64 + 0.5;
-                weight *= 1.0 - (q[axis] as f64 - center).abs();
-            }
-            // Zero weight contributes nothing (the reference multiplies the
-            // zero factor through and it drops out of the sum).
-            weight_sum += weight;
-            let attr_base = row as usize * channels;
-            for (channel, acc_channel) in acc.iter_mut().enumerate() {
-                *acc_channel += weight * attrs[attr_base + channel] as f64;
+        for axis in 0..3 {
+            if !voxel_size[axis].is_finite() || voxel_size[axis] <= 0.0 {
+                candle_core::bail!("trilinear sampling aabb is degenerate along axis {axis}");
             }
         }
-        let denom = weight_sum.max(1e-12);
-        let dst = vertex_index * channels;
-        for (channel, acc_channel) in acc.iter().enumerate() {
-            out[dst + channel] = (acc_channel / denom) as f32;
-        }
+        let map: HashMap<[i32; 3], u32> = coords
+            .iter()
+            .enumerate()
+            .map(|(index, coord)| (*coord, index as u32))
+            .collect();
+        Ok(Self {
+            attrs,
+            channels,
+            aabb,
+            grid_size,
+            voxel_size,
+            map,
+        })
     }
-    Ok(out)
+
+    /// Trilinearly sample the volume at every position.
+    pub fn sample(&self, vertices: &[[f32; 3]]) -> CandleResult<Vec<f32>> {
+        let mut out = vec![0.0_f32; vertices.len() * self.channels];
+        // Corner subidx order dx + 2*dy + 4*dz matches the CUDA kernel's
+        // `base + (i & 1, (i >> 1) & 1, (i >> 2) & 1)`.
+        for (vertex_index, vertex) in vertices.iter().enumerate() {
+            // grid = (vertex - origin) / voxel_size.
+            let q = [
+                (vertex[0] - self.aabb[0][0]) / self.voxel_size[0],
+                (vertex[1] - self.aabb[0][1]) / self.voxel_size[1],
+                (vertex[2] - self.aabb[0][2]) / self.voxel_size[2],
+            ];
+            let base = [
+                (q[0] - 0.5).floor() as i64,
+                (q[1] - 0.5).floor() as i64,
+                (q[2] - 0.5).floor() as i64,
+            ];
+            let mut acc = vec![0.0_f64; self.channels];
+            let mut weight_sum = 0.0_f64;
+            for subidx in 0..8usize {
+                let dx = (subidx & 1) as i64;
+                let dy = ((subidx >> 1) & 1) as i64;
+                let dz = ((subidx >> 2) & 1) as i64;
+                let cell = [base[0] + dx, base[1] + dy, base[2] + dz];
+                // Grid bounds (0..grid_size per axis) and hashmap occupancy:
+                // cells outside the grid cannot be occupied, so both checks
+                // drop the same neighbors (the reference bounds-checks first).
+                if cell
+                    .iter()
+                    .enumerate()
+                    .any(|(axis, &c)| c < 0 || c >= self.grid_size[axis] as i64)
+                {
+                    continue;
+                }
+                let cell_i = [cell[0] as i32, cell[1] as i32, cell[2] as i32];
+                let Some(&row) = self.map.get(&cell_i) else {
+                    continue;
+                };
+                let mut weight = 1.0_f64;
+                for axis in 0..3 {
+                    let center = cell[axis] as f64 + 0.5;
+                    weight *= 1.0 - (q[axis] as f64 - center).abs();
+                }
+                // Zero weight contributes nothing (the reference multiplies the
+                // zero factor through and it drops out of the sum).
+                weight_sum += weight;
+                let attr_base = row as usize * self.channels;
+                for (channel, acc_channel) in acc.iter_mut().enumerate() {
+                    *acc_channel += weight * self.attrs[attr_base + channel] as f64;
+                }
+            }
+            let denom = weight_sum.max(1e-12);
+            let dst = vertex_index * self.channels;
+            for (channel, acc_channel) in acc.iter().enumerate() {
+                out[dst + channel] = (acc_channel / denom) as f32;
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Sample the base-color channels (PBR layout 0:3) at every mesh vertex.

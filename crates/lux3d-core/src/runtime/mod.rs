@@ -160,9 +160,9 @@ pub use trellis2_sparse::{
 };
 pub use trellis2_ss_dec::{Trellis2SsDecoder, Trellis2SsDecoderConfig, occupancy_coords};
 pub use trellis2_tex::{
-    TexDecodeOutput, Trellis2PbrLayout, Trellis2TexDecoder, Trellis2TexDit, concat_tex_input,
-    pbr_attrs_from_raw, query_vertex_attrs, query_vertex_attrs_in_aabb, query_vertex_colors,
-    split_pbr_attrs,
+    PbrAttrSampler, TexDecodeOutput, Trellis2PbrLayout, Trellis2TexDecoder, Trellis2TexDit,
+    concat_tex_input, pbr_attrs_from_raw, query_vertex_attrs, query_vertex_attrs_in_aabb,
+    query_vertex_colors, split_pbr_attrs,
 };
 pub use trellis2_texture::{
     TRELLIS2_SHAPE_ENC_STAGE_REL, Trellis2TexturingOptions, Trellis2TexturingOutput,
