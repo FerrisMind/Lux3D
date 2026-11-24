@@ -2,7 +2,7 @@
 
 Measured on an NVIDIA GeForce RTX 3060 12 GiB (Windows, WDDM) unless noted.
 For the full investigation log and remaining levers, see
-[../PERF-NOTES.md](../PERF-NOTES.md).
+[performance-notes.md](performance-notes.md).
 
 ## Inference benchmarks
 

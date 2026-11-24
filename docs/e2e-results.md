@@ -1,6 +1,6 @@
 # Lux3D real-weight e2e results
 
-Manual run of the scenario suite in [`E2E.md`](E2E.md) against the weights that
+Manual run of the scenario suite in [`e2e.md`](e2e.md) against the weights that
 are already on this machine.
 
 ## Environment
@@ -56,7 +56,7 @@ TripoSG wall and ~0.1 s of triposr's 4-5 s; candle's blocking WDDM
 `flush_drain` accounts for 15.2 s and 2.1 s of those walls (zero on CUDA), and
 Vulkan's peak VRAM is 6.8 GiB against CUDA's 3.9 GiB on TripoSG. The GEMM
 ceilings, the drain measurements and the memory-knob sweep are in
-[`PERF-NOTES.md`](PERF-NOTES.md).
+[`performance-notes.md`](performance-notes.md).
 
 ## 2026-11-23 exact-mode rerun (TripoSG VAE fixes)
 
@@ -125,7 +125,7 @@ CUDA's int8 tensor-core mmq at ~34 TOPS (3.3x on ff_in), while attention
 (f32 GEMM), softmax, layernorm, contiguity copies and the DMC octree are at
 parity or faster on Vulkan. The per-op table, the int8 coopmat experiment
 (bit-exact but 1.6x slower than dp4a), the tile sweeps and the WDDM
-queue-depth limit are in [`PERF-NOTES.md`](PERF-NOTES.md).
+queue-depth limit are in [`performance-notes.md`](performance-notes.md).
 
 ## Automated scenario results
 
@@ -188,7 +188,7 @@ costs batch 116 s). The full WGPU suite is **18/18 in 2769.87 s**, down from
 2908.76 s. The chunk-count flush also exposed a latent `refine_level` bug
 where a batch index was used to slice the cell vector; the window now tracks
 the first pending cell. Details in
-[`PERF-NOTES.md`](PERF-NOTES.md#wgpu-triposg-field-path-regression-and-fix-2026-11-22).
+[`performance-notes.md`](performance-notes.md#wgpu-triposg-field-path-regression-and-fix-2026-11-22).
 
 Measured dead ends in this round, reverted or left opt-in:
 
@@ -296,7 +296,7 @@ change can recover that. The candle-side levers, in measured order:
    (A/B int8, C int32, per-block scale in the epilogue). CUDA reaches 26.29
    TFLOPS with `mma.sync...s8.s8.s32`; Vulkan's `mul_mmq.comp` only has dp4a
    and reaches 8.37. Concrete file/line handoff and the generator gate are in
-   [`PERF-NOTES.md`](PERF-NOTES.md#candle-side-handoff-the-q8_0q4_k-vulkan-gemm-gap).
+   [`performance-notes.md`](performance-notes.md#candle-side-handoff-the-q8_0q4_k-vulkan-gemm-gap).
    This alone bounds every q8 scenario.
 2. Vulkan dispatch/flush overhead on the remaining dispatch-bound paths:
    TripoSG dense SDF decode (~40 fixed dispatches per chunk) and TRELLIS.2
@@ -421,13 +421,13 @@ O-Voxel conversion.
 
 The reference trees for Hunyuan3D-2, Hunyuan3D-2.1, Pixal3D, idol-sdk and
 `diso` have no Lux3D runtime family and no local checkpoints; they remain
-documented in `E2E.md` as unimplemented coverage. `diso` is an algorithm
+documented in `e2e.md` as unimplemented coverage. `diso` is an algorithm
 reference only.
 
 ## Known CLI surfaces not in this suite
 
 - VGGT COLMAP track mode + external bundle adjustment: `colmap` is not
-  installed on this host. The manual command is documented in `E2E.md`.
+  installed on this host. The manual command is documented in `e2e.md`.
 - TRELLIS.2 1024/cascade pipelines, `--num-samples`, and `--return-latent`:
   configured but not run at full weight size; they reuse the sampler code
   covered by the 512 tests.

@@ -71,7 +71,7 @@ Official source: `candle-3d-refs/TRELLIS.2` (`example.py`, `app.py`,
 | 1024 / cascade variants | `pipeline_type` 1024/1024_cascade/1536_cascade | `--pipeline-type ...` | unit/cascade tests exist; heavy full-weight variant not run by default |
 | Multiple samples | `run(num_samples=N)` | `--num-samples N` | not separately tested (same sampler path) |
 | Latent export | `return_latent=True` | `--return-latent out.npz` | not separately tested |
-| Remesh / decimation / hole fill | `o_voxel.postprocess.to_glb` | `--no-remesh`, `--remesh-band`, `--decimation-target`, `--fill-hole-perimeter` | `trellis2_512_geometry` uses `--no-remesh --decimation-target 50000`; the default narrow-band remesh is unit-tested but exceeded 17 min CPU on the 1.5M-voxel decode (see `E2E-RESULTS.md`) |
+| Remesh / decimation / hole fill | `o_voxel.postprocess.to_glb` | `--no-remesh`, `--remesh-band`, `--decimation-target`, `--fill-hole-perimeter` | `trellis2_512_geometry` uses `--no-remesh --decimation-target 50000`; the default narrow-band remesh is unit-tested but exceeded 17 min CPU on the 1.5M-voxel decode (see `e2e-results.md`) |
 | Low-VRAM stage residency | `low_vram=True/False` | `--no-low-vram` | not separately tested |
 | RMBG-2.0 preprocessing | `preprocess_image` + BiRefNet | `--rmbg-model-path rmbg-2.0` | covered by image-to-3D tests |
 
@@ -140,4 +140,4 @@ The suite writes each run's artifacts under
 
 ## Manual run record
 
-Filled after the real-weight manual pass; see `E2E-RESULTS.md`.
+Filled after the real-weight manual pass; see `e2e-results.md`.

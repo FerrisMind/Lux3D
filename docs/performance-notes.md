@@ -23,7 +23,7 @@ session: CUDA **796.39 s**, Vulkan **1444.53 s** (18/18 both). Vulkan/CUDA
 **1.81x**. Both absolute walls dropped ~16% vs 2026-11-21 (955.13 /
 1717.21 s), but the ratio is unchanged: the fixes removed host-side sync and
 repeated per-chunk work that both backends paid. Full per-scenario table:
-[`E2E-RESULTS.md`](E2E-RESULTS.md).
+[`e2e-results.md`](e2e-results.md).
 
 Fixes, all measurement-gated (numbers are e2e wall time):
 
@@ -180,7 +180,7 @@ Full 18-scenario suite, same binary and weights, `--test-threads=1`:
 CUDA **955.13 s**, Vulkan **1717.21 s**, WGPU **3479.83 s** (18/18 on all
 three). Vulkan/CUDA 2.62x -> **1.80x**; WGPU/CUDA **3.64x**, neutral vs its
 previous 3466.58 s run. Full per-scenario table:
-[`E2E-RESULTS.md`](E2E-RESULTS.md).
+[`e2e-results.md`](e2e-results.md).
 
 Fixes, all measurement-gated (numbers are e2e wall time):
 

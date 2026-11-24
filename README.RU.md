@@ -123,10 +123,10 @@ curl http://127.0.0.1:8080/health
 | [docs/weights.md](docs/weights.md) | Canonical-пакеты, нормализация, GGUF-квантизация, измеренная точность |
 | [docs/server.md](docs/server.md) | HTTP API, флаги сервера, workflow задач, встраивание роутера |
 | [docs/performance.md](docs/performance.md) | Бенчмарки бэкендов, warm-loop, поведение памяти |
-| [FEATURES.md](FEATURES.md) | Инвентаризация фич и user stories |
-| [E2E.md](E2E.md) | Матрица end-to-end сценариев и запуск |
-| [E2E-RESULTS.md](E2E-RESULTS.md) | Последние результаты real-weight e2e |
-| [PERF-NOTES.md](PERF-NOTES.md) | Журнал исследований производительности и оставшиеся рычаги |
+| [docs/features.md](docs/features.md) | Инвентаризация фич и user stories |
+| [docs/e2e.md](docs/e2e.md) | Матрица end-to-end сценариев и запуск |
+| [docs/e2e-results.md](docs/e2e-results.md) | Последние результаты real-weight e2e |
+| [docs/performance-notes.md](docs/performance-notes.md) | Журнал исследований производительности и оставшиеся рычаги |
 
 ## Производительность
 
@@ -155,7 +155,7 @@ TripoSG preview (`--steps 2 --num-tokens 1024 --flash-octree-depth 5`): infer
 | `crates/lux3d-cli` | CLI для инспекции, нормализации и запуска инференса |
 | `crates/lux3d-server-core` | Встраиваемый Axum-роутер и HTTP API |
 | `crates/lux3d-server` | Standalone HTTP-сервер |
-| `docs/` | Гайды: models, inference, VGGT, TRELLIS.2, weights, server, performance |
+| `docs/` | Гайды и справочники: models, inference, VGGT, TRELLIS.2, weights, server, performance, features, e2e |
 | `scripts/` | Оценка квантизации, сравнение геометрии, конвертация keypoint-весов |
 | [`tools/python_baseline`](tools/python_baseline/README.md) | Python-инструменты паритета и нормализации весов |
 | `.github/assets` | Ассеты документации |

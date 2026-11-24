@@ -1,7 +1,7 @@
 # Inference: running the CLI
 
 Every `run` command accepts `--device cpu|cuda|vulkan|wgpu` (default `cuda`).
-CUDA is the verified production backend; see [../PERF-NOTES.md](../PERF-NOTES.md)
+CUDA is the verified production backend; see [performance-notes.md](performance-notes.md)
 and [performance.md](performance.md) for measured numbers.
 
 ## Run inference
@@ -199,7 +199,7 @@ produce incorrect output, or fail entirely depending on your GPU, driver, and
 OS. Use CUDA for production workloads.
 
 Real-weight coverage: all 18 e2e scenarios pass on CUDA, Vulkan and WGPU
-(RTX 3060 12 GiB); see [../E2E-RESULTS.md](../E2E-RESULTS.md).
+(RTX 3060 12 GiB); see [e2e-results.md](e2e-results.md).
 
 - **TripoSG on WGPU:** keep packed Q8 weights
   (`LUX3D_WGPU_DEQUANT_WEIGHTS=0`). The default dense-F32 dequant OOMs a 12 GiB

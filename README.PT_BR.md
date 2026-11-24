@@ -124,10 +124,10 @@ Endpoints, campos de requisição e política SSRF: [docs/server.md](docs/server
 | [docs/weights.md](docs/weights.md) | Pacotes canônicos, normalização, quantização GGUF, fidelidade medida |
 | [docs/server.md](docs/server.md) | API HTTP, flags do servidor, fluxo de jobs, embed do router |
 | [docs/performance.md](docs/performance.md) | Benchmarks por backend, warm-loop, comportamento de memória |
-| [FEATURES.md](FEATURES.md) | Inventário de features e user stories |
-| [E2E.md](E2E.md) | Matriz de cenários end-to-end e execução |
-| [E2E-RESULTS.md](E2E-RESULTS.md) | Resultados e2e mais recentes com pesos reais |
-| [PERF-NOTES.md](PERF-NOTES.md) | Log de investigação de performance e alavancas restantes |
+| [docs/features.md](docs/features.md) | Inventário de features e user stories |
+| [docs/e2e.md](docs/e2e.md) | Matriz de cenários end-to-end e execução |
+| [docs/e2e-results.md](docs/e2e-results.md) | Resultados e2e mais recentes com pesos reais |
+| [docs/performance-notes.md](docs/performance-notes.md) | Log de investigação de performance e alavancas restantes |
 
 ## Desempenho
 
@@ -156,7 +156,7 @@ Tabelas completas, VRAM, warm-loop e lacunas conhecidas:
 | `crates/lux3d-cli` | CLI para inspeção, normalização e execução de inferência |
 | `crates/lux3d-server-core` | Router Axum embutível e API HTTP |
 | `crates/lux3d-server` | Binário do servidor HTTP |
-| `docs/` | Guias: models, inference, VGGT, TRELLIS.2, weights, server, performance |
+| `docs/` | Guias e referência: models, inference, VGGT, TRELLIS.2, weights, server, performance, features, e2e |
 | `scripts/` | Avaliação de quantização, comparação de geometria, conversão de keypoints |
 | [`tools/python_baseline`](tools/python_baseline/README.md) | Ferramentas Python de paridade e normalização de pesos |
 | `.github/assets` | Assets de documentação |
