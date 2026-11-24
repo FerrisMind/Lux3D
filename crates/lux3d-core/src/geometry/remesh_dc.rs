@@ -103,6 +103,7 @@
 //!   factor, so values above 1 extrapolate past the closest point, matching
 //!   the official call.
 
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::error::{Lux3dError, Result};
@@ -272,20 +273,23 @@ pub fn remesh_narrow_band_dc<'mesh>(
                 "remesh narrow-band dual contouring band threshold is not finite",
             ));
         }
-        let mut kept: Vec<[i32; 3]> = Vec::with_capacity(coords.len());
-        for chunk in coords.chunks(QUERY_CHUNK) {
-            let points: Vec<[f32; 3]> = chunk
-                .iter()
-                .map(|&coord| cell_center_point(coord, divisor, scale, center))
-                .collect();
-            let hits = bvh.closest_points(&points);
-            for (&coord, hit) in chunk.iter().zip(hits.iter()) {
-                // `abs(unsigned_distance - eps) < 0.87 * cell_size`.
-                if (hit.unsigned_distance - eps).abs() < threshold {
-                    kept.push(coord);
-                }
-            }
-        }
+        // The UDF queries are independent and `bvh.closest_points` is `&self`;
+        // fan the chunks out across threads. `par_chunks` is an indexed
+        // parallel iterator, so the collected `kept` order is the serial one.
+        let kept: Vec<[i32; 3]> = coords
+            .par_chunks(QUERY_CHUNK)
+            .flat_map_iter(|chunk| {
+                let points: Vec<[f32; 3]> = chunk
+                    .iter()
+                    .map(|&coord| cell_center_point(coord, divisor, scale, center))
+                    .collect();
+                let hits = bvh.closest_points(&points);
+                chunk.iter().zip(hits).filter_map(|(&coord, hit)| {
+                    // `abs(unsigned_distance - eps) < 0.87 * cell_size`.
+                    ((hit.unsigned_distance - eps).abs() < threshold).then_some(coord)
+                })
+            })
+            .collect();
         coords = kept;
 
         if current_resolution >= resolution {
@@ -328,17 +332,18 @@ pub fn remesh_narrow_band_dc<'mesh>(
         }
     }
 
-    let mut corner_values: Vec<f32> = Vec::with_capacity(corners.len());
-    for chunk in corners.chunks(QUERY_CHUNK) {
-        let points: Vec<[f32; 3]> = chunk
-            .iter()
-            .map(|&corner| corner_point(corner, resolution_f32, scale, center))
-            .collect();
-        let hits = bvh.closest_points(&points);
-        for hit in hits {
-            corner_values.push(hit.unsigned_distance - eps);
-        }
-    }
+    let corner_values: Vec<f32> = corners
+        .par_chunks(QUERY_CHUNK)
+        .flat_map_iter(|chunk| {
+            let points: Vec<[f32; 3]> = chunk
+                .iter()
+                .map(|&corner| corner_point(corner, resolution_f32, scale, center))
+                .collect();
+            bvh.closest_points(&points)
+                .into_iter()
+                .map(|hit| hit.unsigned_distance - eps)
+        })
+        .collect();
 
     // ---- step 3: one dual vertex per active voxel --------------------------
     // Mirrors `simple_dual_contour.cu:28-156`: mean of the 12 edge
