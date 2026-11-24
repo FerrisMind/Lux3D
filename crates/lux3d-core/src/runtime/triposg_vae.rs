@@ -1013,6 +1013,9 @@ pub fn sample_point_features_with_indices(
         let positions = selected
             .narrow(1, 0, 3)?
             .to_device(&candle_core::Device::Cpu)?
+            // FPS is a host-side f32 loop; the tensor may carry f16 when the
+            // encoder runs in half precision (upstream casts to numpy f32).
+            .to_dtype(DType::F32)?
             .to_vec2::<f32>()?;
         let fps = fps_indices(&positions, num_tokens);
         let fps_tensor = Tensor::from_vec(
