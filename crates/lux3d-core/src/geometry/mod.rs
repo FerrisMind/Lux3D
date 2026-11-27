@@ -1,6 +1,7 @@
 mod dual_grid;
 mod mesh_bvh;
 mod mesh_ops;
+pub mod normal_cones;
 mod pbr_bake;
 mod pi3;
 mod remesh_dc;
